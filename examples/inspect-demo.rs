@@ -3,7 +3,7 @@
 //!
 //! Usage:
 //!     cargo run --release --example inspect-demo
-//!     open <http://127.0.0.1:9090>
+//!     open <http://127.0.0.1:51624>
 //!
 //! What's real:
 //! - hostname, tmux version (queried at startup)
@@ -19,6 +19,14 @@
 //! - `allowed_user_id = 0` (there is no real authorized user in demo mode)
 //! - activity metrics are seeded with a handful of synthetic events so
 //!   the "messages / last response" cards aren't empty
+//!
+//! ## Dummy-data mode (for screenshots)
+//!
+//! Set `INSPECT_DEMO_DUMMY=1` to swap every real field for a fake one —
+//! hostname becomes "demo-host", pid becomes a made-up integer, tmux
+//! sessions are hardcoded, bot identity + autostart + notify all populate
+//! with sample values. Useful for capturing dashboard screenshots without
+//! leaking your actual machine setup.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,10 +48,19 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    // `INSPECT_DEMO_DUMMY=1` forces hardcoded sample data so the dashboard
+    // can be screenshotted without leaking the real hostname, pid, or
+    // whatever tmux sessions are running on the operator's machine.
+    let dummy = std::env::var("INSPECT_DEMO_DUMMY").is_ok();
+
     // Real tmux state: probe with an empty-allowlist Tmux first, then
     // rebuild with whatever valid-named sessions we actually found.
-    let probe = tmux::Tmux::new(vec![], 4000);
-    let live = probe.list_sessions().await.unwrap_or_default();
+    let live: Vec<String> = if dummy {
+        vec!["claude-code".into(), "shell".into(), "notes".into()]
+    } else {
+        let probe = tmux::Tmux::new(vec![], 4000);
+        probe.list_sessions().await.unwrap_or_default()
+    };
     let real_allowlist: Vec<String> = live
         .iter()
         .filter(|s| tmux::is_valid_session_name(s))
@@ -90,22 +107,55 @@ async fn main() -> Result<()> {
         .checked_sub(Duration::from_secs(3 * 3600 + 12 * 60 + 41))
         .unwrap_or_else(Instant::now);
 
+    let (hostname, tmux_ver, pid, allowed_user, bot_info, autostart_info, notify_info) = if dummy
+    {
+        (
+            "demo-host".to_string(),
+            "3.4".to_string(),
+            12_345,
+            1_234_567_890_i64,
+            Some(inspect::BotInfo {
+                id: 9_876_543_210,
+                first_name: "Demo Bridge".into(),
+                username: Some("demo_bridge_bot".into()),
+            }),
+            Some(inspect::AutostartInfo {
+                session: "claude-code".into(),
+                dir: "/home/demo/Repos/sample-project".into(),
+                command: "claude".into(),
+            }),
+            Some(inspect::NotifyInfo {
+                socket_path: "/run/user/1000/tebis.sock".into(),
+                chat_id: 1_234_567_890,
+            }),
+        )
+    } else {
+        (
+            inspect::hostname(),
+            inspect::tmux_version().await,
+            std::process::id(),
+            0,
+            None,
+            None,
+            None,
+        )
+    };
+
     let snapshot = Arc::new(inspect::Snapshot {
         bridge: inspect::BridgeInfo {
             version: env!("CARGO_PKG_VERSION"),
-            pid: std::process::id(),
-            hostname: inspect::hostname(),
-            tmux_version: inspect::tmux_version().await,
+            pid,
+            hostname,
+            tmux_version: tmux_ver,
         },
-        // Honest-null: no bot identity without a real getMe.
-        bot: None,
-        allowed_user_id: 0,
+        bot: bot_info,
+        allowed_user_id: allowed_user,
         allowed_sessions: allowlist,
         poll_timeout: 30,
         max_output_chars: 4000,
         max_concurrent_handlers: 8,
-        autostart: None,
-        notify: None,
+        autostart: autostart_info,
+        notify: notify_info,
         // Demo passes through BRIDGE_ENV_FILE if you set it, so you can
         // test the Settings edit flow locally against a throwaway file.
         env_file: std::env::var("BRIDGE_ENV_FILE").ok(),

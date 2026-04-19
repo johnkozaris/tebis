@@ -12,6 +12,8 @@ from your phone.
   opt-in Unix-domain socket the hook script writes to.
 - Single statically-linked binary (~4 MB release), no web server, no cloud.
 
+![tebis dashboard](docs/dashboard.png)
+
 > **Security model — read first.** tebis is locked to **one** numeric
 > Telegram user id and only forwards to a pre-declared (or regex-validated)
 > set of session names. See [Security](#security).
@@ -202,8 +204,10 @@ event type. The hook exits 0 on every path so it can never block Claude.
 
 ## Inspect dashboard
 
-Set `INSPECT_PORT=9090` and the bridge binds a local HTML control panel at
-`http://127.0.0.1:9090/`. **Loopback-only**; no authentication — do not try to
+Set `INSPECT_PORT=51624` (or any port you like — the setup wizard defaults to
+`51624` in the IANA dynamic range to avoid common collisions like Prometheus'
+`9090`) and the bridge binds a local HTML control panel at
+`http://127.0.0.1:51624/`. **Loopback-only**; no authentication — do not try to
 expose it beyond the host.
 
 What it shows:
