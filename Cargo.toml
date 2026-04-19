@@ -1,0 +1,47 @@
+[package]
+name = "tebis"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+description = "Telegram-tmux bridge for driving AI coding agents from a phone"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+# TUI primitives for `tebis setup` — prompts, colored headers, validators.
+# Only used by the setup wizard and the run-time banner; adds ~10 small
+# crates (console+unicode-width family) to the graph. Skipped entirely
+# when building `--no-default-features`, but defaults stay on because
+# setup is the primary onboarding path.
+console = "0.16"
+dialoguer = { version = "0.12", default-features = false }
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["client", "http1", "server"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "webpki-tokio", "tls12"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client", "client-legacy", "http1", "tokio"] }
+libc = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+strip-ansi-escapes = "0.2"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "time", "sync", "net", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[profile.release]
+opt-level = 3
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+incremental = false
+# Panic on arithmetic overflow in release — a network service silently
+# wrapping an integer is worse than a controlled panic that systemd
+# restarts. CVE-2018-1000810 is the canonical reason this belongs on.
+overflow-checks = true

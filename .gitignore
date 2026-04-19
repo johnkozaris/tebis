@@ -1,0 +1,51 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Secrets — env files with real values must never be committed.
+# `.env.example` (template, placeholders only) IS tracked.
+.env
+.env.local
+.env.*.local
+env
+env.bak
+env.tmp
+
+# Local runtime artifacts
+*.sock
+*.pid
+/tmp/tebis-*.sock
+
+# Editors / IDE
+*.swp
+*.swo
+*.swn
+*~
+.vscode/
+.idea/
+*.iml
+.nvimlog
+
+# OS noise
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs / misc
+*.log
+*.tmp
+
+# Coverage / profiling
+/coverage
+*.profraw
+*.profdata
+tarpaulin-report.*
+
+# Per-user machine config (direnv etc.)
+.direnv/
+.envrc.local

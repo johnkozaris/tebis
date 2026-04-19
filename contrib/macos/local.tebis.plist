@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- macOS launchd user-agent for tebis.
+
+     Install:
+       ./contrib/macos/install.sh          # copies everything into place
+     Or manually:
+       cp contrib/macos/local.tebis.plist \
+         ~/Library/LaunchAgents/
+       launchctl load ~/Library/LaunchAgents/local.tebis.plist
+
+     After editing the env file:
+       launchctl kickstart -k gui/$(id -u)/local.tebis
+     (Or click "Restart bridge" in the dashboard at INSPECT_PORT.)
+
+     Logs:
+       tail -f /tmp/tebis.log
+
+     The ProgramArguments block wraps the binary in bash so we can
+     source the env file (launchd has no EnvironmentFile= equivalent).
+     Replace USERNAME below with your username — install.sh does it
+     automatically. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.tebis</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>set -a &amp;&amp; . "/Users/USERNAME/.config/tebis/env" &amp;&amp; set +a &amp;&amp; exec "/Users/USERNAME/.local/bin/tebis"</string>
+    </array>
+
+    <!-- Respawn on exit (matches systemd's Restart=always). Needed for
+         the dashboard's "Restart bridge" button — which exits 0 — to
+         bring the service back. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Wait 5 s between respawns. Prevents a crash-loop from consuming
+         laptop resources; matches RestartSec=5 on the systemd side. -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/tebis.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/tebis.log</string>
+    <key>StandardInPath</key>
+    <string>/dev/null</string>
+
+    <!-- Process-level tuning. SoftResourceLimits lets the kernel grow
+         open-file count up to HardResourceLimits on demand. Kept
+         conservative — bridge uses <10 fds in steady state. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>256</integer>
+    </dict>
+</dict>
+</plist>
