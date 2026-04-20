@@ -36,9 +36,15 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use tebis::{inspect, metrics, session, tmux};
+use tebis::agent_hooks::HooksMode;
+use tebis::bridge::session;
+use tebis::{inspect, metrics, tmux};
 
 #[tokio::main]
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear demo wiring; factoring just shuffles it"
+)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -80,7 +86,7 @@ async fn main() -> Result<()> {
 
     // SessionState with no autostart — demo doesn't pretend to have a
     // Claude or similar agent running.
-    let sessions = Arc::new(session::SessionState::new(None));
+    let sessions = Arc::new(session::SessionState::new(None, HooksMode::Off));
     if let Some(t) = default_target.as_ref() {
         sessions.set_target(t.clone());
     }
@@ -107,8 +113,7 @@ async fn main() -> Result<()> {
         .checked_sub(Duration::from_secs(3 * 3600 + 12 * 60 + 41))
         .unwrap_or_else(Instant::now);
 
-    let (hostname, tmux_ver, pid, allowed_user, bot_info, autostart_info, notify_info) = if dummy
-    {
+    let (hostname, tmux_ver, pid, allowed_user, bot_info, autostart_info, notify_info) = if dummy {
         (
             "demo-host".to_string(),
             "3.4".to_string(),
@@ -156,6 +161,10 @@ async fn main() -> Result<()> {
         max_concurrent_handlers: 8,
         autostart: autostart_info,
         notify: notify_info,
+        hooks: inspect::HooksInfo {
+            mode: "off",
+            entries: Vec::new(),
+        },
         // Demo passes through BRIDGE_ENV_FILE if you set it, so you can
         // test the Settings edit flow locally against a throwaway file.
         env_file: std::env::var("BRIDGE_ENV_FILE").ok(),

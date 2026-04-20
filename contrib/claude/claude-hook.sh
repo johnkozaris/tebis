@@ -10,6 +10,11 @@
 #   Notification       → forward the notification message (permission asks,
 #                        idle prompts, etc.)
 #
+# SessionStart / SessionEnd are intentionally not handled — tebis is a
+# single-user bot where the agent is provisioned BY the user's first
+# message, so the reply itself is proof of life; ship-state pings
+# duplicate signal.
+#
 # The UserPromptSubmit wrap plus the Stop tail-extract is the summarization
 # strategy: Claude is asked to conclude every non-trivial reply with a short
 # summary, and we take the last N chars of the last assistant message — so

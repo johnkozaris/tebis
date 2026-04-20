@@ -1,0 +1,243 @@
+//! Shared env-file utilities — atomic 0600 write + `KEY=VALUE` parse.
+//!
+//! Every site that touches the env file (`setup`, `inspect` dashboard
+//! editor, `hooks_cli`, `config::load_env_file`, `setup::discover`)
+//! goes through here so parsing + permissions stay consistent. Before
+//! this existed the inspect dashboard's `fs::write` silently dropped
+//! the 0600 mode, exposing the bot token.
+
+use std::fs;
+use std::io;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
+
+/// Atomic write with mode 0600. Creates the tmp file with the right
+/// perms from the start (no umask window), fsyncs, then `rename`s over
+/// the target. A crash at any point leaves either the old file or the
+/// new file intact — never partial, never world-readable.
+pub fn atomic_write_0600(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let tmp = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("env")
+    ));
+
+    // `mode(0o600)` on `OpenOptions` is honored by `open(2)` before the
+    // first byte is written — umask cannot widen this. We still chmod
+    // after write as belt-and-suspenders against filesystems that lose
+    // the creation mode through e.g. an ACL layer.
+    {
+        use std::io::Write as _;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("opening {}", tmp.display()))?;
+        f.write_all(content.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
+    }
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} → {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+/// Parse one `KEY=VALUE` line from an env file. Returns `None` for
+/// blanks, comments, or malformed lines. Strips a leading `export `
+/// prefix and surrounding single or double quotes on the value.
+///
+/// We do NOT do full shell expansion — `$FOO` / `${FOO}` / `\n` pass
+/// through verbatim. The env file is expected to contain literal
+/// values; that's how `systemd`'s `EnvironmentFile=` reads them too.
+pub fn parse_kv_line(raw: &str) -> Option<(&str, &str)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+    let (key, value) = trimmed.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let value = value.trim();
+    let value = strip_matched_quotes(value);
+    Some((key, value))
+}
+
+/// If `s` is wrapped in matching single or double quotes, return the
+/// interior. Otherwise return `s` unchanged.
+fn strip_matched_quotes(s: &str) -> &str {
+    if s.len() >= 2 {
+        let bytes = s.as_bytes();
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
+/// Parse a feature-flag env-var value. Accepts common on/off synonyms
+/// case-insensitive. Empty string → `None` (use default). Anything
+/// else is an error — we'd rather bail at startup than silently run
+/// with the wrong behavior because the user typo'd `yes` vs `on`.
+///
+/// Every `TELEGRAM_*` toggle goes through here so users can use the
+/// same synonyms everywhere and typos never silently collapse to
+/// a default.
+pub fn parse_toggle(value: &str) -> Result<Option<bool>> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "on" | "auto" | "true" | "yes" | "1" | "enable" | "enabled" => Ok(Some(true)),
+        "off" | "false" | "no" | "0" | "disable" | "disabled" => Ok(Some(false)),
+        other => bail!(
+            "unrecognized toggle value {other:?} — use on|off \
+             (synonyms: auto, true/false, yes/no, 1/0, enable/disable)"
+        ),
+    }
+}
+
+/// Look up a single key's value without loading every pair. Returns
+/// the first occurrence (env files don't have a documented last-wins
+/// rule, and callers usually set each key once).
+pub fn read_key(path: &Path, key: &str) -> io::Result<Option<String>> {
+    let content = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    for line in content.lines() {
+        if let Some((k, v)) = parse_kv_line(line)
+            && k == key
+        {
+            return Ok(Some(v.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_kv_line_basic() {
+        assert_eq!(parse_kv_line("FOO=bar"), Some(("FOO", "bar")));
+        assert_eq!(parse_kv_line("  FOO=bar  "), Some(("FOO", "bar")));
+    }
+
+    #[test]
+    fn parse_kv_line_skips_blanks_and_comments() {
+        assert_eq!(parse_kv_line(""), None);
+        assert_eq!(parse_kv_line("   "), None);
+        assert_eq!(parse_kv_line("# a comment"), None);
+        assert_eq!(parse_kv_line("   # indented"), None);
+    }
+
+    #[test]
+    fn parse_kv_line_strips_export_prefix() {
+        assert_eq!(parse_kv_line("export FOO=bar"), Some(("FOO", "bar")));
+    }
+
+    #[test]
+    fn parse_kv_line_strips_matched_quotes() {
+        assert_eq!(parse_kv_line(r#"FOO="bar baz""#), Some(("FOO", "bar baz")));
+        assert_eq!(parse_kv_line("FOO='bar baz'"), Some(("FOO", "bar baz")));
+    }
+
+    #[test]
+    fn parse_kv_line_leaves_mismatched_quotes() {
+        assert_eq!(parse_kv_line(r#"FOO="bar"#), Some(("FOO", r#""bar"#)));
+        assert_eq!(parse_kv_line(r#"FOO='bar""#), Some(("FOO", r#"'bar""#)));
+    }
+
+    #[test]
+    fn parse_kv_line_rejects_no_equals() {
+        assert_eq!(parse_kv_line("FOO"), None);
+    }
+
+    #[test]
+    fn parse_kv_line_accepts_empty_value() {
+        assert_eq!(parse_kv_line("FOO="), Some(("FOO", "")));
+    }
+
+    #[test]
+    fn atomic_write_0600_creates_with_mode() {
+        let p = std::env::temp_dir().join(format!("tebis-env-0600-{}", std::process::id()));
+        let _ = fs::remove_file(&p);
+        atomic_write_0600(&p, "FOO=bar\n").unwrap();
+        let meta = fs::metadata(&p).unwrap();
+        // Mask to perm bits; higher bits are file type.
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read_to_string(&p).unwrap(), "FOO=bar\n");
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn atomic_write_0600_overwrite_tightens_perms() {
+        let p = std::env::temp_dir().join(format!("tebis-env-0600-tight-{}", std::process::id()));
+        fs::write(&p, "old").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write_0600(&p, "new\n").unwrap();
+        let meta = fs::metadata(&p).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read_to_string(&p).unwrap(), "new\n");
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn read_key_finds_and_trims() {
+        let p = std::env::temp_dir().join(format!("tebis-env-read-{}", std::process::id()));
+        fs::write(&p, "FOO=bar\n# comment\nBAZ=  qux  \n").unwrap();
+        assert_eq!(read_key(&p, "FOO").unwrap().as_deref(), Some("bar"));
+        assert_eq!(read_key(&p, "BAZ").unwrap().as_deref(), Some("qux"));
+        assert_eq!(read_key(&p, "MISSING").unwrap(), None);
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn read_key_returns_none_when_file_missing() {
+        let p = std::env::temp_dir().join("tebis-env-does-not-exist-xyz-missing");
+        let _ = fs::remove_file(&p);
+        assert!(read_key(&p, "FOO").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_toggle_accepts_all_documented_synonyms() {
+        for on in [
+            "on", "auto", "true", "yes", "1", "enable", "enabled", "ON", "Auto", "TRUE",
+        ] {
+            assert_eq!(parse_toggle(on).unwrap(), Some(true), "`{on}` should be on");
+        }
+        for off in ["off", "false", "no", "0", "disable", "disabled", "OFF"] {
+            assert_eq!(
+                parse_toggle(off).unwrap(),
+                Some(false),
+                "`{off}` should be off"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_toggle_empty_returns_none() {
+        assert_eq!(parse_toggle("").unwrap(), None);
+        assert_eq!(parse_toggle("   ").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_toggle_rejects_unknown_values() {
+        assert!(parse_toggle("maybe").is_err());
+        assert!(parse_toggle("sometimes").is_err());
+        assert!(parse_toggle("2").is_err());
+    }
+}

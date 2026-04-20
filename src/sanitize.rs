@@ -1,7 +1,9 @@
-/// Codepoints that render as zero-width, line-break, or bidi overrides.
-/// These are dangerous to pass through tmux (terminal confusion) and to
-/// forward back to Telegram (can RTL-spoof the client display).
-/// See dgl.cx, 2023: <https://dgl.cx/2023/09/ansi-terminal-security>
+//! Sanitizers for inbound message text and captured pane output, plus the
+//! Telegram HTML escaper. Defenses against terminal-injection (dgl.cx 2023)
+//! and bidi-spoofing rendering attacks.
+
+/// Zero-width, line-break, and bidi-override codepoints — dangerous in
+/// terminals (tmux) and in Telegram's rendered HTML.
 const fn is_bidi_or_zero_width(c: char) -> bool {
     matches!(c as u32,
         0x200B..=0x200F   // ZWSP, ZWNJ, ZWJ, LRM, RLM
@@ -12,16 +14,9 @@ const fn is_bidi_or_zero_width(c: char) -> bool {
     )
 }
 
-/// Strip control characters that are dangerous for tmux send-keys.
-///
-/// Removes:
-/// - C0 control chars (0x00–0x1F) — especially CR (0x0d) which executes commands
-/// - DEL (0x7F)
-/// - C1 control chars (0x80–0x9F) — especially ESC (0x1b) which injects terminal escapes
-/// - Bidi / zero-width codepoints — display-confusion attacks
-/// - Trailing semicolons (tmux parser bug, tmux issue #1849)
-///
-/// Allows: printable Unicode (>= 0x20, excluding the ranges above).
+/// Strip control chars (C0 incl. CR, DEL, C1 incl. ESC), bidi / zero-width
+/// codepoints, and trailing `;` (tmux parser quirk — tmux #1849). Cap
+/// length at 4096 bytes.
 pub fn sanitize_tmux_input(input: &str) -> String {
     let max_len = 4096;
     let truncated = if input.len() > max_len {
@@ -41,16 +36,11 @@ pub fn sanitize_tmux_input(input: &str) -> String {
     sanitized.trim_end_matches(';').to_string()
 }
 
-/// Sanitize tmux capture-pane output before sending to Telegram.
-///
-/// Defense-in-depth: strip-ansi-escapes handles ANSI sequences, then we
-/// manually strip control characters and bidi codepoints. ANSI-stripping
-/// alone is not sufficient — see dgl.cx 2023 for terminal-injection CVEs.
+/// Two layers: `strip_ansi_escapes` for CSI/OSC, then a manual pass for
+/// stray control / bidi codepoints. ANSI-stripping alone is insufficient.
 pub fn sanitize_tmux_output(output: &str, max_chars: usize) -> String {
-    // Layer 1: strip ANSI escape sequences
     let stripped = strip_ansi_escapes::strip_str(output);
 
-    // Layer 2: remove remaining control chars and bidi codepoints
     let clean: String = stripped
         .chars()
         .filter(|&c| {
@@ -73,48 +63,24 @@ pub fn sanitize_tmux_output(output: &str, max_chars: usize) -> String {
     )
 }
 
-/// Escape text for Telegram HTML parse mode.
-///
-/// Handles **tag content only** (e.g., text inside `<pre>…</pre>`,
-/// `<code>…</code>`, `<b>…</b>`). Does NOT escape `"` or `'`, which would
-/// be required if we ever emitted attribute values like
-/// `<a href="…">`. We never emit attributes — if that changes, use a
-/// context-aware escaper instead of reaching for this one.
-///
-/// Single-pass implementation: the naive three sequential `.replace()`
-/// calls this replaced allocated three intermediate `String`s per call
-/// (one per replacement). This version pre-sizes the output buffer and
-/// walks `text` once, cutting the typical per-reply allocation from
-/// 3× input-size bytes to input-size + slack.
+/// Tag-content escaper for Telegram `parse_mode=HTML` (`<pre>`, `<code>`,
+/// `<b>`). Does NOT escape quotes — we never emit attribute values.
 pub fn escape_html(text: &str) -> String {
-    // Worst case: every byte is `&` → `&amp;` (+4 per byte). For realistic
-    // input the ratio is ~0, so +16 slack covers small inputs without
-    // under-sizing. Larger inputs grow once at most if we misjudge.
     let mut out: Vec<u8> = Vec::with_capacity(text.len() + 16);
     for &byte in text.as_bytes() {
         match byte {
             b'&' => out.extend_from_slice(b"&amp;"),
             b'<' => out.extend_from_slice(b"&lt;"),
             b'>' => out.extend_from_slice(b"&gt;"),
-            // Everything else — including every byte of a multi-byte
-            // UTF-8 codepoint — is copied verbatim.
             b => out.push(b),
         }
     }
-    // SAFETY: `text` is a valid `&str` (guaranteed UTF-8). We only
-    // replace three ASCII bytes (`&`, `<`, `>`) with pure-ASCII byte
-    // sequences (`&amp;`, `&lt;`, `&gt;`), and preserve every other byte
-    // unchanged. The resulting byte sequence is therefore valid UTF-8.
-    unsafe { String::from_utf8_unchecked(out) }
+    String::from_utf8(out).expect("escape_html only substitutes ASCII — output is valid UTF-8")
 }
 
-/// Wrap an already-HTML-escaped body in `open`/`close` tags, guaranteeing the
-/// final message fits Telegram's 4096-char limit (we cap at 4000 for slack).
-/// If the body is too long, truncate at an HTML-safe boundary: prefer a
-/// newline cut, otherwise step back to the nearest codepoint boundary that is
-/// not inside an HTML entity like `&amp;`. The longest entity we emit is
-/// `&amp;` (5 chars), so we back off to the last `&` within 6 chars of the cut
-/// if the intervening slice doesn't contain `;`.
+/// Wrap an already-HTML-escaped body in tags, truncating to fit Telegram's
+/// 4096-char cap (with slack). Cut is HTML-safe: avoids landing inside
+/// `&amp;`-style entities, prefers the last newline within the window.
 pub fn wrap_and_truncate(escaped_body: &str, open: &str, close: &str) -> String {
     const MAX_MSG: usize = 4000;
     const TRUNC_SUFFIX: &str = "\n... (truncated)";
@@ -126,7 +92,7 @@ pub fn wrap_and_truncate(escaped_body: &str, open: &str, close: &str) -> String 
     let target = MAX_MSG.saturating_sub(overhead + TRUNC_SUFFIX.len());
     let mut cut = escaped_body.floor_char_boundary(target);
 
-    // Avoid cutting inside an HTML entity.
+    // Don't cut inside an HTML entity (`&amp;` is 5 chars; window of 6).
     if let Some(amp) = escaped_body[..cut].rfind('&') {
         let tail = &escaped_body[amp..cut];
         if !tail.contains(';') && tail.len() < 6 {
@@ -134,7 +100,6 @@ pub fn wrap_and_truncate(escaped_body: &str, open: &str, close: &str) -> String 
         }
     }
 
-    // Prefer the last newline within the safe window.
     if let Some(nl) = escaped_body[..cut].rfind('\n') {
         cut = nl;
     }

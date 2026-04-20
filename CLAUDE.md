@@ -5,26 +5,36 @@ coding agents (Claude Code) running in tmux sessions.
 
 ## Layout
 
-Split into two layers so plumbing and policy are testable independently:
+Split into two layers so plumbing and policy are testable independently.
 
-**Plumbing** (pure API wrappers — no knowledge of commands or autostart):
-- `src/main.rs` — poll loop, spawn-per-update, `CancellationToken` + `TaskTracker` shutdown
-- `src/telegram.rs` — Bot API client (`thiserror` errors, 429/5xx retry, 409 bubbles up)
-- `src/tmux.rs` — `send-keys` / `capture-pane` with per-session `tokio::Mutex`; returns typed `TmuxError` (`NotFound` / `AlreadyExists` / `EmptyInput` / …); owns `is_valid_session_name` (name-allowlist regex lives with the thing that enforces it)
-- `src/notify/mod.rs` — optional UDS listener for hook-pushed summaries: `Forwarder` trait + `TelegramForwarder` + `Payload` + `NotifyConfig` + `spawn` entrypoint
-- `src/notify/format.rs` — pure HTML body formatter (kind tag + header + `<pre>`)
-- `src/notify/listener.rs` — UDS bind, accept loop, per-connection protocol. Parameterized over `Forwarder` for testability.
-- `src/types.rs` — Telegram DTOs
-- `src/config.rs` — env-var parsing only. Returns `Config`, `AutostartConfig` (defined in `session.rs`), `NotifyConfig` (defined in `notify/mod.rs`). Each consumer owns the shape of its own config.
+**Plumbing** — pure I/O wrappers, no knowledge of commands or autostart:
+- `src/main.rs` — poll loop, spawn-per-update, `CancellationToken` + `TaskTracker` shutdown, 401 dead-end
+- `src/telegram/mod.rs` — Bot API client (`thiserror` errors, 429/5xx retry, 409/401 expose via `is_conflict`/`is_unauthorized`)
+- `src/telegram/types.rs` — Telegram DTOs
+- `src/tmux.rs` — `send-keys` / `capture-pane` with per-session `tokio::Mutex`; returns typed `TmuxError` (`NotFound` / `AlreadyExists` / `EmptyInput` / …); owns `is_valid_session_name`
+- `src/config.rs` — env-var parsing only. Populates `Config`; every subsystem owns the shape of its own config type (`AutostartConfig` in `bridge::session`, `NotifyConfig` in `notify`, `AutoreplyConfig` in `bridge::autoreply`, `HooksMode` in `agent_hooks`).
+- `src/env_file.rs` — shared env-file utilities. `atomic_write_0600` (used by wizard + inspect dashboard so secrets never leak through umask), `parse_kv_line` (used by every reader), `parse_toggle` (used by every `TELEGRAM_*` feature flag so unknown values fail loudly).
+- `src/lockfile.rs` — single-instance flock at `$XDG_RUNTIME_DIR/tebis.lock` (or `/tmp/tebis-$USER.lock`).
 
-**Behavior** (what happens on a new message):
-- `src/bridge.rs` — per-message behavior: rate-limit → parse → execute → reply. The `HandlerContext` each spawned task gets. Instruments `Metrics` at each stage.
-- `src/metrics.rs` — lock-free atomic counters + last-event timestamps. Shared via `Arc<Metrics>`; read by the inspect dashboard.
-- `src/inspect.rs` — opt-in local HTML dashboard (`INSPECT_PORT=<n>` → `127.0.0.1:<n>`). Server-rendered via `format!`, zero JS, CSRF-safe POST actions, loopback-only enforced.
-- `src/handler.rs` — command parse + execute. Clears stale `default_target` and retries provisioning once on `TmuxError::NotFound` for the plain-text path (with an explicit `kill_session` drain to break zombie-state loops).
-- `src/session.rs` — `SessionState` owns `default_target` + `autostart` + its serialization lock; `resolve_or_autostart`, `resolve_explicit`, `clear_target_if`. Defines `AutostartConfig` and `ResolveError` (incl. `AutostartCommandDied` when the configured command exits during TUI-boot sleep).
-- `src/security.rs` — numeric-ID auth + per-chat GCRA rate limiter (access-control primitives only)
+**Behavior** — what happens per message:
+- `src/bridge/mod.rs` — rate-limit → parse → execute → reply routing (hook-driven / pane-settle / bare 👍). Owns `HandlerContext` (includes the shared `TaskTracker`). Instruments `Metrics` at each stage.
+- `src/bridge/handler.rs` — command parse + execute. Clears stale `default_target` and retries provisioning once on `TmuxError::NotFound` for the plain-text path (with an explicit `kill_session` drain to break zombie-state loops).
+- `src/bridge/session.rs` — `SessionState` owns `default_target` + `autostart` + its serialization lock + `hooked_sessions` set; `resolve_or_autostart`, `resolve_explicit`, `clear_target_if`, `mark_hooked`/`unmark_hooked`/`is_hooked`. Defines `AutostartConfig` and `ResolveError` (incl. `AutostartCommandDied`). Hook install runs OUTSIDE the autostart lock — it's idempotent atomic writes with no ordering dep on provisioning.
+- `src/bridge/autoreply.rs` — TUI-agnostic pane-settle reply detection (Braille-spinner-tolerant hash + diff-against-baseline). Owns `AutoreplyConfig` (tunings live with the consumer).
+- `src/bridge/typing.rs` — `TypingGuard` RAII handle + `spawn_with_cap` free fn. Every typing-indicator spawn goes on the shared `TaskTracker` (invariant 12).
+
+**Shared utilities:**
 - `src/sanitize.rs` — input/output sanitizers (C0/C1/bidi), `escape_html`, `wrap_and_truncate`
+- `src/security.rs` — numeric-ID auth + per-chat GCRA rate limiter
+- `src/metrics.rs` — lock-free atomic counters, shared via `Arc<Metrics>`
+
+**Subsystems:**
+- `src/inspect/{mod,server,render}.rs` — opt-in local HTML dashboard. `INSPECT_PORT=<n>` → `127.0.0.1:<n>`. Loopback-only, CSRF-checked, zero JS. `server.rs` handles HTTP + routing + env-file I/O via `env_file::atomic_write_0600`; `render.rs` handles HTML + JSON + inline CSS. `HooksInfo` row shows mode + every project dir from the manifest.
+- `src/notify/{mod,listener,format}.rs` — opt-in UDS listener for hook-pushed summaries. `mod.rs` owns `Forwarder` trait + `TelegramForwarder` + `Payload`. `listener.rs` handles bind + accept + per-connection protocol (parameterized over `Forwarder` for testability). `format.rs` is pure HTML body formatting.
+- `src/setup/{mod,steps,discover,ui}.rs` — six-step first-run wizard. `mod.rs` runs steps + preserves user-added env keys across re-runs. `steps.rs` has each step fn + validators (step 5 is hook-mode, defaulting Auto when the autostart command resolves to a known agent). `discover.rs` parses existing env via `env_file::parse_kv_line`. `ui.rs` is the terminal rendering primitives.
+- `src/agent_hooks/{mod,agent,claude,copilot,manifest,jsonfile,test_support}.rs` — native-hook installation for Claude Code + Copilot CLI. `agent.rs` owns `AgentKind` + `HooksMode` (co-located with the installers, not in `config.rs`). `claude.rs` merges into `.claude/settings.local.json` (lowest-precedence project layer); `copilot.rs` writes a single sentinel `.github/hooks/tebis.json`. `manifest.rs` tracks every project-dir/agent pair at `$XDG_DATA_HOME/tebis/installed.json` so `tebis hooks list` and the dashboard can enumerate installs host-wide. `jsonfile.rs` is shared atomic-write + load-or-empty. Both uninstallers probe `data_dir()` up front so an unresolvable `$HOME` fails loudly instead of silently leaving hooks behind.
+- `src/hooks_cli.rs` — `tebis hooks {install,uninstall,status,list}`. Install-time probes `jq` / `nc` on `$PATH` and scans for legacy (pre-Phase-2) hook entries.
+- `src/service.rs` — launchd (macOS) / systemd user (Linux) install / start / stop / status / restart / uninstall.
 
 ## Security invariants — do not weaken
 
@@ -131,6 +141,44 @@ discussion.
   conclusion lives at the end. The hook script pairs this with a
   `UserPromptSubmit` wrap that asks Claude to end with a summary, so the
   tail *is* the summary in the common case.
+
+## Agent hooks — April 2026 reality
+
+**Claude Code** ships 25+ events. We install the four that matter for a
+chat-forwarding bridge: `UserPromptSubmit` (inject "conclude with a
+summary" context), `Stop` (forward the final assistant message),
+`SubagentStop` (tagged `[agent]`), `Notification` (permission /
+idle prompts). Claude hot-reloads `.claude/settings.local.json` — no
+session restart needed after install. Non-zero exit is non-blocking on
+every event we install; exit 2 is the only blocking signal and we
+never emit it. Default timeout is 600 s; we set 5–15 s which is plenty.
+
+**Copilot CLI** (v1.0.32, GA 2026-02-25) does **not** ship an
+`agentStop` event — that's Claude-Code-only. The closest signal is
+`notification` (async on agent completion, permission prompts, idle).
+We install just `userPromptSubmitted` + `notification`. Copilot loads
+every `*.json` in `.github/hooks/` and merges them, so our sentinel
+file (`tebis.json`) co-exists cleanly with user files. Per-turn reply
+delivery via hooks is less precise on Copilot than on Claude; pane-settle
+is the universal fallback.
+
+**Dependencies**: the embedded hook scripts shell out to `jq` and `nc`
+(BSD netcat on macOS; `netcat-openbsd` on Debian/Ubuntu). `tebis hooks
+install` probes PATH and warns up front when either is missing —
+otherwise the hook fires silently and nothing arrives at the bridge.
+
+**Ownership**: neither agent's schema has a provenance field. We
+identify tebis-owned entries by matching `command` / `bash` fields to
+scripts whose parent dir is `$XDG_DATA_HOME/tebis/`. On uninstall,
+both installers probe `data_dir()` up front so an unresolvable `$HOME`
+fails loudly instead of silently leaving hooks in place (symptom of
+a bug we fixed: `is_our_script` returned `false` on error, making
+every entry look user-owned).
+
+**Manifest**: `$XDG_DATA_HOME/tebis/installed.json` records every
+`(agent, project_dir, timestamp)` tuple. Updated on every install /
+uninstall. Read by `tebis hooks list` and the inspect dashboard so
+users can enumerate installs across the whole host.
 
 ## Build / test / audit
 

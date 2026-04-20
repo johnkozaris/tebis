@@ -107,3 +107,12 @@ pub struct SetMessageReactionRequest<'a> {
 pub enum ReactionType<'a> {
     Emoji { emoji: &'a str },
 }
+
+// --- sendChatAction ---
+// Shows "typing…" / "recording…" in the chat. Auto-expires after ~5s
+// on Telegram's side, so refresh every 4s for a continuous indicator.
+#[derive(Debug, Serialize)]
+pub struct SendChatActionRequest<'a> {
+    pub chat_id: i64,
+    pub action: &'a str,
+}

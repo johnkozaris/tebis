@@ -1,7 +1,4 @@
-//! UDS binding, accept loop, and per-connection protocol handler.
-//!
-//! Parameterized over `F: Forwarder` so tests can inject a fake sink; the
-//! production code path uses [`super::TelegramForwarder`].
+//! UDS binding, accept loop, per-connection protocol.
 
 use anyhow::{Context, Result};
 use std::os::unix::fs::PermissionsExt;
@@ -15,17 +12,11 @@ use tokio_util::task::TaskTracker;
 
 use super::{Forwarder, Payload};
 
-/// Hard cap on a single line. 16 KiB is ~10× the advertised 1500-char body
-/// limit; anything bigger is a bug or abuse.
+/// 16 KiB is ~10× the advertised 1500-char body limit.
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024;
 
-/// Per-connection read budget. Hooks run locally and should finish writing
-/// within milliseconds; 5 s leaves room for a pathological client.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bind the socket and register the accept loop on the shared
-/// [`TaskTracker`]. Per-connection tasks are also tracked so graceful
-/// shutdown drains any in-flight deliveries.
 pub fn spawn<F: Forwarder>(
     tracker: &TaskTracker,
     shutdown: CancellationToken,
@@ -50,24 +41,11 @@ pub fn spawn<F: Forwarder>(
     Ok(())
 }
 
-/// Unlink any stale socket at `path`, bind a fresh `UnixListener`, and
-/// chmod to `0600`.
-///
 /// Three-layer defense so the socket never exists at a looser mode:
-///
-/// 1. **Tightened umask around `bind(2)`** — the kernel creates the socket
-///    file with mode `0666 & ~umask`. Default umasks (`0022`, `0002`) yield
-///    `0644` / `0664`, which Linux honors for `connect(2)`. We temporarily
-///    set umask `0177` so the file is `0600` from the instant it appears.
-/// 2. **Explicit `chmod 0600`** — umask can't be trusted across weird init
-///    configs (login shells, containers with overridden umask).
-/// 3. **Peer-cred check** in [`handle_connection`] — kernel-authenticated
-///    UID match, closes the tiny TOCTOU window between bind and chmod.
-///
-/// `libc::umask` is process-wide, so another thread creating a file in
-/// the same microseconds would also inherit `0177`. Bind is called once
-/// from `main` before the poll loop starts and before any notify work
-/// fires, so in practice only the main thread is active here.
+/// (1) tightened `umask(0177)` around `bind(2)`, (2) explicit `chmod 0600`,
+/// (3) `peer_cred` check in `handle_connection`. Layers (1)+(2) close the
+/// TOCTOU window; (3) is the authenticated gate. Don't remove any in
+/// isolation.
 fn bind(path: &Path) -> Result<UnixListener> {
     match std::fs::remove_file(path) {
         Ok(()) => {}
@@ -78,10 +56,8 @@ fn bind(path: &Path) -> Result<UnixListener> {
         }
     }
 
-    // SAFETY: `umask(2)` is async-signal-safe and has no preconditions.
-    // We restore the prior mask unconditionally (including on the error
-    // path) so a bind failure doesn't leak the tightened umask into the
-    // rest of the process.
+    // SAFETY: `umask(2)` is async-signal-safe; prior mask restored
+    // unconditionally below so a bind failure doesn't leak the tightening.
     let prior_umask = unsafe { libc::umask(0o177) };
     let listener_result = UnixListener::bind(path);
     unsafe { libc::umask(prior_umask) };
@@ -95,6 +71,25 @@ fn bind(path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
+/// RAII guard: removes the socket file on drop so the listener can't
+/// exit any path (shutdown, panic, task cancel) without cleaning up.
+/// Before this, a panic in the accept loop left a stale socket that
+/// subsequent hook firings happily `connect(2)`-ed to, only to see
+/// `ECONNREFUSED` since no one was accepting.
+struct SocketCleanup(PathBuf);
+
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Minimum sleep between consecutive failed `accept(2)` calls.
+/// Without this, a sticky error like `EMFILE` (process fd exhaustion)
+/// burns CPU and fills the journal with warnings at whatever rate the
+/// kernel hands them back.
+const ACCEPT_ERROR_COOLDOWN: Duration = Duration::from_millis(100);
+
 async fn accept_loop<F: Forwarder>(
     listener: UnixListener,
     socket_path: PathBuf,
@@ -102,12 +97,12 @@ async fn accept_loop<F: Forwarder>(
     tracker: TaskTracker,
     shutdown: CancellationToken,
 ) {
+    let _cleanup = SocketCleanup(socket_path);
     loop {
         let accept = tokio::select! {
             a = listener.accept() => a,
             () = shutdown.cancelled() => {
                 tracing::info!("Notify listener shutting down");
-                let _ = std::fs::remove_file(&socket_path);
                 return;
             }
         };
@@ -115,31 +110,28 @@ async fn accept_loop<F: Forwarder>(
         match accept {
             Ok((stream, _)) => {
                 let f = forwarder.clone();
-                // Track per-connection tasks so `tracker.wait()` drains
-                // in-flight deliveries on shutdown. Short-lived by design.
+                // Per-connection tasks tracked so `tracker.wait()` drains
+                // in-flight deliveries on shutdown.
                 tracker.spawn(async move {
                     handle_connection(stream, f).await;
                 });
             }
             Err(e) => {
                 tracing::warn!(err = %e, "Notify accept failed");
+                tokio::select! {
+                    () = tokio::time::sleep(ACCEPT_ERROR_COOLDOWN) => {}
+                    () = shutdown.cancelled() => return,
+                }
             }
         }
     }
 }
 
-/// Read one line of JSON, forward it, write a status line, close.
-///
-/// Peer authentication: every accepted connection is checked against the
-/// bridge's own effective UID. `chmod 0600` is the primary gate (only the
-/// owner can `connect(2)`), but it has a TOCTOU window between `bind` and
-/// the explicit `chmod`. Peer-cred closes that — if the kernel-reported
-/// peer UID doesn't match ours, we refuse without touching the forwarder.
-/// On shared-user systems this is the real defense.
+/// Per-accept peer-cred check against our euid closes the TOCTOU window
+/// between `bind` and `chmod 0600`. On shared-user systems this is the
+/// authenticated gate.
 async fn handle_connection<F: Forwarder>(mut stream: UnixStream, forwarder: Arc<F>) {
     if !peer_is_self(&stream) {
-        // Deliberately minimal reply — don't leak whether the check
-        // triggered on uid mismatch vs. getsockopt failure.
         let _ = stream
             .write_all(b"{\"ok\":false,\"error\":\"forbidden\"}\n")
             .await;
@@ -157,8 +149,7 @@ async fn handle_connection<F: Forwarder>(mut stream: UnixStream, forwarder: Arc<
         }
     };
 
-    // Log metadata only — `text` may contain secrets or sensitive
-    // conversation content, same reason inbound message text isn't logged.
+    // Metadata only — `text` may contain secrets.
     tracing::debug!(
         bytes = payload.text.len(),
         has_cwd = payload.cwd.is_some(),
@@ -180,9 +171,7 @@ async fn handle_connection<F: Forwarder>(mut stream: UnixStream, forwarder: Arc<
     }
 }
 
-/// Read the stream up to the first `\n` or EOF, whichever comes first, with
-/// a global `CONNECT_TIMEOUT`. Reject empty payloads and payloads that
-/// would exceed `MAX_PAYLOAD_BYTES`.
+/// Read up to `\n` or EOF, bounded by `CONNECT_TIMEOUT` + `MAX_PAYLOAD_BYTES`.
 async fn read_payload(stream: &mut UnixStream) -> Result<Payload> {
     let mut reader = BufReader::with_capacity(4096, stream);
     let mut buf = Vec::with_capacity(2048);
@@ -206,8 +195,8 @@ async fn read_payload(stream: &mut UnixStream) -> Result<Payload> {
     Ok(payload)
 }
 
-/// `AsyncBufReadExt::read_until` with a hard cap. Prevents a client that
-/// never sends `\n` from growing the buffer without bound.
+/// `read_until` with a hard cap — a client that never sends `\n` can't
+/// grow the buffer unbounded.
 async fn read_until_bounded<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     delim: u8,
@@ -238,15 +227,11 @@ fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
     haystack.iter().position(|&b| b == needle)
 }
 
-/// Kernel-authenticated peer check — the peer's reported UID must equal
-/// the bridge's own effective UID. The pid reported by `peer_cred` is
-/// racy (the peer can fork/exec between report and any action we'd take
-/// on it), so we only trust `uid`.
-///
-/// `geteuid` is an async-signal-safe syscall with no failure modes.
-/// `peer_cred` can fail on exotic kernels / socket states; treat failure
-/// as reject so a misbehaving stack doesn't silently bypass the check.
+/// Kernel-authenticated peer check. `peer_cred`'s pid is racy (the peer
+/// can fork/exec), so we only trust `uid`. `peer_cred` failure → reject,
+/// so a misbehaving stack can't bypass the check.
 fn peer_is_self(stream: &UnixStream) -> bool {
+    // SAFETY: `geteuid` is async-signal-safe with no failure modes.
     let our_euid = unsafe { libc::geteuid() };
     match stream.peer_cred() {
         Ok(cred) if cred.uid() == our_euid => true,
@@ -267,9 +252,7 @@ fn peer_is_self(stream: &UnixStream) -> bool {
 
 #[cfg(test)]
 mod tests {
-    //! Protocol tests using `UnixStream::pair()` and a recording `Forwarder`.
-    //! This validates that the listener's read / parse / dispatch / write
-    //! path is correct without touching a real socket or the Telegram API.
+    //! Protocol tests via `UnixStream::pair()` + a recording `Forwarder`.
 
     use super::super::{ForwardError, Forwarder, Payload};
     use super::*;

@@ -1,3 +1,12 @@
+//! tmux subprocess wrapper.
+//!
+//! Every public method validates the session name against
+//! [`is_valid_session_name`], serializes operations on the same session
+//! via a per-session lock, and classifies tmux stderr into [`TmuxError`]
+//! so callers can recover from stale state without matching on free-form
+//! strings. Two modes: strict (pre-declared allowlist) or permissive (any
+//! regex-valid name, slot allocated on first use).
+
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -7,60 +16,29 @@ use tokio::sync::Mutex;
 
 use crate::sanitize;
 
-/// Delay between sending the text and sending Enter. See `send_keys`.
+/// Gap between the text and the Enter keystroke. Ink/React TUIs
+/// (Claude Code) treat Enter that arrives too close to text as a newline
+/// inside the input rather than a submit. 300 ms is safe; 100 ms was not.
 const SUBMIT_GAP: Duration = Duration::from_millis(300);
 
-/// Pure tmux API surface. Every public method validates the session name
-/// via the regex [`is_valid_session_name`], serializes operations on the
-/// same session via a per-session lock, and classifies stderr into
-/// [`TmuxError`] so callers can recover from stale state without matching
-/// on free-form strings.
-///
-/// Two allowlist modes:
-///
-/// - **Strict** (`allowed` non-empty at construction): only the pre-declared
-///   names resolve. Any other name returns [`TmuxError::NotAllowed`]. Slots
-///   are allocated up front and their `=NAME` argv prefix is cached — zero
-///   allocation on the hot path.
-/// - **Permissive** (`allowed` empty at construction): any name matching
-///   the regex resolves. Slots are allocated on first reference and cached
-///   in `dynamic` so the per-session lock is stable across calls.
-///
-/// In either mode the name regex is enforced, the per-session lock is
-/// honored, and `send_keys` / `capture_pane` / `kill_session` all go
-/// through the same `slot()` entry point.
 pub struct Tmux {
-    /// Pre-populated slots (strict mode). Empty in permissive mode.
     strict: HashMap<String, Arc<SessionSlot>>,
-    /// Lazily-allocated slots (permissive mode). Never shrinks — the map
-    /// is keyed by a bounded, regex-validated name, so growth is driven by
-    /// real user commands, not attacker input.
+    /// Lazy slots (permissive mode). Never shrinks — key is a bounded,
+    /// regex-validated name, so growth is driven by real user traffic.
     dynamic: std::sync::Mutex<HashMap<String, Arc<SessionSlot>>>,
-    /// Cached `strict.is_empty()` so hot-path lookups don't re-read the
-    /// map length.
     permissive: bool,
     max_output_chars: usize,
 }
 
-/// Per-session cached state. The `exact_target` string (`=NAME`) is the
-/// argv value passed to every `tmux -t` call; precomputing it here saves
-/// one `format!` allocation per `send_keys` / `capture_pane` / `kill_session`.
-/// The inner `Mutex` serializes operations on the same session; `Arc` lets
-/// `slot()` hand out ownership that survives the map lock being dropped.
+/// `exact_target` is the precomputed `=NAME` argv value; `Mutex` serializes
+/// per-session operations.
 struct SessionSlot {
     exact_target: String,
     lock: Mutex<()>,
 }
 
-/// Structured tmux error. `NotFound` / `AlreadyExists` are the two shapes
-/// callers act on — everything else is opaque `CommandFailed`.
-///
-/// Kept `thiserror` so handlers can pattern-match on shape (the project's
-/// "thiserror inside modules" rule); `Display` impls are the user-facing
-/// strings shown in Telegram replies and intentionally omit the internal
-/// `=SESSION` exact-match prefix — that prefix is tmux wire syntax, not
-/// something we want leaking into error messages and tempting users to
-/// type it back into `/kill =…`.
+/// Display strings never leak the internal `=NAME` exact-match prefix —
+/// that's tmux wire syntax, not something users should paste back.
 #[derive(Debug, thiserror::Error)]
 pub enum TmuxError {
     #[error("session '{0}' not found")]
@@ -75,9 +53,7 @@ pub enum TmuxError {
     #[error("session '{session}' is not in the allowlist. Allowed: {allowed}")]
     NotAllowed { session: String, allowed: String },
 
-    /// Sanitization stripped the entire message (pure control/bidi/zero-width).
-    /// Separate from `CommandFailed` so the user sees a clear reason instead
-    /// of a `tmux send-keys failed: …` wrapper around internal detail.
+    /// Sanitization stripped the entire message (pure control / bidi).
     #[error("message is empty (nothing to send after sanitization)")]
     EmptyInput,
 
@@ -92,9 +68,6 @@ pub enum TmuxError {
 }
 
 impl TmuxError {
-    /// True when the underlying session doesn't exist (from tmux's POV).
-    /// Callers use this to detect a stale default-target and clear it
-    /// before re-provisioning on the next message.
     #[must_use]
     pub const fn is_not_found(&self) -> bool {
         matches!(self, Self::NotFound(_))
@@ -104,11 +77,8 @@ impl TmuxError {
 pub type Result<T> = std::result::Result<T, TmuxError>;
 
 impl Tmux {
-    /// Construct a tmux wrapper.
-    ///
-    /// `allowed` is the strict allowlist. Pass an empty `Vec` to enable
-    /// **permissive mode**, where any name matching the regex resolves
-    /// and slots are allocated on demand.
+    /// Empty `allowed` enables **permissive mode** — any regex-valid name
+    /// resolves, slots allocated on first reference.
     pub fn new(allowed: Vec<String>, max_output_chars: usize) -> Self {
         let permissive = allowed.is_empty();
         let strict = allowed
@@ -132,22 +102,16 @@ impl Tmux {
         }
     }
 
-    /// True when the wrapper was constructed with an empty allowlist —
-    /// any valid session name resolves. The dashboard and `/list` use
-    /// this to render "any" instead of a bounded set.
     #[must_use]
     pub const fn is_permissive(&self) -> bool {
         self.permissive
     }
 
-    /// List all active tmux sessions.
     pub async fn list_sessions(&self) -> Result<Vec<String>> {
         let output = run_tmux("list-sessions", &["list-sessions", "-F", "#{session_name}"]).await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // "no server running" / "no sessions" is not an error — just
-            // means no sessions.
             if stderr.contains("no server running") || stderr.contains("no sessions") {
                 return Ok(Vec::new());
             }
@@ -166,11 +130,10 @@ impl Tmux {
         Ok(sessions)
     }
 
-    /// Send keystrokes to a tmux session.
-    /// Serializes per-session so text + Enter can't interleave with a concurrent call.
+    /// Sends text with `-l` (literal, bypasses key-name lookup), a
+    /// `SUBMIT_GAP` pause, then Enter as raw hex `0d`. Per-session lock
+    /// keeps the text+Enter pair atomic against concurrent calls.
     pub async fn send_keys(&self, session: &str, text: &str) -> Result<()> {
-        // Resolve the slot (strict lookup or permissive-mode lazy alloc)
-        // and hold the per-session lock for the whole text + Enter pair.
         let slot = self.slot(session)?;
         let _guard = slot.lock.lock().await;
 
@@ -179,7 +142,6 @@ impl Tmux {
             return Err(TmuxError::EmptyInput);
         }
 
-        // Send the text as literal keystrokes (-l bypasses key-name lookup).
         let out = run_tmux(
             "send-keys",
             &["send-keys", "-t", &slot.exact_target, "-l", &sanitized],
@@ -187,13 +149,8 @@ impl Tmux {
         .await?;
         classify_status(&out, "send-keys", session)?;
 
-        // Gap before Enter. Claude Code's TUI (Ink/React) sometimes batches
-        // Enter that arrives too close to the text and treats it as a newline
-        // inside the input instead of submit. 300 ms is the safe middle;
-        // 100 ms proved too short in practice for cold TUI boots.
         tokio::time::sleep(SUBMIT_GAP).await;
 
-        // Send Enter as raw hex byte (CR = 0x0d).
         let out = run_tmux(
             "send-keys",
             &["send-keys", "-t", &slot.exact_target, "-H", "0d"],
@@ -204,20 +161,13 @@ impl Tmux {
         Ok(())
     }
 
-    /// Check whether a session currently exists in tmux. Uses `tmux
-    /// has-session`, whose exit code is the single source of truth
-    /// (0 = exists, non-zero = doesn't). Name regex + allowlist gate
-    /// apply; no per-session lock is held because this is a pure query.
+    /// `has-session` is a pure query — no per-session lock taken.
     pub async fn has_session(&self, session: &str) -> Result<bool> {
         let slot = self.slot(session)?;
         let output = run_tmux("has-session", &["has-session", "-t", &slot.exact_target]).await?;
         Ok(output.status.success())
     }
 
-    /// Create a detached tmux session with the given name, optional working
-    /// directory, and optional command to run inside. Holds the per-session
-    /// lock for the full create so a concurrent `send_keys` / `capture_pane`
-    /// can't race the new-session.
     pub async fn new_session(
         &self,
         session: &str,
@@ -241,26 +191,20 @@ impl Tmux {
         Ok(())
     }
 
-    /// Kill a tmux session by name. **Idempotent**: if the session is
-    /// already gone, returns `Ok(())` — a caller's intent ("make sure this
-    /// is dead") is satisfied either way. Holds the per-session lock so
-    /// any in-flight `send_keys` / `capture_pane` completes before the
-    /// session disappears.
+    /// Idempotent: `NotFound` → `Ok`.
     pub async fn kill_session(&self, session: &str) -> Result<()> {
         let slot = self.slot(session)?;
         let _guard = slot.lock.lock().await;
 
         let out = run_tmux("kill-session", &["kill-session", "-t", &slot.exact_target]).await?;
-        // Idempotent: NotFound folds into success — caller's intent
-        // ("make sure this is dead") is satisfied either way.
         match classify_status(&out, "kill-session", session) {
             Ok(()) | Err(TmuxError::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
     }
 
-    /// Capture the visible pane content. `-J` joins wrapped lines deterministically.
-    /// Holds the per-session lock so a concurrent `send_keys` can't interleave.
+    /// `-J` joins wrapped lines deterministically. Holds the per-session
+    /// lock so a concurrent `send_keys` can't interleave.
     pub async fn capture_pane(&self, session: &str, lines: usize) -> Result<String> {
         let slot = self.slot(session)?;
         let _guard = slot.lock.lock().await;
@@ -285,26 +229,15 @@ impl Tmux {
         Ok(sanitize::sanitize_tmux_output(&raw, self.max_output_chars))
     }
 
-    /// Check that a session name is valid and (in strict mode) allowlisted.
-    /// Cheap — no subprocess.
     pub fn validate_session(&self, session: &str) -> Result<()> {
         self.slot(session).map(|_| ())
     }
 
-    /// Snapshot of the configured strict allowlist. In permissive mode
-    /// this returns an empty `Vec` — callers that need a list of touchable
-    /// sessions should combine this with `list_sessions()` and treat
-    /// [`Self::is_permissive`] as "all live sessions are touchable".
+    /// Strict allowlist snapshot. Empty in permissive mode.
     pub fn allowlisted_sessions(&self) -> Vec<String> {
         self.strict.keys().cloned().collect()
     }
 
-    /// Resolve a session name to its [`SessionSlot`] (exact-target string
-    /// + per-session lock).
-    ///
-    /// Enforces the name regex in both modes and the strict allowlist in
-    /// strict mode; in permissive mode, allocates a fresh slot on first
-    /// reference and caches it.
     fn slot(&self, session: &str) -> Result<Arc<SessionSlot>> {
         if !is_valid_session_name(session) {
             return Err(TmuxError::InvalidName);
@@ -319,10 +252,8 @@ impl Tmux {
                 allowed,
             });
         }
-        // Permissive mode: lazy-alloc-and-cache. Re-check under the lock
-        // so two concurrent first-references share one slot (and thus one
-        // per-session mutex). Released at the end of the `{}` block so the
-        // Arc clone happens outside the critical section.
+        // Lazy alloc + cache; re-check under the lock so concurrent first
+        // references share one slot (and one mutex).
         let fresh = {
             let mut map = self.dynamic.lock().expect("dynamic slots poisoned");
             if let Some(slot) = map.get(session) {
@@ -339,13 +270,8 @@ impl Tmux {
     }
 }
 
-/// Validate a tmux session name. Strict allowlist — only alphanumeric,
-/// hyphen, underscore, and dot. Max 64 chars. No path separators or shell
-/// metacharacters.
-///
-/// Enforced at two points: every public `Tmux` method via `slot`, and at
-/// config load in `config.rs` so a bad `TELEGRAM_ALLOWED_SESSIONS` or
-/// `TELEGRAM_AUTOSTART_SESSION` fails loudly at startup.
+/// Shell-metachar / path-traversal defense. Enforced at config load and
+/// at every public `Tmux` method via `slot`.
 #[must_use]
 pub fn is_valid_session_name(name: &str) -> bool {
     !name.is_empty()
@@ -355,14 +281,10 @@ pub fn is_valid_session_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
-/// Map a non-zero tmux exit into the right `TmuxError` variant by looking
-/// at stderr. tmux's error wording is stable (hasn't changed in years), and
-/// we only need to recognize two shapes — "not found" (session/pane gone)
-/// and "already exists" (duplicate). Everything else falls through to
-/// `CommandFailed` with the stderr preserved.
-///
-/// `session` is the bare name (not `=name`) — so user-facing error strings
-/// never leak tmux's exact-match prefix.
+/// Classify tmux stderr into a typed error. `send-keys` reports "can't find
+/// pane"; most other subcommands report "can't find session" — both fold
+/// into `NotFound`. `session` is the bare name so user-facing strings never
+/// leak the `=NAME` prefix.
 fn classify_status(output: &std::process::Output, op: &'static str, session: &str) -> Result<()> {
     if output.status.success() {
         return Ok(());
@@ -370,8 +292,6 @@ fn classify_status(output: &std::process::Output, op: &'static str, session: &st
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr_lc = stderr.to_ascii_lowercase();
 
-    // `send-keys` on a missing target reports "can't find pane"; most
-    // other subcommands report "can't find session". Treat both as NotFound.
     if stderr_lc.contains("can't find session")
         || stderr_lc.contains("can't find pane")
         || stderr_lc.contains("session not found")
@@ -390,9 +310,7 @@ fn classify_status(output: &std::process::Output, op: &'static str, session: &st
     })
 }
 
-/// Remove the leading `=` that tmux echoes back in some error messages
-/// (notably `new-session`'s "duplicate session: =NAME"). That prefix is
-/// our internal exact-match syntax, not meaningful to the user.
+/// Strip the `=` that `new-session` echoes back in "duplicate session: =NAME".
 fn strip_equals_prefix(stderr: &str) -> std::borrow::Cow<'_, str> {
     if stderr.contains(": =") {
         std::borrow::Cow::Owned(stderr.replace(": =", ": "))
@@ -401,9 +319,7 @@ fn strip_equals_prefix(stderr: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Run a tmux subprocess with a 5-second bound. On timeout, the child future
-/// is dropped — `kill_on_drop(true)` sends SIGKILL — and a warn-level log
-/// fires so operators can see the hang.
+/// 5 s bound; on timeout the child is dropped and `kill_on_drop` sends SIGKILL.
 async fn run_tmux(op: &'static str, args: &[&str]) -> Result<std::process::Output> {
     let child = Command::new("tmux")
         .args(args)

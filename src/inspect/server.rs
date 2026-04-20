@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use super::{LiveContext, Snapshot, render};
+use crate::env_file;
 
 /// Origins a legitimate same-host browser POST could carry.
 pub(super) fn expected_origins_for(port: u16) -> Vec<String> {
@@ -32,7 +33,7 @@ pub(super) async fn accept_loop(
     snapshot: Arc<Snapshot>,
     live: Arc<LiveContext>,
     expected_origins: Arc<Vec<String>>,
-    tracker: TaskTracker,
+    _tracker: TaskTracker,
 ) {
     loop {
         let (stream, _peer) = tokio::select! {
@@ -52,19 +53,37 @@ pub(super) async fn accept_loop(
         let snapshot = snapshot.clone();
         let live = live.clone();
         let expected_origins = expected_origins.clone();
-        tracker.spawn(async move {
+        let conn_shutdown = shutdown.clone();
+        // Per-connection tasks are NOT tracked: a browser with the
+        // dashboard open holds a keep-alive connection that would stall
+        // the shutdown drain for its full timeout. These tasks serve
+        // non-critical HTML — fine to drop on Ctrl-C. On shutdown we
+        // also race serve_connection against the cancel token so the
+        // handler stops accepting new requests on the same connection.
+        tokio::spawn(async move {
             let service = service_fn(move |req| {
                 let snapshot = snapshot.clone();
                 let live = live.clone();
                 let expected_origins = expected_origins.clone();
                 async move { handle(req, snapshot, live, expected_origins).await }
             });
-            if let Err(e) = http1::Builder::new()
+            let serve = http1::Builder::new()
                 .timer(TokioTimer::new())
-                .serve_connection(io, service)
-                .await
-            {
-                tracing::debug!(err = %e, "inspect: connection ended");
+                .serve_connection(io, service);
+            tokio::pin!(serve);
+            tokio::select! {
+                res = &mut serve => {
+                    if let Err(e) = res {
+                        tracing::debug!(err = %e, "inspect: connection ended");
+                    }
+                }
+                () = conn_shutdown.cancelled() => {
+                    serve.as_mut().graceful_shutdown();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        serve,
+                    ).await;
+                }
             }
         });
     }
@@ -313,18 +332,21 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Rewrite the env file atomically. Preserves comments + existing order.
-/// Keys not already in the file are appended.
-fn write_env_file(path: &Path, updates: &[(&'static str, String)]) -> std::io::Result<()> {
-    use std::fs;
-    let current = fs::read_to_string(path).unwrap_or_default();
+/// Rewrite the env file atomically, mode 0600. Preserves comments and
+/// existing line order. Keys not already in the file are appended.
+///
+/// The 0600 guarantee comes from [`env_file::atomic_write_0600`]; a
+/// previous implementation used `fs::write` which creates under the
+/// process umask (0644 on macOS by default) and silently demoted the
+/// file's perms through the rename, exposing the bot token.
+fn write_env_file(path: &Path, updates: &[(&'static str, String)]) -> anyhow::Result<()> {
+    let current = std::fs::read_to_string(path).unwrap_or_default();
     let mut lines: Vec<String> = current.lines().map(str::to_string).collect();
 
     for (key, value) in updates {
-        let prefix = format!("{key}=");
         let replaced = lines
             .iter_mut()
-            .find(|line| line.trim_start().starts_with(&prefix));
+            .find(|line| env_file::parse_kv_line(line).is_some_and(|(k, _)| k == *key));
         if let Some(line) = replaced {
             *line = format!("{key}={value}");
         } else {
@@ -332,12 +354,9 @@ fn write_env_file(path: &Path, updates: &[(&'static str, String)]) -> std::io::R
         }
     }
 
-    let tmp_path = path.with_extension("env.tmp");
     let mut body = lines.join("\n");
     body.push('\n');
-    fs::write(&tmp_path, body)?;
-    fs::rename(&tmp_path, path)?;
-    Ok(())
+    env_file::atomic_write_0600(path, &body)
 }
 
 /// Origin-header CSRF check. Missing `Origin` = same-origin form POST

@@ -2,10 +2,11 @@
 //! rate limiting. Both guard the inbound-message path before any tmux
 //! work happens — the rate limit is cheap, the auth check is free.
 
-use crate::types::Update;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use crate::telegram::types::Update;
 
 /// Authorize by Telegram numeric `user_id`. Never authenticate by username —
 /// usernames are recyclable and mutable, making them unsafe for access control.

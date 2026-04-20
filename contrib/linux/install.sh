@@ -1,9 +1,9 @@
 #!/bin/bash
 # Thin wrapper — builds the release binary if needed, then delegates to
-# `tebis install` (which handles all the platform-specific plist work).
+# `tebis install` (which handles all the systemd work).
 #
 # Usage:
-#   ./contrib/macos/install.sh
+#   ./contrib/linux/install.sh
 
 set -eu
 

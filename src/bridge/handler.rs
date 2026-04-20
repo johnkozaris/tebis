@@ -1,29 +1,17 @@
 //! Command parsing and execution.
 //!
-//! Split into three layers:
-//!
-//! - **Parser** ([`parse`]) — pure: `&str` → [`Command`]. No I/O, no deps.
-//! - **Executor** ([`execute`]) — glues commands to [`crate::tmux::Tmux`]
-//!   and [`crate::session::SessionState`], converts tmux errors into a
-//!   Telegram-safe [`Response`].
-//! - **State** — owned by [`crate::session::SessionState`], not this module.
-//!
-//! Recovery path: when a tmux operation on the default target fails with
-//! [`crate::tmux::TmuxError::NotFound`], the executor clears the stale
-//! default via [`SessionState::clear_target_if`]. For plain-text messages
-//! it also retries once via autostart so the user's message lands in a
-//! fresh session — this is the "phone drove Claude, Claude exited between
-//! messages" case, and making it self-heal beats leaving the user to
-//! debug tmux.
+//! Pure parser (`parse`) + executor (`execute`) that turn a Telegram message
+//! into a tmux side effect and a reply. Stale-target recovery: on
+//! `TmuxError::NotFound` we clear the cached default and, for plain-text
+//! messages, retry once via autostart.
 
 use std::collections::HashSet;
 use std::time::Instant;
 
+use super::session::SessionState;
 use crate::sanitize;
-use crate::session::SessionState;
 use crate::tmux::Tmux;
 
-/// Parsed command from a Telegram message.
 pub enum Command {
     List,
     Send {
@@ -49,27 +37,30 @@ pub enum Command {
     PlainText(String),
 }
 
-/// Response shape. `Text` sends a chat reply; `ReactSuccess` reacts 👍 to
-/// the originating message — lighter UX for fire-and-forget commands.
+/// `Text` sends a reply; `ReactSuccess` reacts 👍 — lighter UX for
+/// fire-and-forget commands. `Sent` is the "text delivered to a tmux
+/// session" response: `bridge::handle_update` turns it into a typing
+/// indicator + auto-reply when enabled, or a 👍 fallback otherwise.
+/// `baseline` is the pane capture taken *before* `send_keys`, used to
+/// extract just the new content for the auto-reply (so we don't dump
+/// the agent's whole scrollback every time).
 pub enum Response {
     Text(String),
     ReactSuccess,
+    Sent {
+        session: String,
+        baseline: Option<String>,
+    },
 }
 
-/// Dependencies the executor needs. Kept small so `execute` stays the thin
-/// seam between "parsed command" and "tmux side effect + response".
 pub struct Deps<'a> {
     pub tmux: &'a Tmux,
     pub session: &'a SessionState,
-    /// Process start instant — used by `/status` to report uptime. Copy-cheap
-    /// so we pass by value rather than shared state.
     pub started_at: Instant,
 }
 
-/// Strip a command prefix (`/cmd `) with either a space or tab separator,
-/// returning the remainder trimmed of leading whitespace. Returns `None`
-/// if the text doesn't start with `/cmd` followed by a separator — so
-/// `/newt` won't be mistaken for `/new t`.
+/// Strip `/<cmd>` followed by a space/tab separator. Returning `None` for
+/// `/cmdmore` prevents `/newt` being mistaken for `/new t`.
 fn strip_cmd<'a>(text: &'a str, cmd: &str) -> Option<&'a str> {
     let after = text.strip_prefix(cmd)?;
     let rest = after
@@ -78,30 +69,24 @@ fn strip_cmd<'a>(text: &'a str, cmd: &str) -> Option<&'a str> {
     Some(rest)
 }
 
-/// Accept a session name the user typed into a command. Lenient: if the
-/// user copy-pasted `=NAME` out of a tmux error message, strip the prefix
-/// before it hits `security::is_valid_session_name` (which rejects `=`).
-/// The bare name is what every other caller expects.
+/// Accept `=NAME` (tmux exact-match syntax) and hand back bare `NAME` —
+/// lets users paste session names out of tmux error messages.
 fn normalize_session_arg(raw: &str) -> String {
     raw.strip_prefix('=').unwrap_or(raw).to_string()
 }
 
-/// Parse a message into a command.
 pub fn parse(text: &str) -> Command {
     let text = text.trim();
 
     if text.eq_ignore_ascii_case("/list") {
         return Command::List;
     }
-
     if text.eq_ignore_ascii_case("/status") {
         return Command::Status;
     }
-
     if text.eq_ignore_ascii_case("/restart") {
         return Command::Restart;
     }
-
     if text.eq_ignore_ascii_case("/help") || text.eq_ignore_ascii_case("/start") {
         return Command::Help;
     }
@@ -153,9 +138,8 @@ pub fn parse(text: &str) -> Command {
     Command::PlainText(text.to_string())
 }
 
-/// Execute a command. Errors become a Telegram-safe text response — the
-/// message content is HTML-escaped so a `<` in a tmux stderr can't break
-/// `parse_mode=HTML` and cause Telegram to reject the reply.
+/// Execute a command. Errors surface as Telegram-safe `Response::Text` with
+/// HTML-escaped content so tmux stderr can't break `parse_mode=HTML`.
 pub async fn execute(cmd: Command, deps: &Deps<'_>) -> Response {
     match handle(cmd, deps).await {
         Ok(r) => r,
@@ -163,9 +147,6 @@ pub async fn execute(cmd: Command, deps: &Deps<'_>) -> Response {
     }
 }
 
-/// Inner error type — `String` lets us collapse `TmuxError` /
-/// `ResolveError` into a single shape before it hits the Telegram layer.
-/// The Display strings are already user-safe (no `=` prefix, no tokens).
 type HandleResult = Result<Response, String>;
 
 async fn handle(cmd: Command, deps: &Deps<'_>) -> HandleResult {
@@ -189,9 +170,6 @@ async fn list(deps: &Deps<'_>) -> HandleResult {
         return Ok(Response::Text("No active tmux sessions.".to_string()));
     }
 
-    // In permissive mode (empty allowlist) every valid name is touchable,
-    // so every live session gets the ✓. In strict mode the set marks
-    // which ones we can `/send` / `/read` / `/kill`.
     let permissive = deps.tmux.is_permissive();
     let allowed = deps.tmux.allowlisted_sessions();
     let allowed_set: HashSet<&str> = allowed.iter().map(String::as_str).collect();
@@ -215,8 +193,24 @@ async fn list(deps: &Deps<'_>) -> HandleResult {
 }
 
 async fn send(deps: &Deps<'_>, session: &str, text: &str) -> HandleResult {
+    // Snapshot the pane BEFORE the send so the auto-reply can diff
+    // against it and only forward new content. On failure, we carry
+    // `None` and the auto-reply falls back to a plain tail.
+    let baseline = match deps.tmux.capture_pane(session, 100).await {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::debug!(
+                err = %e, session,
+                "baseline capture_pane failed — autoreply will fall back to pane tail"
+            );
+            None
+        }
+    };
     match deps.tmux.send_keys(session, text).await {
-        Ok(()) => Ok(Response::ReactSuccess),
+        Ok(()) => Ok(Response::Sent {
+            session: session.to_string(),
+            baseline,
+        }),
         Err(e) => {
             if e.is_not_found() {
                 deps.session.clear_target_if(session);
@@ -231,10 +225,6 @@ async fn read(deps: &Deps<'_>, session: Option<String>, lines: Option<usize>) ->
         .session
         .resolve_explicit(session)
         .map_err(|e| e.to_string())?;
-    // Cap at 5000 lines. `sanitize::sanitize_tmux_output` eventually
-    // truncates to `max_output_chars`, so huge values only cost a slower
-    // capture subprocess, but the bound is cheap insurance against a
-    // user typing `/read sess 99999999`.
     let lines = lines.unwrap_or(50).min(5_000);
     let output = match deps.tmux.capture_pane(&session, lines).await {
         Ok(o) => o,
@@ -274,18 +264,16 @@ async fn new(deps: &Deps<'_>, session: &str) -> HandleResult {
 }
 
 async fn kill(deps: &Deps<'_>, session: &str) -> HandleResult {
-    // `kill_session` is idempotent on NotFound at the tmux layer; any error
-    // here is a real one. Always clear the default target if it matched —
-    // the user's intent is unambiguous.
     let result = deps.tmux.kill_session(session).await;
     deps.session.clear_target_if(session);
+    // Forget that this session was hooked — if the user later
+    // `/new`s a bare session with the same name, pane-settle should
+    // apply, not the stale "hooks will deliver" assumption.
+    deps.session.unmark_hooked(session);
     result.map_err(|e| e.to_string())?;
     Ok(Response::ReactSuccess)
 }
 
-/// `/status` — snapshot of bridge state the user would otherwise have to
-/// deduce from error messages. HTML-escaped so a session name with an
-/// HTML-special char can't break `parse_mode=HTML`.
 fn status(deps: &Deps<'_>) -> String {
     let target = deps
         .session
@@ -295,8 +283,6 @@ fn status(deps: &Deps<'_>) -> String {
         .session
         .autostart_session()
         .unwrap_or("(not configured)");
-    // Permissive (empty) mode reports "(any)" so the user sees it's not
-    // an error state — distinct from strict mode with an empty list.
     let allowlist = if deps.tmux.is_permissive() {
         "(any)".to_string()
     } else {
@@ -310,62 +296,66 @@ fn status(deps: &Deps<'_>) -> String {
     format!("<pre>{}</pre>", sanitize::escape_html(&body))
 }
 
-/// `/restart` — kill the autostart session and drop the cached target so
-/// the next plain-text message re-provisions. Explicit, fast way to
-/// recover from "Claude hung, restart please" without the user having to
-/// `/kill` + send a new message.
 async fn restart(deps: &Deps<'_>) -> HandleResult {
     let Some(name) = deps.session.autostart_session() else {
         return Err("No autostart session configured; nothing to restart.".to_string());
     };
-    let name = name.to_string(); // detach lifetime from SessionState
+    let name = name.to_string();
     deps.tmux
         .kill_session(&name)
         .await
         .map_err(|e| e.to_string())?;
     deps.session.clear_target_if(&name);
+    // `/restart` drops the cache so the next plain-text re-runs
+    // autostart → re-installs hooks if configured. Forget the flag
+    // so the install path runs cleanly instead of short-circuiting.
+    deps.session.unmark_hooked(&name);
     Ok(Response::Text(format!(
         "Killed <code>{}</code>. Next plain-text message will re-provision.",
         sanitize::escape_html(&name)
     )))
 }
 
-/// Plain-text path: resolve (or autostart) a target, send to it. If the
-/// resolved session turns out to be stale (tmux says `NotFound`), clear the
-/// cached default, drain any zombie state, and retry once with fresh
-/// provisioning. One retry only — good enough for the transient-death
-/// case (Claude exited between messages) without risking loops if
-/// autostart itself keeps failing.
-///
-/// The retry explicitly calls `kill_session` (idempotent) before
-/// reprovisioning. tmux's teardown of a dying session can briefly lag,
-/// during which `has_session` returns `true` even though `send_keys`
-/// fails. Killing first guarantees the subsequent `has_session` check
-/// inside `resolve_or_autostart` returns `false`, so we always
-/// re-provision — no chance of replaying the same failure.
+/// Resolve-or-autostart, send, and on `NotFound` drain + reprovision + retry
+/// once. Explicit kill before the retry breaks zombie `has_session` states.
 async fn plain_text(deps: &Deps<'_>, text: &str) -> HandleResult {
     let session = resolve_or_autostart_str(deps).await?;
+    // Baseline for diff-based auto-reply. On retry with a fresh session
+    // the baseline is `None` (nothing was there before autostart).
+    let baseline = match deps.tmux.capture_pane(&session, 100).await {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::debug!(
+                err = %e, session,
+                "plain_text baseline capture failed — autoreply will fall back to pane tail"
+            );
+            None
+        }
+    };
     match deps.tmux.send_keys(&session, text).await {
-        Ok(()) => Ok(Response::ReactSuccess),
+        Ok(()) => Ok(Response::Sent { session, baseline }),
         Err(e) if e.is_not_found() => {
             deps.session.clear_target_if(&session);
-            // Drain any zombie tmux state before reprovisioning.
-            // `kill_session` is idempotent on NotFound, so an already-
-            // gone session is a no-op.
-            let _ = deps.tmux.kill_session(&session).await;
+            if let Err(kill_err) = deps.tmux.kill_session(&session).await {
+                tracing::debug!(
+                    err = %kill_err, session,
+                    "plain_text retry: kill_session drain failed (usually harmless — session was already gone)"
+                );
+            }
             let fresh = resolve_or_autostart_str(deps).await?;
             deps.tmux
                 .send_keys(&fresh, text)
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(Response::ReactSuccess)
+            Ok(Response::Sent {
+                session: fresh,
+                baseline: None,
+            })
         }
         Err(e) => Err(e.to_string()),
     }
 }
 
-/// Thin wrapper that flattens `ResolveError` into the `String` error channel
-/// `handle` uses. Factored because `plain_text` calls it twice (initial + retry).
 async fn resolve_or_autostart_str(deps: &Deps<'_>) -> Result<String, String> {
     deps.session
         .resolve_or_autostart(deps.tmux)
@@ -373,9 +363,6 @@ async fn resolve_or_autostart_str(deps: &Deps<'_>) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Render uptime into a short human-friendly form (e.g. `3d 4h 12m`).
-/// Never zero-pads (so `5m 3s` reads naturally). Always shows seconds so
-/// newly-started bridges don't say just `0m`.
 fn format_uptime(d: std::time::Duration) -> String {
     use std::fmt::Write as _;
     let mut s = d.as_secs();
@@ -399,8 +386,6 @@ fn format_uptime(d: std::time::Duration) -> String {
     out
 }
 
-// ---------- help text ----------
-
 const HELP_BASE: &str = concat!(
     "<b>Commands:</b>\n",
     "/list — list tmux sessions (✓ = allowlisted)\n",
@@ -418,16 +403,9 @@ const HELP_BASE: &str = concat!(
     "(e.g. <code>claude</code>) in the configured directory.",
 );
 
-// Keep the static base under the Telegram 4096-char ceiling with slack.
-// If this fails, someone added too much to HELP_BASE.
-const _: () = assert!(
-    HELP_BASE.len() < 3800,
-    "HELP_BASE must leave room for autostart suffix + Telegram's 4096-char send cap"
-);
+// Keep HELP_BASE well under Telegram's 4096-char ceiling.
+const _: () = assert!(HELP_BASE.len() < 3800, "HELP_BASE too long");
 
-/// Render help text with the concrete autostart session name appended
-/// (if configured). Rendered per-call so `/help` always reflects current
-/// config — cheap because it's just a `String::from` + `push_str`.
 fn help_text(autostart_session: Option<&str>) -> String {
     let mut out = HELP_BASE.to_string();
     if let Some(name) = autostart_session {
@@ -442,8 +420,6 @@ fn help_text(autostart_session: Option<&str>) -> String {
 mod tests {
     use super::*;
 
-    /// Helper — match on the shape of a parsed command so assertions read
-    /// like expectations rather than pattern acrobatics.
     fn kind(cmd: &Command) -> &'static str {
         match cmd {
             Command::List => "list",
@@ -493,8 +469,6 @@ mod tests {
 
     #[test]
     fn send_without_text_falls_through_to_help() {
-        // `/send sessname` alone (no trailing text) isn't a valid Send —
-        // we fall through to the catch-all `/cmd → Help` at the bottom.
         assert_eq!(kind(&parse("/send mysession")), "help");
     }
 
@@ -540,10 +514,9 @@ mod tests {
         assert_eq!(kind(&parse("/kill")), "help");
     }
 
+    /// Regression: bare-prefix matching would treat `/newt` as `/new t`.
     #[test]
     fn newt_is_not_new() {
-        // Regression: bare-prefix matching would incorrectly treat
-        // `/newt` as `/new t`.
         assert_eq!(kind(&parse("/newt")), "help");
         assert_eq!(kind(&parse("/killr anything")), "help");
     }
@@ -573,11 +546,9 @@ mod tests {
         }
     }
 
+    /// Users who see `=name` in a tmux error should be able to paste it back.
     #[test]
     fn equals_prefix_stripped_from_user_args() {
-        // Users who see `=demo` in a tmux error message (e.g.
-        // `duplicate session: =demo` from new-session) should be able
-        // to paste it back into /kill without hitting the validator.
         match parse("/kill =demo") {
             Command::Kill { session } => assert_eq!(session, "demo"),
             c => panic!("{}", kind(&c)),
@@ -627,9 +598,6 @@ mod tests {
 
     #[test]
     fn help_text_escapes_autostart_name() {
-        // Name can't actually contain `<` (allowlist rejects it), but the
-        // escape path must still be HTML-safe in case of future regex
-        // relaxation.
         let out = help_text(Some("a&b"));
         assert!(out.contains("a&amp;b"));
     }

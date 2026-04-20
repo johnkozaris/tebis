@@ -1,22 +1,8 @@
-//! Process-level orchestration: config → wiring → poll loop → shutdown.
-//!
-//! The split:
-//!
-//! - `main` — tokio runtime, tracing, panic hook, config load, Telegram
-//!   client bring-up, shared-state construction, signal handling, and the
-//!   `getUpdates` poll loop with its 409/5xx/Conflict backoff policy.
-//! - [`bridge::handle_update`] — per-message behavior: rate limit, parse,
-//!   execute, reply. Lives in `bridge.rs` so `main` stays focused on the
-//!   lifecycle and the behavior side is testable without spinning up the
-//!   whole poll loop.
-//!
-//! That boundary is what "separate the bridge from the behavior" means in
-//! practice: the plumbing here (`main.rs`, `telegram.rs`, `tmux.rs`) knows
-//! nothing about commands or autostart; the policy (`bridge.rs`,
-//! `handler.rs`, `session.rs`) knows nothing about how bytes arrive.
+//! Process entry point — argv dispatch + foreground run loop.
 
 use anyhow::{Context, Result};
 use std::env;
+use std::process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
@@ -24,86 +10,192 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing_subscriber::EnvFilter;
 
-// Modules live in `lib.rs` so `examples/` can share them.
-use tebis::{bridge, config, inspect, metrics, notify, security, session, setup, telegram, tmux};
+use tebis::bridge::session;
+use tebis::{
+    bridge, config, hooks_cli, inspect, lockfile, metrics, notify, security, service, setup,
+    telegram, tmux,
+};
 
 const HELP: &str = "\
 tebis — Telegram-tmux bridge
 
 Usage:
-  tebis                 Start the bridge (reads config from env)
-  tebis setup           Interactive first-run setup wizard
-  tebis --help          Show this message
-  tebis --version       Print version
+  tebis                 Run in foreground (auto-loads ~/.config/tebis/env).
+  tebis setup           Interactive first-run config wizard.
+  tebis install         Install as a background service (launchd / systemd user).
+  tebis uninstall       Remove the background service.
+  tebis start           Start the installed background service.
+  tebis stop            Stop the installed background service.
+  tebis restart         Stop + start the installed service (e.g. after config edit).
+  tebis status          Show service + foreground state.
+  tebis hooks <verb>    Manage agent hooks: install | uninstall | status.
+  tebis --help / -h     This message.
+  tebis --version / -V  Print version.
 
 Required env (set by `tebis setup` or your own scripts):
   TELEGRAM_BOT_TOKEN            Bot token from @BotFather
   TELEGRAM_ALLOWED_USER         Your numeric Telegram user id
-  TELEGRAM_ALLOWED_SESSIONS     Comma-separated tmux session allowlist
 
 Optional env:
+  TELEGRAM_ALLOWED_SESSIONS     Comma-separated tmux session allowlist
   TELEGRAM_POLL_TIMEOUT         Long-poll seconds (default 30, 1..=900)
   TELEGRAM_MAX_OUTPUT_CHARS     /read truncation cap (default 4000)
-  TELEGRAM_AUTOSTART_SESSION    Autostart session name (must be in allowlist)
-  TELEGRAM_AUTOSTART_DIR        Autostart cwd
+  TELEGRAM_AUTOSTART_SESSION    Autostart session name
+  TELEGRAM_AUTOSTART_DIR        Autostart working directory
   TELEGRAM_AUTOSTART_COMMAND    Autostart command (e.g. `claude`)
   NOTIFY_CHAT_ID                Enable hook-forward UDS listener
   NOTIFY_SOCKET_PATH            UDS path (default $XDG_RUNTIME_DIR/tebis.sock)
-  INSPECT_PORT                  Enable local control dashboard on 127.0.0.1
+  INSPECT_PORT                  Local control dashboard on 127.0.0.1:<port>
   BRIDGE_ENV_FILE               Env file path (enables dashboard Settings edits)
+  TELEGRAM_AUTOREPLY            `off` to disable pane-settle auto-reply
+  TELEGRAM_HOOKS_MODE           `auto` to auto-install agent hooks at autostart
+  TELEGRAM_NOTIFY               `off` to disable outbound-notify UDS listener
 
-Docs: see README.md and CLAUDE.md.
+Docs: README.md · CLAUDE.md.
 ";
 
 fn main() -> Result<()> {
-    if let Some(arg) = env::args().nth(1) {
-        match arg.as_str() {
-            "--help" | "-h" => {
-                print!("{HELP}");
-                return Ok(());
-            }
-            "--version" | "-V" => {
-                println!("tebis {}", env!("CARGO_PKG_VERSION"));
-                return Ok(());
-            }
-            "setup" | "init" => return setup::run(),
-            other => {
-                eprintln!("unknown argument: {other}\n\n{HELP}");
-                std::process::exit(2);
-            }
+    match env::args().nth(1).as_deref() {
+        Some("--help" | "-h") => {
+            print!("{HELP}");
+            Ok(())
+        }
+        Some("--version" | "-V") => {
+            println!("tebis {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("setup" | "init") => handle_setup(),
+        Some("install") => service::install(),
+        Some("uninstall") => service::uninstall(),
+        Some("start") => service::start(),
+        Some("stop") => service::stop(),
+        Some("restart") => service::restart(),
+        Some("status") => service::status(),
+        Some("hooks") => hooks_cli::run(&env::args().skip(2).collect::<Vec<_>>()),
+        Some(other) => {
+            eprintln!("tebis: unknown argument: {other}\n\n{HELP}");
+            process::exit(2);
+        }
+        None => {
+            ensure_env_loaded()?;
+            run_bridge()
         }
     }
-
-    // No args: start the bridge. If the user hasn't run setup yet and no
-    // env is present, point them at the wizard rather than dumping a
-    // stack of "env var not set" errors.
-    if first_run_check_needed() {
-        eprintln!(
-            "tebis: no config found — run `tebis setup` first.\n\
-             (Expected env vars like TELEGRAM_BOT_TOKEN; see `tebis --help`.)"
-        );
-        std::process::exit(2);
-    }
-
-    run_bridge()
 }
 
-/// True when both the primary required env var is missing AND the
-/// canonical env file doesn't exist. Either on its own means "not a
-/// fresh user", so we only nudge toward `setup` when nothing at all is
-/// configured.
-fn first_run_check_needed() -> bool {
+/// Dispatch what the wizard asked for — foreground run / service install /
+/// nothing (already printed instructions).
+fn handle_setup() -> Result<()> {
+    match setup::run()? {
+        setup::Next::Exit => Ok(()),
+        setup::Next::Install => service::install(),
+        setup::Next::RunForeground => {
+            let env_path = setup::env_file_path()?;
+            // SAFETY: we're still in `main` before any async runtime or
+            // thread is spawned. `run_bridge` below creates the tokio
+            // runtime; env is loaded strictly before that.
+            unsafe { config::load_env_file(&env_path) }
+                .with_context(|| format!("loading env file {}", env_path.display()))?;
+            run_bridge()
+        }
+    }
+}
+
+/// Make bare `tebis` Just Work after `tebis setup`. If the env vars are
+/// already present (systemd / launchd path), this is a no-op.
+fn ensure_env_loaded() -> Result<()> {
     if env::var("TELEGRAM_BOT_TOKEN").is_ok_and(|v| !v.is_empty()) {
-        return false;
+        return Ok(());
     }
-    setup::env_file_path().map_or(true, |p| !p.exists())
+    let Ok(path) = setup::env_file_path() else {
+        nudge_to_setup();
+    };
+    if !path.exists() {
+        nudge_to_setup();
+    }
+    // SAFETY: called from `main` before the tokio runtime is built.
+    unsafe { config::load_env_file(&path) }
+        .with_context(|| format!("loading env file {}", path.display()))?;
+    Ok(())
 }
 
-/// Global cap on concurrent handlers doing tmux work. Single-user bot —
-/// realistic need is 1-2 at a time; 8 is generous. Bounds subprocess
-/// fan-out when Telegram delivers a burst of queued updates (e.g., after
-/// the phone reconnects from offline).
+/// `auto` / `off` — the user-facing name for `HooksMode`. Inline
+/// rather than adding an `impl Display` on `HooksMode` because the
+/// dashboard row is the only consumer.
+const fn hooks_mode_label(mode: tebis::agent_hooks::HooksMode) -> &'static str {
+    match mode {
+        tebis::agent_hooks::HooksMode::Auto => "auto",
+        tebis::agent_hooks::HooksMode::Off => "off",
+    }
+}
+
+fn nudge_to_setup() -> ! {
+    eprintln!(
+        "tebis: no config found — run `tebis setup` first.\n\
+         (Expected env vars like TELEGRAM_BOT_TOKEN; see `tebis --help`.)"
+    );
+    process::exit(2);
+}
+
+/// Translate a 401 from Telegram into an operator-actionable anyhow error.
+/// Returned from `run_bridge` so launchd / systemd still see a failure
+/// exit, but the user gets a clear "re-run setup" message instead of a
+/// cryptic `API error 401: Unauthorized` crash loop.
+fn unauthorized_dead_end(err: &telegram::TelegramError) -> anyhow::Error {
+    eprintln!();
+    eprintln!(
+        "  {}  Telegram rejected the bot token (401 Unauthorized).",
+        console::style("✗").red().bold()
+    );
+    eprintln!();
+    eprintln!("  The token in ~/.config/tebis/env is wrong, revoked, or was regenerated");
+    eprintln!("  in BotFather. Re-run `tebis setup` to paste a fresh one.");
+    eprintln!();
+    anyhow::anyhow!("bot token rejected by Telegram (401 Unauthorized): {err}")
+}
+
+/// Single-user workload: realistic concurrency is 1–2. 8 bounds subprocess
+/// fan-out when Telegram delivers a queued burst.
 const MAX_CONCURRENT_HANDLERS: usize = 8;
+
+/// Acquire the single-instance lock. On conflict, tell the user exactly
+/// who holds it — the background service, a foreground run, or unknown.
+fn acquire_instance_lock() -> Result<lockfile::LockFile> {
+    let path = lockfile::default_path();
+    match lockfile::acquire(&path) {
+        Ok(lock) => Ok(lock),
+        Err(lockfile::AcquireError::Locked { pid, .. }) => {
+            eprintln!();
+            eprintln!("tebis: another instance is already running.");
+            if let Some(pid) = pid {
+                eprintln!("  holder pid:   {pid}");
+            }
+            if service::is_running() {
+                eprintln!(
+                    "  source:       the background service (stop it with `tebis stop`, \
+                     or remove it with `tebis uninstall`)."
+                );
+                eprintln!(
+                    "  note:         if you're running a dev build from source and the \
+                     service is installed too, run `tebis stop` before testing."
+                );
+            } else if let Some(pid) = pid {
+                eprintln!(
+                    "  source:       another foreground run — stop it with `kill {pid}` \
+                     if you're sure."
+                );
+            } else {
+                eprintln!(
+                    "  source:       unknown (lock file is empty). Try \
+                     `ps aux | grep tebis` to find the holder."
+                );
+            }
+            eprintln!();
+            process::exit(1);
+        }
+        Err(e) => Err(anyhow::Error::new(e)),
+    }
+}
 
 #[tokio::main]
 #[expect(
@@ -113,8 +205,12 @@ const MAX_CONCURRENT_HANDLERS: usize = 8;
 async fn run_bridge() -> Result<()> {
     print_startup_banner();
 
-    // 1. Tracing — low-level HTTP/TLS crates at warn to keep the bot token
-    //    (embedded in the request URL) out of debug logs.
+    // Single-instance guard. Held for the lifetime of the daemon; dropped
+    // at function exit, which releases the flock and removes the file.
+    let _lock = acquire_instance_lock()?;
+
+    // HTTP/TLS crates pinned at warn so bot tokens embedded in request URLs
+    // never appear at debug level in the journal.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -123,7 +219,6 @@ async fn run_bridge() -> Result<()> {
         .with_target(false)
         .init();
 
-    // 2. Redacted panic hook — body of panic is suppressed.
     std::panic::set_hook(Box::new(|info| {
         tracing::error!(
             "PANIC at {}: panicked",
@@ -132,23 +227,49 @@ async fn run_bridge() -> Result<()> {
         );
     }));
 
-    // 3. rustls crypto provider — install once, up front. Must happen
-    //    before any TLS handshake. Panics if already installed, which
-    //    would indicate a dep silently picked a different backend.
     telegram::install_crypto_provider();
 
-    // 4. Config
-    let config = config::Config::from_env()?;
+    let mut config = config::Config::from_env()?;
     tracing::info!(
         allowed_user = config.allowed_user_id,
         sessions = ?config.allowed_sessions,
         "Config loaded"
     );
 
-    // 4. Telegram client + webhook teardown + getMe verification
+    // Build the shutdown token + signal listener BEFORE the Telegram
+    // startup so a SIGTERM during a Telegram outage breaks out of the
+    // getMe / deleteWebhook retry budget (up to ~50s without this race).
+    let shutdown = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    {
+        let shutdown = shutdown.clone();
+        tracker.spawn(async move {
+            shutdown_signal().await;
+            tracing::info!("Shutdown signal received");
+            shutdown.cancel();
+        });
+    }
+
     let tg = Arc::new(telegram::TelegramClient::new(&config.bot_token));
-    tg.delete_webhook().await?;
-    let me = tg.get_me().await?;
+    let delete_webhook_result = tokio::select! {
+        r = tg.delete_webhook() => r,
+        () = shutdown.cancelled() => return Ok(()),
+    };
+    if let Err(e) = delete_webhook_result {
+        if e.is_unauthorized() {
+            return Err(unauthorized_dead_end(&e));
+        }
+        return Err(e.into());
+    }
+    let get_me_result = tokio::select! {
+        r = tg.get_me() => r,
+        () = shutdown.cancelled() => return Ok(()),
+    };
+    let me = match get_me_result {
+        Ok(me) => me,
+        Err(e) if e.is_unauthorized() => return Err(unauthorized_dead_end(&e)),
+        Err(e) => return Err(e.into()),
+    };
     tracing::info!(
         bot_id = me.id,
         bot_username = ?me.username,
@@ -156,9 +277,6 @@ async fn run_bridge() -> Result<()> {
         me.first_name
     );
 
-    // 5. Snapshot non-secret config + identity for the inspect dashboard
-    //    BEFORE any field is moved into a subsystem below. `config.bot_token`
-    //    is deliberately not copied — no path from env → dashboard.
     let inspect_port: Option<u16> = match env::var("INSPECT_PORT") {
         Ok(s) => Some(
             s.parse()
@@ -194,19 +312,27 @@ async fn run_bridge() -> Result<()> {
                 socket_path: n.socket_path.to_string_lossy().into_owned(),
                 chat_id: n.chat_id,
             }),
-            // Enables the Settings panel edit form when set. systemd
-            // unit should export this alongside `EnvironmentFile=`.
+            hooks: inspect::HooksInfo {
+                mode: hooks_mode_label(config.hooks_mode),
+                entries: tebis::agent_hooks::manifest::load_entries()
+                    .into_iter()
+                    .map(|e| inspect::HooksEntryInfo {
+                        agent: e.agent,
+                        dir: e.dir.display().to_string(),
+                        installed_at: e.installed_at,
+                    })
+                    .collect(),
+            },
             env_file: env::var("BRIDGE_ENV_FILE").ok(),
         }))
     } else {
         None
     };
 
-    // 6. Shared state. `SessionState` owns the mutable session bookkeeping
-    //    (default target + autostart + its serialization lock); `Tmux` is
-    //    the pure API wrapper.
+    let autoreply_cfg = config.autoreply.take().map(Arc::new);
+
     let tmux = Arc::new(tmux::Tmux::new(
-        config.allowed_sessions,
+        config.allowed_sessions.clone(),
         config.max_output_chars,
     ));
     if let Some(a) = config.autostart.as_ref() {
@@ -217,35 +343,30 @@ async fn run_bridge() -> Result<()> {
             "Autostart configured — first plain-text message will provision this session"
         );
     }
-    let session_state = Arc::new(session::SessionState::new(config.autostart));
+
+    // Snapshot everything `print_ready_status` needs BEFORE we move
+    // `config.autostart` into `SessionState`. Reading from env vars at
+    // print time would work but drifts from the validated Config.
+    let ready_allowlist = config.allowed_sessions.clone();
+    let ready_autostart = config
+        .autostart
+        .as_ref()
+        .map(|a| format!("{} · {} · {}", a.session, a.dir, a.command));
+
+    let session_state = Arc::new(session::SessionState::new(
+        config.autostart.take(),
+        config.hooks_mode,
+    ));
     let rate_limiter = Arc::new(security::RateLimiter::new(30, 10));
     let handler_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS));
     let metrics = Arc::new(metrics::Metrics::new());
     let started_at = Instant::now();
 
-    // 6. Shutdown plumbing — cancel token fans out, task tracker drains.
-    let shutdown = CancellationToken::new();
-    let tracker = TaskTracker::new();
-    {
-        let shutdown = shutdown.clone();
-        // Tracked so `wait()` on shutdown has a consistent view — the
-        // signal task is short-lived (fires `cancel()` and returns) but
-        // keeping it under the same TaskTracker is consistent with every
-        // other spawned task in the process.
-        tracker.spawn(async move {
-            shutdown_signal().await;
-            tracing::info!("Shutdown signal received");
-            shutdown.cancel();
-        });
-    }
-
-    // 7. Outbound-notify listener (UDS, owner-only). Opt-in via config.
     if let Some(n) = config.notify {
         let forwarder = Arc::new(notify::TelegramForwarder::new(tg.clone(), n.chat_id));
         notify::spawn(&tracker, shutdown.clone(), n.socket_path, forwarder)?;
     }
 
-    // 7b. Inspect dashboard (local HTTP). Opt-in via INSPECT_PORT.
     if let (Some(port), Some(snapshot)) = (inspect_port, inspect_snapshot) {
         let live = inspect::LiveContext::new(
             tmux.clone(),
@@ -253,25 +374,30 @@ async fn run_bridge() -> Result<()> {
             handler_sem.clone(),
             metrics.clone(),
             started_at,
-            // Same CancellationToken the poll loop watches — the
-            // /actions/restart endpoint cancels it for graceful exit.
             shutdown.clone(),
         );
         inspect::spawn(&tracker, shutdown.clone(), port, snapshot, live)?;
     }
 
-    // 8. Poll loop — pure plumbing. Per-message behavior is in `bridge.rs`.
     let mut offset: Option<i64> = None;
     let mut backoff = Duration::from_secs(1);
-    // 409 Conflict means another poller is holding the long-poll. Sleep at
-    // least `poll_timeout + 5s` so the prior poller's long-poll expires
-    // before we retry, instead of storming the server with 1s-backoff.
+    // 409 Conflict → another poller holds the long-poll. Wait at least
+    // `poll_timeout + 5s` so the prior long-poll expires before we retry.
     let conflict_backoff = Duration::from_secs(u64::from(config.poll_timeout) + 5);
 
     tracing::info!(
         max_concurrent_handlers = MAX_CONCURRENT_HANDLERS,
         poll_timeout_secs = config.poll_timeout,
         "Bridge ready"
+    );
+
+    // Human-friendly status block — complements the structured log above.
+    print_ready_status(
+        &me,
+        config.allowed_user_id,
+        &ready_allowlist,
+        ready_autostart.as_deref(),
+        inspect_port,
     );
 
     loop {
@@ -305,8 +431,6 @@ async fn run_bridge() -> Result<()> {
                     let chat_id = message.chat.id;
                     let message_id = message.message_id;
 
-                    // Never log message content — pasted secrets would leak
-                    // to the journal. Observability is bounded to metadata.
                     tracing::debug!(chat_id, bytes = text.len(), "Received message");
 
                     let ctx = bridge::HandlerContext {
@@ -317,14 +441,10 @@ async fn run_bridge() -> Result<()> {
                         handler_sem: handler_sem.clone(),
                         started_at,
                         metrics: metrics.clone(),
+                        autoreply: autoreply_cfg.clone(),
+                        tracker: tracker.clone(),
                     };
 
-                    // NOTE: no per-handler cancel select. `tmux send_keys` is
-                    // text-send + submit-gap + Enter-send; cancelling at the
-                    // gap would leave uncommitted text in the pane that the
-                    // next message would prepend to — dangerous for AI-agent
-                    // targets. Shutdown drains via `tracker.wait()` with a
-                    // bounded timeout below.
                     tracker.spawn(bridge::handle_update(ctx, chat_id, message_id, text));
                 }
             }
@@ -333,12 +453,21 @@ async fn run_bridge() -> Result<()> {
                 tracing::warn!(
                     err = %e,
                     backoff_secs = conflict_backoff.as_secs(),
-                    "409 Conflict — waiting for server to release prior poller"
+                    "409 Conflict — another poller is active (maybe the background service?)"
                 );
                 tokio::select! {
                     () = tokio::time::sleep(conflict_backoff) => {}
                     () = shutdown.cancelled() => break,
                 }
+            }
+            // 401 at runtime means the bot token was revoked mid-session.
+            // The poll loop would otherwise retry with exponential backoff
+            // forever, spamming the journal. Exit with a clean error so
+            // the operator sees the paste-a-fresh-token message on next
+            // launch (startup re-runs `get_me` which also dead-ends 401).
+            Err(e) if e.is_unauthorized() => {
+                metrics.record_poll_error();
+                return Err(unauthorized_dead_end(&e));
             }
             Err(e) => {
                 metrics.record_poll_error();
@@ -369,8 +498,8 @@ async fn run_bridge() -> Result<()> {
     Ok(())
 }
 
-/// One-line colored identity banner at startup. Suppressed when stdout
-/// isn't a terminal (systemd/launchd logs) so service logs stay clean.
+/// One-line identity banner. Suppressed when stdout isn't a terminal so
+/// systemd / launchd logs stay clean.
 fn print_startup_banner() {
     let term = console::Term::stdout();
     if !term.is_term() {
@@ -382,6 +511,71 @@ fn print_startup_banner() {
         console::style("tebis").bold().cyan(),
         console::style(format!("v{version}")).dim(),
         console::style("· Telegram → tmux bridge").dim(),
+    );
+}
+
+/// Human-readable "what's running" block. Printed after the bridge reaches
+/// ready, only when stdout is a tty (systemd / launchd logs stay structured).
+fn print_ready_status(
+    me: &tebis::telegram::types::BotUser,
+    allowed: i64,
+    allowlist: &[String],
+    autostart: Option<&str>,
+    inspect_port: Option<u16>,
+) {
+    use console::style;
+    let term = console::Term::stdout();
+    if !term.is_term() {
+        return;
+    }
+    let username = me
+        .username
+        .as_deref()
+        .map_or_else(|| "(no @username)".to_string(), |u| format!("@{u}"));
+
+    println!();
+    println!(
+        "  {}  {}",
+        style("online").green().bold(),
+        style("— waiting for messages").dim(),
+    );
+    println!();
+    kv(
+        "Bot",
+        &format!("{} · {} · id {}", me.first_name, username, me.id),
+    );
+    kv("Allowed user", &format!("id {allowed}"));
+    if allowlist.is_empty() {
+        kv("Sessions", "(any — permissive)");
+    } else {
+        kv("Sessions", &allowlist.join(", "));
+    }
+    if let Some(a) = autostart {
+        kv("Autostart", a);
+    }
+    if let Some(port) = inspect_port {
+        let url = format!("http://127.0.0.1:{port}");
+        kv_url("Dashboard", &url);
+    }
+    println!();
+    println!(
+        "  {} to stop · logs above are also captured by tracing",
+        style("Ctrl-C").bold(),
+    );
+    println!();
+}
+
+fn kv(label: &str, value: &str) {
+    use console::style;
+    println!("  {}  {value}", style(format!("{label:<13}")).dim());
+}
+
+fn kv_url(label: &str, url: &str) {
+    use console::style;
+    println!(
+        "  {}  {}",
+        style(format!("{label:<13}")).dim(),
+        style(url).cyan().underlined(),
     );
 }
 

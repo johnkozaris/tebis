@@ -30,6 +30,7 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext) -> String {
     let bot_rows = build_bot_rows(snapshot.bot.as_ref());
     let autostart_rows = build_autostart_rows(snapshot.autostart.as_ref());
     let notify_rows = build_notify_rows(snapshot.notify.as_ref());
+    let hooks_rows = build_hooks_rows(&snapshot.hooks);
     let settings_section = build_settings_section(snapshot);
 
     let default_target_display = default_target.as_deref().map_or_else(
@@ -111,6 +112,7 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext) -> String {
     <dt>Session allowlist</dt><dd>{allowlist_display}</dd>
     {autostart_rows}
     {notify_rows}
+    {hooks_rows}
   </dl></div>
 </section>
 
@@ -274,6 +276,29 @@ fn build_autostart_rows(autostart: Option<&super::AutostartInfo>) -> String {
             )
         },
     )
+}
+
+fn build_hooks_rows(hooks: &super::HooksInfo) -> String {
+    let mut out = format!(
+        "<dt>Hooks mode</dt><dd><code>{}</code></dd>",
+        sanitize::escape_html(hooks.mode),
+    );
+    if hooks.entries.is_empty() {
+        out.push_str(r#"<dt>Installed hooks</dt><dd class="muted">none</dd>"#);
+    } else {
+        out.push_str("<dt>Installed hooks</dt><dd><ul class=\"hooks-list\">");
+        for entry in &hooks.entries {
+            let _ = write!(
+                out,
+                "<li><code>{agent}</code> · {dir} <span class=\"muted\">({ts})</span></li>",
+                agent = sanitize::escape_html(&entry.agent),
+                dir = sanitize::escape_html(&entry.dir),
+                ts = sanitize::escape_html(&entry.installed_at),
+            );
+        }
+        out.push_str("</ul></dd>");
+    }
+    out
 }
 
 fn build_notify_rows(notify: Option<&super::NotifyInfo>) -> String {

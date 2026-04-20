@@ -62,3 +62,17 @@ jobs:
       - run: cargo build --release --locked
       - name: Report binary size
         run: ls -lh target/release/tebis
+
+  # The hook scripts are embedded via `include_str!` and ship inside
+  # the release binary; a shell-level regression caught only at runtime
+  # shows up as silent no-ops on every user's host. shellcheck catches
+  # structural issues (SC2015 misuse of && ||, unset vars, subtle quoting
+  # bugs) that `bash -n` doesn't. `ubuntu-latest` has shellcheck
+  # pre-installed.
+  shellcheck:
+    name: shellcheck hook scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck contrib/
+        run: shellcheck --severity=warning contrib/claude/claude-hook.sh contrib/copilot/copilot-hook.sh

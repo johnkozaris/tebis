@@ -1,55 +1,130 @@
+<div align="center">
+
 # tebis
 
+**Drive AI coding agents from your phone.**
+
+A hardened Rust daemon that bridges **Telegram ↔ tmux** so `claude`,
+`aider`, or any long-running TUI on your workstation becomes a chat
+conversation on your phone.
+
+[![CI](https://img.shields.io/badge/CI-passing-brightgreen)](.github/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust Edition 2024](https://img.shields.io/badge/rust-edition%202024-orange)](Cargo.toml)
+[![Rust 2024](https://img.shields.io/badge/rust-edition%202024-orange?logo=rust)](Cargo.toml)
+[![MSRV 1.95](https://img.shields.io/badge/MSRV-1.95-blue?logo=rust)](Cargo.toml)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#run-persistently)
+[![Binary ~4 MB](https://img.shields.io/badge/binary-~4%20MB-success)](#build-from-source)
+[![Deps: rustls](https://img.shields.io/badge/TLS-rustls%2Fring-informational)](deny.toml)
+[![No OpenSSL](https://img.shields.io/badge/deps-no%20OpenSSL-critical)](deny.toml)
 
-A small, hardened Rust daemon that bridges **Telegram ↔ tmux** so you can
-drive AI coding agents (Claude Code, Aider, …) or any long-running TUI
-from your phone.
+[Quickstart](#quickstart) ·
+[Features](#features) ·
+[How it works](#how-it-works) ·
+[Configure](#configure) ·
+[Security](#security) ·
+[Contributing](CONTRIBUTING.md)
 
-- Inbound: long-polls Telegram, sends your messages to a named tmux session.
-- Outbound: reads pane output on request, forwards assistant replies via an
-  opt-in Unix-domain socket the hook script writes to.
-- Single statically-linked binary (~4 MB release), no web server, no cloud.
+</div>
 
-![tebis dashboard](docs/dashboard.png)
+---
 
-> **Security model — read first.** tebis is locked to **one** numeric
-> Telegram user id and only forwards to a pre-declared (or regex-validated)
-> set of session names. See [Security](#security).
+## Why tebis
+
+You're away from the laptop. `claude` is in a tmux session doing a long
+refactor. You want to:
+
+- check what it last said,
+- nudge it with a quick instruction,
+- or kill it and spin up a fresh agent on a different project.
+
+tebis is the ~4 MB daemon that makes that a Telegram chat. No cloud, no
+web dashboard exposed to the internet, no tunnel. Your bot token locked to
+your numeric user id is the only entry point.
+
+## Features
+
+- **Single purpose.** A Telegram message becomes a `tmux send-keys`; a
+  `/read` becomes a `tmux capture-pane`. Nothing more.
+- **Locked to one user.** Access control is a numeric `user.id` match —
+  usernames are never trusted (recyclable / mutable).
+- **Auto-provisioning.** Configure an autostart session and the first
+  message spawns `claude` in the project dir, waits for the TUI, and
+  delivers the keystrokes. If the agent dies, the next message re-spawns.
+- **Opt-in outbound.** A local Unix-domain socket lets a Claude Code hook
+  push `Stop` / `SubagentStop` / permission / idle events to Telegram.
+  No TCP, `chmod 0600`, peer-cred check on every connection.
+- **Auto-wired hooks.** Set `TELEGRAM_HOOKS_MODE=auto` and tebis writes
+  Claude Code / Copilot CLI hook configs into your project dir at
+  autostart time so replies arrive via the agent's native `Stop` event
+  — no pane-settle polling, no per-project setup. Full lifecycle via
+  `tebis hooks {install,uninstall,status}`; removal is clean.
+- **Opt-in dashboard.** Set `INSPECT_PORT` and get a zero-JS HTML control
+  panel on `127.0.0.1` — live tmux sessions, activity metrics,
+  kill / restart buttons, in-place settings editing.
+- **Hardened by default.** All replies HTML-escaped. All tmux argv
+  regex-validated. Bot token in `SecretString`, redacted from logs and
+  `Debug`. Panic hook with no payload. systemd unit with sandboxing
+  pre-configured.
+- **Reproducible deps.** `deny.toml` bans OpenSSL, native-TLS, `reqwest`,
+  and `aws-lc-rs`. CI audits on every push plus a daily cron.
 
 ## Quickstart
 
 ```sh
-cargo build --release            # build the binary
-./target/release/tebis setup     # interactive config wizard
+cargo build --release
+./target/release/tebis setup     # interactive first-run wizard
 ./target/release/tebis           # run
 ```
 
-The wizard walks through creating a bot on @BotFather, finding your
-numeric user id, picking session names, and (optionally) autostart +
-the control dashboard. It writes `~/.config/tebis/env` (mode 0600).
+The wizard walks through creating a bot on [`@BotFather`][botfather],
+finding your numeric user id via [`@userinfobot`][userinfobot], picking
+session names, and (optionally) enabling autostart and the control
+dashboard. It writes `~/.config/tebis/env` (mode 0600).
 
-Then, to start it manually:
+Start manually after setup:
 
 ```sh
 set -a; source ~/.config/tebis/env; set +a
 ./target/release/tebis
 ```
 
-Or install as a persistent background service — see
-[Run persistently](#run-persistently) below.
+[botfather]: https://t.me/BotFather
+[userinfobot]: https://t.me/userinfobot
 
 ### Build from source
 
 ```sh
 git clone https://github.com/<your-fork>/tebis.git
 cd tebis
-cargo build --release          # produces ./target/release/tebis
+cargo build --release
 ```
 
-Requirements: Rust 1.95+ (edition 2024), `tmux` 3.x on the host.
-Bot API traffic is HTTP/1.1 + rustls (ring); no OpenSSL, no native TLS.
+**Requirements:** Rust 1.95+ (edition 2024), `tmux` 3.x. No OpenSSL, no
+native TLS — rustls/ring is bundled. Release binary ~4 MB (LTO + strip).
+
+## How it works
+
+```
+┌──────────┐                   ┌──────────┐                   ┌──────────┐
+│ Phone    │   Bot API long    │  tebis   │   tmux send-keys  │  tmux    │
+│ Telegram │ ───── poll ─────▶ │  daemon  │ ────────────────▶ │  pane    │
+│          │ ◀──── reply ───── │          │ ◀─ capture-pane ─ │ (claude) │
+└──────────┘                   └────▲─────┘                   └──────────┘
+                                    │
+                                    │ UDS (opt-in)
+                                    │ mode 0600
+                                 ┌──┴───────┐
+                                 │ hook.sh  │
+                                 │ (Claude) │
+                                 └──────────┘
+```
+
+Inbound: long-poll → filter by user id → rate-limit → parse command →
+`send-keys` with a 300 ms submit gap → react 👍 or reply with `<pre>`
+block.
+
+Outbound: Claude Code's `Stop` hook writes a JSON line to the local UDS;
+tebis forwards the tail of the agent's final message to your chat.
 
 ## CLI
 
@@ -60,31 +135,54 @@ tebis --help       Env-var reference + options
 tebis --version    Print version
 ```
 
+## Commands
+
+| Command | Effect |
+|---|---|
+| `/list` | List active tmux sessions (`✓` = allowlisted, `✗` = visible but not targetable) |
+| `/status` | Show default target, autostart session, allowlist, uptime |
+| `/send <session> <text>` | Send text + Enter to session |
+| `/read [session] [lines]` | Capture pane output (default: current target, 50 lines) |
+| `/target <session>` | Set the default target session |
+| `/new <session>` | Create an empty detached tmux session |
+| `/kill <session>` | Kill a tmux session (idempotent) |
+| `/restart` | Kill the autostart session and drop the cached target; next plain-text re-provisions |
+| `/help` | Show help |
+| *plain text* | Send to the default target (or autostart on first message) |
+
+Ack-only commands react with 👍 rather than replying. Commands with
+output (`/list`, `/read`, `/status`, `/help`) reply with a formatted
+`<pre>` block; all text-returning paths are HTML-escaped before
+`parse_mode=HTML`.
+
 ## Configure
 
-The setup wizard writes these; `tebis --help` lists them all. Full
-reference:
+The setup wizard writes these; `tebis --help` lists them all.
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | yes | — | From @BotFather |
-| `TELEGRAM_ALLOWED_USER` | yes | — | Numeric user id (from @userinfobot) |
+| `TELEGRAM_BOT_TOKEN` | yes | — | From `@BotFather` |
+| `TELEGRAM_ALLOWED_USER` | yes | — | Numeric user id (from `@userinfobot`) |
 | `TELEGRAM_ALLOWED_SESSIONS` | no | — | Comma-separated allowlist. Unset = any valid tmux name is accepted. |
 | `TELEGRAM_POLL_TIMEOUT` | no | `30` | Long-poll seconds (1..=900) |
 | `TELEGRAM_MAX_OUTPUT_CHARS` | no | `4000` | `capture-pane` truncation cap |
-| `TELEGRAM_AUTOSTART_SESSION` | no | — | Autostart session name (must be allowlisted) |
+| `TELEGRAM_AUTOSTART_SESSION` | no | — | Autostart session name (must be allowlisted if allowlist set) |
 | `TELEGRAM_AUTOSTART_DIR` | no | — | Autostart working directory |
 | `TELEGRAM_AUTOSTART_COMMAND` | no | — | Autostart command (e.g. `claude`) |
 | `NOTIFY_CHAT_ID` | no | — | Enables outbound-notify listener |
 | `NOTIFY_SOCKET_PATH` | no | `$XDG_RUNTIME_DIR/tebis.sock` or `/tmp/tebis-$USER.sock` | UDS path for hook pushes |
 | `INSPECT_PORT` | no | — | Local HTML control dashboard on `127.0.0.1:<port>` |
 | `BRIDGE_ENV_FILE` | no | — | Env file path (enables in-dashboard Settings edits) |
+| `TELEGRAM_HOOKS_MODE` | no | `off` | `auto` → install Claude Code / Copilot CLI hooks into the autostart dir automatically |
+| `TELEGRAM_AUTOREPLY` | no | `on` | `off` disables pane-settle auto-reply (useful if you only want hook-driven replies) |
+| `TELEGRAM_NOTIFY` | no | `on` | `off` disables the outbound-notify UDS listener |
 
 Session names must match `[A-Za-z0-9._-]{1,64}`. Invalid names fail startup.
 
 ## Run persistently
 
 ### macOS (launchd user agent)
+
 ```sh
 cargo build --release
 ./contrib/macos/install.sh       # first run creates env file from template
@@ -94,10 +192,9 @@ tail -f /tmp/tebis.log
 ```
 
 Auto-starts at login (`RunAtLoad`), respawns on crash (`KeepAlive`).
-Dashboard's **Restart bridge** button works because the plist sets
-`KeepAlive=true` (matches systemd's `Restart=always`).
 
 ### Linux (systemd user unit)
+
 ```sh
 cp target/release/tebis ~/.local/bin/
 mkdir -p ~/.config/tebis ~/.config/systemd/user
@@ -110,53 +207,31 @@ loginctl enable-linger "$USER"   # survive logout
 
 Audit the sandbox: `systemd-analyze --user security tebis`.
 
-## Commands
-
-| Command | Effect |
-|---|---|
-| `/list` | List active tmux sessions (`✓` = allowlisted, `✗` = visible but not targetable) |
-| `/status` | Show default target, autostart session, allowlist, uptime |
-| `/send <session> <text>` | Send text + Enter to session |
-| `/read [session] [lines]` | Capture pane output (default: current target, 50 lines) |
-| `/target <session>` | Set the default target session |
-| `/new <session>` | Create an empty detached tmux session |
-| `/kill <session>` | Kill a tmux session (idempotent — already gone = OK) |
-| `/restart` | Kill the autostart session and drop the cached target; next plain-text re-provisions |
-| `/help` | Show help |
-| *plain text* | Send to the default target (or autostart on first message) |
-
-Ack-only commands react with 👍 instead of replying. Commands with output
-(`/list`, `/read`, `/status`, `/help`) reply with a formatted `<pre>` block.
-All text-returning paths are HTML-escaped before `parse_mode=HTML`.
-
 ## Autostart
 
-Set all three of these to have the first plain-text message auto-provision
-a detached tmux session running a TUI (e.g. `claude`):
+Set all three of these so the first plain-text message auto-provisions a
+detached tmux session running a TUI:
 
 ```
-TELEGRAM_AUTOSTART_SESSION=claude-code    # must be in TELEGRAM_ALLOWED_SESSIONS
+TELEGRAM_AUTOSTART_SESSION=claude-code
 TELEGRAM_AUTOSTART_DIR=/path/to/your/project
 TELEGRAM_AUTOSTART_COMMAND=claude
 ```
 
-Once configured, autostart-related behaviors:
+Behaviors:
 
-- First plain-text message → provisions the session, waits 3 s for the TUI
-  to boot, sends the message.
-- If the autostart session later exits (Claude quit, pane died) and you
+- First plain-text message → provisions the session, waits 3 s for the
+  TUI to boot, sends the message.
+- If the autostart session later exits (agent quit, pane died) and you
   send another plain-text message, the bridge clears the stale target,
-  re-provisions, and retries once — so transient agent death self-heals.
-- `/restart` gives you explicit control: kills the session + clears the
+  re-provisions, and retries once — transient agent death self-heals.
+- `/restart` gives explicit control: kills the session + clears the
   target without sending anything.
-- The directory is validated at config load; a bad `TELEGRAM_AUTOSTART_DIR`
-  fails startup with a clear error instead of a confusing first-message tmux
-  error.
 
 ## Claude Code notifications
 
-The bridge can forward four kinds of Claude Code events to Telegram over a
-local Unix-domain socket (mode 0600, unreachable from the network):
+The bridge can forward four kinds of Claude Code events to Telegram over
+a local UDS (mode 0600, unreachable from the network):
 
 | Hook event | What gets sent | Header tag |
 |---|---|---|
@@ -167,84 +242,106 @@ local Unix-domain socket (mode 0600, unreachable from the network):
 
 ### Summarization strategy
 
-Rather than truncate the start of a long reply (losing the conclusion),
-the hook takes two complementary steps:
+Rather than head-truncate a long reply (which would lose the
+conclusion), the hook pair:
 
-1. **`UserPromptSubmit`** injects an `additionalContext` instruction asking
-   Claude to end non-trivial replies with a concise ≤1500-char summary.
-2. **`Stop`** / **`SubagentStop`** take the **tail** of the final assistant
-   message (last 1500 chars, not first). If Claude complied with step 1,
-   the tail is the summary. If it didn't, the tail still has the
-   conclusion, which is usually what a phone notification wants.
+1. **`UserPromptSubmit`** injects an `additionalContext` instruction
+   asking Claude to end non-trivial replies with a concise ≤1500-char
+   summary.
+2. **`Stop`** / **`SubagentStop`** take the **tail** of the final
+   assistant message (last 1500 chars, not first).
 
-No extra LLM calls, no Stop-block loops (both of which have documented
-failure modes in the wild).
+If Claude complied, the tail *is* the summary. If it didn't, the tail
+still has the conclusion — usually what a phone notification wants. No
+extra LLM calls, no Stop-block loops.
 
 ### Setup
 
-1. Set these in the bridge's env:
-   ```sh
-   NOTIFY_CHAT_ID=<your-numeric-user-id>   # usually same as TELEGRAM_ALLOWED_USER
-   ```
-   The socket binds automatically at `$XDG_RUNTIME_DIR/tebis.sock`
-   (or `/tmp/tebis-$USER.sock` as fallback).
+The UDS listener is on by default (chat_id = your `TELEGRAM_ALLOWED_USER`).
+To get Claude Code / Copilot CLI replies via their native `Stop` events
+instead of pane-settle polling, enable hook auto-install and the rest is
+automatic:
 
-2. In each project you want notifications for:
-   ```sh
-   mkdir -p .claude
-   cp /path/to/tebis/contrib/claude/claude-settings.example.json .claude/settings.json
-   # Edit /path/to/tebis in the `command` fields to point at your tebis checkout,
-   # or merge the `hooks` entries into an existing settings.json.
-   ```
+```sh
+echo 'TELEGRAM_HOOKS_MODE=auto' >> ~/.config/tebis/env
+```
 
-3. Ensure `jq` and `nc` (BSD netcat — `netcat-openbsd` on Linux) are installed.
+On the next autostart, tebis writes the agent's hook config into the
+autostart directory and the embedded hook script into
+`~/.local/share/tebis/<agent>-hook.sh`. You'll see a banner line like:
 
-Remove any of the four hook blocks from `settings.json` to opt out of that
-event type. The hook exits 0 on every path so it can never block Claude.
+```
+  ▶  installed Claude Code hooks in /path/to/your/project
+```
+
+**Where tebis writes** (and what it owns):
+
+| Agent | Config file | Script |
+|---|---|---|
+| Claude Code | `<dir>/.claude/settings.local.json` (lowest-precedence; normally `.gitignore`d) | `~/.local/share/tebis/claude-hook.sh` |
+| Copilot CLI | `<dir>/.github/hooks/tebis.json` (file owned outright by tebis) | `~/.local/share/tebis/copilot-hook.sh` |
+
+**tebis only touches the four events it installs** (`UserPromptSubmit`,
+`Stop`, `SubagentStop`, `Notification`) and only entries whose `command`
+path is the tebis data dir. Your other hooks are never modified.
+
+**Manual lifecycle** — for dirs you run an agent in that aren't the
+autostart dir:
+
+```sh
+tebis hooks install [<dir>]      # defaults to autostart dir
+tebis hooks uninstall [<dir>]    # removes only tebis-owned entries
+tebis hooks status [<dir>]       # lists tebis events installed
+```
+
+**Dependencies**: `jq` and `nc` (BSD netcat — `netcat-openbsd` on Linux).
+
+**Failure-open**: the hook exits 0 on every path, so even a missing
+script or broken socket never blocks an agent's turn.
 
 ## Inspect dashboard
 
-Set `INSPECT_PORT=51624` (or any port you like — the setup wizard defaults to
-`51624` in the IANA dynamic range to avoid common collisions like Prometheus'
+Set `INSPECT_PORT=51624` (or any port — the wizard defaults to `51624`
+in the IANA dynamic range to avoid common collisions like Prometheus
 `9090`) and the bridge binds a local HTML control panel at
-`http://127.0.0.1:51624/`. **Loopback-only**; no authentication — do not try to
-expose it beyond the host.
+`http://127.0.0.1:51624/`. **Loopback-only**; no authentication — do not
+try to expose it beyond the host.
 
-What it shows:
-- Non-secret config (allowed user id, session allowlist, autostart config, notify socket)
-- Live tmux sessions with `✓`/`✗` markers, plus allowlisted-but-not-running
-- Activity metrics: last message received, last response time + duration, total counts, poll success/errors, in-flight handlers
-- Uptime, default target, handler slot availability
+**Shows:** non-secret config, live tmux sessions with ✓/✗ markers,
+activity metrics (last message / response, counts, poll health),
+uptime, default target, handler slot availability.
 
-What you can do:
-- `[Kill all allowlisted tmux sessions]` button — CSRF-protected POST that kills every session in the allowlist (idempotent), clears the default target so the next plain-text re-provisions.
+**Actions:** kill any session, kill-all-allowlisted, restart bridge
+(graceful — launchd/systemd respawns), edit poll timeout / output cap /
+autostart dir and save-restart in one click.
 
-`GET /status` returns the same info as JSON — pipe it to `jq`, hook it into your own observability, etc.
-
-The page auto-refreshes every 5 seconds via `<meta http-equiv="refresh">`. Zero JavaScript, zero bundler, no external assets — it's a single server-rendered HTML page from `src/inspect.rs`.
+`GET /status` returns the same info as JSON. Auto-refresh every 5 s via
+`<meta http-equiv="refresh">`. Zero JavaScript, zero bundler, zero
+external assets.
 
 ## Security
 
-tebis ships with sharp edges — it executes keystrokes into another process —
-so the security model is worth understanding before you deploy it.
+tebis executes keystrokes into another process. The security model is
+worth understanding before you deploy it.
 
-- **Auth by numeric Telegram `user.id` only.** Usernames are recyclable and
-  never used for access control.
-- **Session-name regex `[A-Za-z0-9._-]{1,64}` is enforced at every tmux
-  call** (shell-metachar / path-traversal defense). Optional strict allowlist
-  on top for defense in depth.
-- **`send-keys -l` + separate `-H 0d`** so message text is sent as literal
-  keystrokes and can never be interpreted as a tmux key-name.
-- **All Telegram replies are HTML-escaped** before `parse_mode=HTML`. Output
-  from tmux also passes through ANSI / C0 / C1 / bidi-codepoint stripping.
-- **Bot token is held in `SecretString`**, never logged. Network errors walk
-  the source chain and redact anything that looks like URL / token data.
-- **Outbound-notify is UDS-only**, mode 0600 with `peer_cred` check on every
-  accepted connection; not reachable from the network.
-- **Per-chat GCRA rate limit + global handler semaphore** bound subprocess
-  fan-out during bursts.
-- **Reproducible dependency policy** in `deny.toml`: no OpenSSL, no native
-  TLS, no `reqwest`, no `aws-lc-rs`. Allowed licenses are enumerated.
+- **Auth by numeric Telegram `user.id` only.** Usernames are recyclable
+  and never used for access control.
+- **Session-name regex `[A-Za-z0-9._-]{1,64}`** enforced at every tmux
+  call (shell-metachar / path-traversal defense). Optional strict
+  allowlist on top.
+- **`send-keys -l` + separate `-H 0d`** so message text is sent as
+  literal keystrokes and can never be interpreted as a tmux key-name.
+- **All Telegram replies HTML-escaped** before `parse_mode=HTML`. Output
+  from tmux also passes through ANSI / C0 / C1 / bidi-codepoint
+  stripping.
+- **Bot token in `SecretString`**, never logged. Network errors walk the
+  source chain and redact anything that looks like URL / token data.
+- **Outbound-notify UDS-only**, mode 0600 with `peer_cred` check on
+  every accepted connection.
+- **Per-chat GCRA rate limit + global handler semaphore** bound
+  subprocess fan-out during bursts.
+- **Reproducible dependency policy** in `deny.toml`: no OpenSSL, no
+  native TLS, no `reqwest`, no `aws-lc-rs`.
 
 Reporting a vulnerability: see [SECURITY.md](SECURITY.md).
 
@@ -252,47 +349,65 @@ Reporting a vulnerability: see [SECURITY.md](SECURITY.md).
 
 ```sh
 cargo test                                           # unit tests
-cargo clippy --all-targets -- -D warnings            # base lints
 cargo clippy --all-targets -- -D warnings \
     -W clippy::pedantic -W clippy::nursery           # full lints
 cargo fmt --check                                    # style
-cargo audit                                          # requires cargo-install cargo-audit
-cargo deny check                                     # requires cargo-install cargo-deny
+cargo audit                                          # RUSTSEC advisories
+cargo deny check                                     # licenses + bans + sources
 cargo build --release                                # ~4 MB binary (LTO + strip)
 ```
 
-HTTP stack: `hyper` 1.x + `hyper-util` legacy `Client` + `hyper-rustls` +
-`rustls` with the **ring** crypto backend and `webpki-roots` for CAs.
-No `reqwest`, no `aws-lc-rs`, no native TLS. These are explicitly banned in
-`deny.toml` to catch silent regressions.
-
-See `CLAUDE.md` for invariants before changing security-sensitive code, and
-[CONTRIBUTING.md](CONTRIBUTING.md) for PR expectations.
+See [CLAUDE.md](CLAUDE.md) for security invariants before touching
+security-sensitive code, and [CONTRIBUTING.md](CONTRIBUTING.md) for PR
+expectations.
 
 ## Project layout
 
 ```
 src/
-  main.rs        poll loop, signals, runtime wiring
-  bridge.rs      per-message behavior (rate-limit → parse → execute → reply)
-  handler.rs     command parser + executor (/list, /send, /read, plain-text, …)
-  session.rs     default-target state + autostart provisioning
-  telegram.rs    hyper+rustls Bot API client with token redaction
-  tmux.rs        send-keys / capture-pane / kill-session wrapper with name allowlist
-  security.rs    user-id auth + GCRA rate limiter
-  sanitize.rs    input/output sanitizers (C0/C1/bidi + HTML escape)
-  config.rs      env-var parsing + validation
-  metrics.rs     lock-free atomic counters
-  setup.rs       `tebis setup` wizard
-  inspect/       opt-in local HTML control dashboard
-  notify/        opt-in UDS listener + Forwarder trait
-  types.rs       Telegram DTOs
+  main.rs                       # runtime, signals, poll loop, argv dispatch
+  config.rs                     # env → Config + HooksMode
+  env_file.rs                   # shared 0600 atomic write + KEY=VAL parse + toggles
+  bridge/                       # per-message behavior
+    mod.rs                      #   entry pipeline + reply routing
+    handler.rs                  #   command parser + executor
+    session.rs                  #   default-target state + autostart + hooked_sessions
+    autoreply.rs                #   pane-settle fallback reply path
+    typing.rs                   #   shared "typing…" refresher (TypingGuard RAII)
+  agent_hooks/                  # hook install / uninstall per agent
+    mod.rs                      #   HookManager trait, materialize()
+    agent.rs                    #   AgentKind enum + detect() + HooksMode
+    claude.rs                   #   Claude Code: .claude/settings.local.json
+    copilot.rs                  #   Copilot CLI: .github/hooks/tebis.json
+    jsonfile.rs                 #   atomic JSON write
+    manifest.rs                 #   host-wide installed-hooks manifest + flock
+    legacy.rs                   #   pre-Phase-2 hook detection
+  hooks_cli.rs                  # `tebis hooks install|uninstall|status|list|prune`
+  telegram/                     # Bot API client
+    mod.rs                      #   hyper + rustls, token redaction
+    types.rs                    #   DTOs
+  tmux.rs                       # send-keys / capture / allowlist
+  sanitize.rs                   # C0/C1/bidi + HTML escape
+  security.rs                   # user-id auth + GCRA rate limit
+  metrics.rs                    # lock-free atomic counters
+  lockfile.rs                   # single-instance flock
+  service.rs                    # launchd/systemd install + status
+  inspect/                      # opt-in local HTML dashboard
+  notify/                       # UDS listener + Forwarder trait
+    mod.rs                      #   Forwarder trait + TelegramForwarder + Payload
+    listener.rs                 #   UDS bind / accept / per-connection protocol
+    format.rs                   #   Payload → Telegram HTML body (tag + text)
+    markdown.rs                 #   Markdown → Telegram HTML (bold, code, fences)
+  setup/                        # `tebis setup` wizard
+    mod.rs, steps.rs,
+    discover.rs, ui.rs
 contrib/
-  macos/         launchd user agent + installer
-  linux/         systemd user unit (sandboxed)
-  claude/        Claude Code hook script + example settings.json
+  macos/                        # launchd user agent + installer
+  linux/                        # sandboxed systemd user unit
+  claude/claude-hook.sh         # embedded into binary via include_str!
+  copilot/copilot-hook.sh       # embedded into binary via include_str!
 examples/
-  inspect-demo.rs   spin up the dashboard with synthetic metrics
+  inspect-demo.rs               # spin up the dashboard with synthetic metrics
 ```
 
 ## License

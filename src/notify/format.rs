@@ -1,210 +1,158 @@
-//! Pure formatting: [`Payload`] → Telegram HTML message body.
+//! Pure `Payload` → Telegram HTML body.
 //!
-//! No I/O, no tokio — every function here is a total function from inputs
-//! to a `String`, which makes them trivial to unit-test.
+//! The hook script hands us text that's already clean — a tail of
+//! Claude's final assistant message (Markdown, not terminal output).
+//! So unlike the pane-settle path, we do NOT wrap in `<pre>`. We
+//! escape HTML entities so Telegram's `parse_mode=HTML` sees
+//! plain-looking text, preserving line breaks and intentional
+//! inline formatting (bold, italics, code spans) without painting
+//! every reply as a fixed-width code block.
+//!
+//! Header rules: single-user bot, same cwd and same session on every
+//! message — so adding a header to every Stop reply is noise. We only
+//! prepend a tiny italic tag when the kind is non-obvious (idle, ask,
+//! session-up, session-end). Plain `stop` / `subagent_stop` replies
+//! get no prefix at all.
 
-use std::path::Path;
-
-use super::Payload;
+use super::{Payload, markdown};
 use crate::sanitize;
 
-/// Header is capped so that `<b>{header}</b>\n` + `<pre>…</pre>` (≤ 4000)
-/// still fits under Telegram's 4096-char message limit with slack.
-const MAX_HEADER_CHARS: usize = 80;
-
-/// Final HTML body. Layout:
+/// Convert a payload into the final Telegram HTML body.
 ///
-/// ```text
-/// <b>[kind] basename · session</b>
-/// <pre>text (truncated if needed)</pre>
-/// ```
-///
-/// If all three header fields are empty, the `<b>…</b>\n` prefix is omitted.
+/// Content rules:
+/// - Markdown subset translated to Telegram HTML tags (inline + fenced
+///   code, bold, italic) so Claude's `**bold**` / `` `code` `` / fenced
+///   blocks render correctly instead of as literal punctuation.
+/// - HTML entities escaped up front (so `<foo>` and `&` in the reply
+///   render literally, not as tags / entities).
+/// - Soft-truncate to the Telegram 4096-char ceiling with the shared
+///   `wrap_and_truncate` helper.
 pub fn body(p: &Payload) -> String {
-    let header = build_header(p.kind.as_deref(), p.cwd.as_deref(), p.session.as_deref());
-    let escaped = sanitize::escape_html(&p.text);
-    let wrapped = sanitize::wrap_and_truncate(&escaped, "<pre>", "</pre>");
+    let tag_line = p.kind.as_deref().and_then(kind_tag).map(|t| {
+        // Italic bracket tag. Kept short so the real content leads.
+        format!("<i>[{t}]</i>\n")
+    });
 
-    if header.is_empty() {
-        wrapped
-    } else {
-        format!("<b>{header}</b>\n{wrapped}")
+    let html = markdown::to_html(&p.text);
+    let truncated = sanitize::wrap_and_truncate(&html, "", "");
+
+    match tag_line {
+        Some(t) => format!("{t}{truncated}"),
+        None => truncated,
     }
 }
 
-/// Build the `[kind] basename · session` header. All parts are
-/// HTML-escaped; the final string is codepoint-truncated to
-/// [`MAX_HEADER_CHARS`] with a trailing `…` on overflow.
-fn build_header(kind: Option<&str>, cwd: Option<&str>, session: Option<&str>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-
-    if let Some(tag) = kind.and_then(kind_tag) {
-        parts.push(format!("[{tag}]"));
-    }
-    if let Some(cwd) = cwd {
-        let name = Path::new(cwd)
-            .file_name()
-            .map_or_else(|| cwd.to_string(), |s| s.to_string_lossy().into_owned());
-        if !name.is_empty() {
-            parts.push(sanitize::escape_html(&name));
-        }
-    }
-    if let Some(session) = session
-        && !session.is_empty()
-    {
-        parts.push(sanitize::escape_html(session));
-    }
-
-    let joined = parts.join(" · ");
-    truncate_chars(&joined, MAX_HEADER_CHARS)
-}
-
-/// Map raw hook event classification to a short header tag.
-///
-/// - `"stop"` → no tag (the common case; would be noise)
-/// - `"subagent_stop"` → `agent`
-/// - `"permission_prompt"` → `ask` (user attention needed)
-/// - `"idle_prompt"` → `idle`
-/// - unknown → no tag (render without, rather than leaking raw values)
+/// Returns a short human tag for kinds where the user needs to know
+/// the flavor. Normal `Stop` / `SubagentStop` replies get no tag
+/// because they're the overwhelming majority — labelling them
+/// `[reply]` on every message would be chat noise.
 fn kind_tag(raw: &str) -> Option<&'static str> {
     match raw {
+        // Permission asks ("Claude wants to do X — approve?") and
+        // idle prompts are read very differently from normal replies.
+        // Claude's notification_type has varied across versions
+        // (`permission_prompt` vs `permission_request`); accept both.
+        "permission_prompt" | "permission_request" => Some("ask"),
+        "idle_prompt" | "idle" => Some("idle"),
+        // Subagent results are distinct from the main agent's Stop.
         "subagent_stop" => Some("agent"),
-        "permission_prompt" => Some("ask"),
-        "idle_prompt" => Some("idle"),
+        // `stop` (plain) or any unknown → no tag. Ordinary replies
+        // should look like ordinary messages, not tagged system events.
+        // session_start / session_end are intentionally dropped from
+        // the installed event set; we never receive them at runtime.
         _ => None,
     }
-}
-
-/// Codepoint-aware truncation. Byte slicing with `&s[..N]` would panic on a
-/// mid-codepoint cut, and `.chars().take(N).collect()` allocates twice.
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let cut = s
-        .char_indices()
-        .nth(max.saturating_sub(1))
-        .map_or(s.len(), |(i, _)| i);
-    format!("{}…", &s[..cut])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn payload(
-        text: &str,
-        cwd: Option<&str>,
-        session: Option<&str>,
-        kind: Option<&str>,
-    ) -> Payload {
+    fn payload(text: &str, kind: Option<&str>) -> Payload {
         Payload {
             text: text.into(),
-            cwd: cwd.map(Into::into),
-            session: session.map(Into::into),
+            cwd: Some("/tmp/test-project".into()),
+            session: Some("de54af3d-b13e-4b73-b929-190001455ee1".into()),
             kind: kind.map(Into::into),
         }
     }
 
     #[test]
-    fn header_empty_when_no_fields() {
-        assert_eq!(build_header(None, None, None), "");
-    }
-
-    #[test]
-    fn header_uses_cwd_basename_not_full_path() {
+    fn plain_stop_is_just_text() {
+        // No tag, no header, no <pre>. Just the message.
         assert_eq!(
-            build_header(None, Some("/tmp/myproject"), None),
-            "myproject"
+            body(&payload("Hey, still here. What do you need?", Some("stop"))),
+            "Hey, still here. What do you need?"
         );
     }
 
     #[test]
-    fn header_combines_all_three_fields_with_middle_dot() {
+    fn unknown_kind_gets_no_tag() {
+        assert_eq!(body(&payload("done", Some("something_new"))), "done",);
+    }
+
+    #[test]
+    fn idle_gets_italic_tag_prefix() {
         assert_eq!(
-            build_header(Some("subagent_stop"), Some("/tmp/myrepo"), Some("s1")),
-            "[agent] · myrepo · s1"
+            body(&payload("Claude is waiting for input", Some("idle_prompt"))),
+            "<i>[idle]</i>\nClaude is waiting for input"
         );
     }
 
     #[test]
-    fn header_omits_tag_for_default_stop() {
+    fn permission_prompt_gets_ask_tag_and_markdown_translated() {
+        // Confirms the markdown pipeline runs: backticks become
+        // <code> tags so the command is rendered as inline code on
+        // Telegram, not literal backticks.
         assert_eq!(
-            build_header(Some("stop"), Some("/tmp/r"), Some("s")),
-            "r · s"
+            body(&payload(
+                "Run `rm -rf /tmp/foo`?",
+                Some("permission_prompt")
+            )),
+            "<i>[ask]</i>\nRun <code>rm -rf /tmp/foo</code>?"
         );
     }
 
     #[test]
-    fn header_omits_tag_for_unknown_kind() {
+    fn permission_request_synonym_maps_to_ask_tag() {
+        // Claude Code emits `permission_request` in some versions.
         assert_eq!(
-            build_header(Some("weird_future_kind"), Some("/tmp/r"), None),
-            "r"
+            body(&payload("OK?", Some("permission_request"))),
+            "<i>[ask]</i>\nOK?"
         );
     }
 
     #[test]
-    fn header_tag_for_permission_prompt() {
-        assert_eq!(build_header(Some("permission_prompt"), None, None), "[ask]");
-    }
-
-    #[test]
-    fn header_tag_for_idle_prompt() {
-        assert_eq!(build_header(Some("idle_prompt"), None, None), "[idle]");
-    }
-
-    #[test]
-    fn header_escapes_html_in_both_parts() {
+    fn subagent_stop_gets_agent_tag() {
         assert_eq!(
-            build_header(None, Some("/tmp/<evil>"), Some("s&1")),
-            "&lt;evil&gt; · s&amp;1"
+            body(&payload("done", Some("subagent_stop"))),
+            "<i>[agent]</i>\ndone"
         );
     }
 
     #[test]
-    fn header_truncates_with_ellipsis() {
-        let h = build_header(None, Some(&format!("/tmp/{}", "a".repeat(200))), None);
-        assert!(h.chars().count() <= MAX_HEADER_CHARS + 1);
-        assert!(h.ends_with('…'));
+    fn html_entities_escaped_but_text_not_pre_wrapped() {
+        // The reply might contain angle brackets — escape them so Telegram
+        // doesn't parse them as tags, but do NOT wrap in <pre>.
+        let out = body(&payload("Look at <foo> and bar & baz", Some("stop")));
+        assert!(!out.contains("<pre>"));
+        assert_eq!(out, "Look at &lt;foo&gt; and bar &amp; baz");
     }
 
     #[test]
-    fn body_with_no_header_is_only_pre() {
-        assert_eq!(body(&payload("hi", None, None, None)), "<pre>hi</pre>");
+    fn newlines_preserved_in_output() {
+        // Without <pre>, line breaks come from \n in the source text.
+        // Telegram's HTML mode renders \n as line breaks.
+        let out = body(&payload("line 1\nline 2\nline 3", Some("stop")));
+        assert_eq!(out, "line 1\nline 2\nline 3");
     }
 
     #[test]
-    fn body_with_header_prepends_bold_tag_plus_newline() {
-        assert_eq!(
-            body(&payload("hi", Some("/tmp/r"), Some("s"), None)),
-            "<b>r · s</b>\n<pre>hi</pre>"
-        );
-    }
-
-    #[test]
-    fn body_escapes_text_inside_pre() {
-        assert_eq!(
-            body(&payload("<script>", None, None, None)),
-            "<pre>&lt;script&gt;</pre>"
-        );
-    }
-
-    #[test]
-    fn body_includes_kind_tag() {
-        assert_eq!(
-            body(&payload("done", None, None, Some("subagent_stop"))),
-            "<b>[agent]</b>\n<pre>done</pre>"
-        );
-    }
-
-    #[test]
-    fn truncate_chars_passthrough_when_under_cap() {
-        assert_eq!(truncate_chars("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_chars_cuts_codepoint_aware() {
-        // 3 codepoints, each multi-byte in UTF-8.
-        assert_eq!(truncate_chars("世界🌍", 2), "世…");
+    fn no_cwd_or_session_in_output() {
+        // Belt-and-suspenders: even though we moved the cwd/session
+        // out of the format, confirm they don't leak into the body.
+        let out = body(&payload("hi", Some("stop")));
+        assert!(!out.contains("test-project"));
+        assert!(!out.contains("de54af3d"));
     }
 }
