@@ -1,34 +1,34 @@
 {
   "manifest_version": 1,
   "tebis_version": "0.2.0",
-  "updated_at": "2026-04-21",
+  "updated_at": "2026-04-22",
   "stt_models": {
     "base.en": {
-      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
-      "sha256": "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
-      "size_bytes": 147964211,
-      "display_name": "Whisper Base (English) — 148 MB",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin",
+      "sha256": "4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f",
+      "size_bytes": 59770597,
+      "display_name": "Whisper Base (English) Q5_1 — 57 MB",
       "default": true
     },
     "small.en": {
-      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
-      "sha256": "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
-      "size_bytes": 511662473,
-      "display_name": "Whisper Small (English) — 488 MB",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en-q5_1.bin",
+      "sha256": "bfdff4894dcb76bbf647d56263ea2a96645423f1669176f4844a1bf8e478ad30",
+      "size_bytes": 190134239,
+      "display_name": "Whisper Small (English) Q5_1 — 181 MB",
       "default": false
     },
     "tiny.en": {
-      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
-      "sha256": "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
-      "size_bytes": 77691713,
-      "display_name": "Whisper Tiny (English) — 78 MB",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en-q5_1.bin",
+      "sha256": "c77c5766f1cef09b6b7d47f21b546cbddd4157886b3b5d6d4f709e91e66c7c2b",
+      "size_bytes": 32201487,
+      "display_name": "Whisper Tiny (English) Q5_1 — 31 MB",
       "default": false
     }
   },
   "tts_models": {
     "kokoro-v1.0": {
       "onnx_url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model.onnx",
-      "onnx_sha256": "TBD-PLACEHOLDER-kokoro-onnx",
+      "onnx_sha256": "8fbea51ea711f2af382e88c833d9e288c6dc82ce5e98421ea61c058ce21a34cb",
       "onnx_size_bytes": 346000000,
       "voices_url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices.bin",
       "voices_sha256": "TBD-PLACEHOLDER-kokoro-voices",
