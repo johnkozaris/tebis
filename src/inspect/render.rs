@@ -31,7 +31,7 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext) -> String {
     let autostart_rows = build_autostart_rows(snapshot.autostart.as_ref());
     let notify_rows = build_notify_rows(snapshot.notify.as_ref());
     let hooks_rows = build_hooks_rows(&snapshot.hooks);
-    let voice_rows = build_voice_rows(snapshot.voice.as_ref());
+    let voice_rows = build_voice_rows(snapshot.voice.as_ref(), &live.metrics);
     let settings_section = build_settings_section(snapshot);
 
     let default_target_display = default_target.as_deref().map_or_else(
@@ -303,7 +303,10 @@ fn build_hooks_rows(hooks: &super::HooksInfo) -> String {
     out
 }
 
-fn build_voice_rows(voice: Option<&super::VoiceInfo>) -> String {
+fn build_voice_rows(
+    voice: Option<&super::VoiceInfo>,
+    metrics: &crate::metrics::Metrics,
+) -> String {
     voice.map_or_else(
         || r#"<dt>Voice input</dt><dd class="muted">disabled</dd>"#.to_string(),
         |v| {
@@ -312,9 +315,22 @@ fn build_voice_rows(voice: Option<&super::VoiceInfo>) -> String {
             } else {
                 r#"<span class="muted">unavailable (see startup logs)</span>"#
             };
+            let received = metrics.voice_received.load(Ordering::Relaxed);
+            let success = metrics.stt_success.load(Ordering::Relaxed);
+            let failures = metrics.stt_failures.load(Ordering::Relaxed);
+            let last_ms = metrics.last_stt_duration_ms.load(Ordering::Relaxed);
+            let activity = if received == 0 {
+                "<span class=\"muted\">no voice messages yet</span>".to_string()
+            } else {
+                format!(
+                    "<code>{received}</code> received · <code>{success}</code> transcribed \
+                     · <code>{failures}</code> failed · last took <code>{last_ms} ms</code>",
+                )
+            };
             format!(
                 "<dt>Voice STT model</dt><dd><code>{model}</code></dd>\
-                 <dt>Voice STT status</dt><dd>{status}</dd>",
+                 <dt>Voice STT status</dt><dd>{status}</dd>\
+                 <dt>Voice STT activity</dt><dd>{activity}</dd>",
                 model = sanitize::escape_html(&v.stt_model),
                 status = status,
             )

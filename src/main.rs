@@ -319,8 +319,6 @@ async fn run_bridge() -> Result<()> {
     } else {
         None
     };
-    // Silence unused-variable warnings until Phase 3 wires this into HandlerContext.
-    let _ = &audio;
 
     // Snapshot is built AFTER the audio subsystem so the dashboard's
     // Voice section can reflect real initialization state (model loaded
@@ -473,11 +471,46 @@ async fn run_bridge() -> Result<()> {
                     let Some(message) = update.message else {
                         continue;
                     };
-                    let Some(text) = message.text else { continue };
                     let chat_id = message.chat.id;
                     let message_id = message.message_id;
 
-                    tracing::debug!(chat_id, bytes = text.len(), "Received message");
+                    let payload = if let Some(text) = message.text {
+                        tracing::debug!(chat_id, bytes = text.len(), "Received text message");
+                        bridge::Payload::Text(text)
+                    } else if let Some(v) = message.voice {
+                        tracing::debug!(
+                            chat_id,
+                            duration_sec = v.duration,
+                            size = ?v.file_size,
+                            "Received voice message"
+                        );
+                        bridge::Payload::Voice {
+                            file_id: v.file_id,
+                            duration_sec: v.duration,
+                            size_bytes: v.file_size,
+                        }
+                    } else if let Some(a) = message.audio {
+                        // Music-file upload, same code path as voice.
+                        // The codec only accepts OGG/Opus; MP3/M4A uploads
+                        // will be rejected downstream with a clear error.
+                        tracing::debug!(
+                            chat_id,
+                            duration_sec = a.duration,
+                            size = ?a.file_size,
+                            mime = ?a.mime_type,
+                            "Received audio file"
+                        );
+                        bridge::Payload::Voice {
+                            file_id: a.file_id,
+                            duration_sec: a.duration,
+                            size_bytes: a.file_size,
+                        }
+                    } else {
+                        // No handled content (sticker, photo, …). Drop
+                        // silently — different from voice-with-STT-off
+                        // which gets a user-facing reply.
+                        continue;
+                    };
 
                     let ctx = bridge::HandlerContext {
                         tg: tg.clone(),
@@ -489,9 +522,10 @@ async fn run_bridge() -> Result<()> {
                         metrics: metrics.clone(),
                         autoreply: autoreply_cfg.clone(),
                         tracker: tracker.clone(),
+                        audio: audio.clone(),
                     };
 
-                    tracker.spawn(bridge::handle_update(ctx, chat_id, message_id, text));
+                    tracker.spawn(bridge::handle_update(ctx, chat_id, message_id, payload));
                 }
             }
             Err(e) if e.is_conflict() => {

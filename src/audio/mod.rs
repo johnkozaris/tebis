@@ -75,6 +75,17 @@ pub struct AudioSubsystem {
     stt: Option<stt::local::LocalStt>,
     // tts: Option<tts::local::LocalTts>, // Phase 4
     stt_model_name: Option<String>,
+    /// Snapshot of STT runtime caps. `None` when STT is off. The bridge
+    /// reads these to enforce duration/size limits before downloading.
+    stt_limits: Option<SttLimits>,
+    /// ISO-639-1 hint to pass to whisper; `None` means auto-detect.
+    stt_language: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SttLimits {
+    pub max_duration_sec: u32,
+    pub max_bytes: u32,
 }
 
 impl AudioSubsystem {
@@ -93,17 +104,28 @@ impl AudioSubsystem {
         _tracker: &TaskTracker,
         shutdown: CancellationToken,
     ) -> Result<Arc<Self>> {
-        let (stt, stt_model_name) = match &cfg.stt {
-            None => (None, None),
+        let (stt, stt_model_name, stt_limits, stt_language) = match &cfg.stt {
+            None => (None, None, None, None),
             Some(scfg) => {
                 let (backend, model_name) = build_local_stt(scfg, shutdown.clone()).await?;
-                (Some(backend), Some(model_name))
+                let limits = SttLimits {
+                    max_duration_sec: scfg.max_duration_sec,
+                    max_bytes: scfg.max_bytes,
+                };
+                (
+                    Some(backend),
+                    Some(model_name),
+                    Some(limits),
+                    Some(scfg.language.clone()),
+                )
             }
         };
 
         Ok(Arc::new(Self {
             stt,
             stt_model_name,
+            stt_limits,
+            stt_language,
         }))
     }
 
@@ -118,6 +140,18 @@ impl AudioSubsystem {
     /// STT is disabled.
     pub fn stt_model_name(&self) -> Option<&str> {
         self.stt_model_name.as_deref()
+    }
+
+    /// STT duration + byte caps for the bridge to enforce BEFORE
+    /// downloading a voice file. `None` when STT is disabled.
+    pub const fn stt_limits(&self) -> Option<SttLimits> {
+        self.stt_limits
+    }
+
+    /// ISO-639-1 language hint to pass to whisper. `""` (empty) means
+    /// auto-detect. Returns `None` when STT is disabled.
+    pub fn stt_language(&self) -> Option<&str> {
+        self.stt_language.as_deref()
     }
 }
 

@@ -35,6 +35,23 @@ pub struct Metrics {
     pub last_response_duration_ms: AtomicU64,
     /// Unix seconds of the last successful getUpdates.
     pub last_poll_success_at: AtomicI64,
+
+    /// Voice/audio messages received. Subset of `updates_received` —
+    /// every voice goes through rate-limit + permit just like text.
+    pub voice_received: AtomicU64,
+    /// Voice messages that produced a non-empty transcript. Diverges
+    /// from `voice_received` when STT is disabled, the file is rejected
+    /// (too long / wrong codec / etc.), inference errors out, or the
+    /// model returns empty text.
+    pub stt_success: AtomicU64,
+    /// Voice messages that reached STT but failed at any stage after
+    /// rate-limit — size/duration cap, download error, decode error,
+    /// inference error. Counted separately from `handler_errors`
+    /// because those are send-side failures.
+    pub stt_failures: AtomicU64,
+    /// Wall-clock milliseconds of the last successful transcription
+    /// (whisper-rs inference only, not download / decode).
+    pub last_stt_duration_ms: AtomicU64,
 }
 
 impl Metrics {
@@ -71,6 +88,20 @@ impl Metrics {
 
     pub fn record_poll_error(&self) {
         self.poll_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_voice_received(&self) {
+        self.voice_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_stt_success(&self, duration_ms: u32) {
+        self.stt_success.fetch_add(1, Ordering::Relaxed);
+        self.last_stt_duration_ms
+            .store(u64::from(duration_ms), Ordering::Relaxed);
+    }
+
+    pub fn record_stt_failure(&self) {
+        self.stt_failures.fetch_add(1, Ordering::Relaxed);
     }
 }
 

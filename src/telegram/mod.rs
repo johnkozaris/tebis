@@ -19,8 +19,9 @@ use secrecy::{ExposeSecret, SecretString};
 pub mod types;
 
 use types::{
-    ApiResponse, BotUser, DeleteWebhookRequest, GetUpdatesRequest, LinkPreviewOptions, Message,
-    ReactionType, SendChatActionRequest, SendMessageRequest, SetMessageReactionRequest, Update,
+    ApiResponse, BotUser, DeleteWebhookRequest, GetFileRequest, GetUpdatesRequest,
+    LinkPreviewOptions, Message, ReactionType, SendChatActionRequest, SendMessageRequest,
+    SetMessageReactionRequest, TelegramFile, Update,
 };
 
 /// Extra time above the caller's long-poll window for connect + headers.
@@ -207,6 +208,90 @@ impl TelegramClient {
             )
             .await?;
         Ok(())
+    }
+
+    /// Resolve a `file_id` (from a `voice` / `audio` / `document` field)
+    /// to a [`TelegramFile`] with the server-visible `file_path`. Pair
+    /// with [`Self::download_file`] to fetch the bytes.
+    pub async fn get_file(&self, file_id: &str) -> Result<TelegramFile> {
+        self.post_with_timeout(
+            "getFile",
+            &GetFileRequest { file_id },
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Download a file at `file_path` (from a prior `get_file` call)
+    /// via the Bot API's file-serving endpoint. The URL contains the
+    /// bot token — same as every other Telegram URL — and is routed
+    /// through the same `redact_network_error` redactor so network
+    /// errors can never leak it to the journal.
+    ///
+    /// Caller should pre-check `file_size` against
+    /// `TELEGRAM_STT_MAX_BYTES`; this method still enforces a
+    /// [`MAX_RESPONSE_BYTES`] ceiling so a server lying about its size
+    /// can't blow memory. Cloud Bot API maxes at 20 MiB regardless.
+    pub async fn download_file(&self, file_path: &str) -> Result<Bytes> {
+        // `base_url` is `https://api.telegram.org/bot<TOKEN>` — swap
+        // `/bot<TOKEN>` for `/file/bot<TOKEN>` to reach the file-serving
+        // endpoint. The token stays wrapped in `SecretString` so `Debug`
+        // redaction keeps working.
+        let url = {
+            let base = self.base_url.expose_secret();
+            let Some(token) = base.strip_prefix("https://api.telegram.org/bot") else {
+                return Err(TelegramError::Network {
+                    method: "download_file".to_string(),
+                    description: "unexpected base_url shape".to_string(),
+                    retryable: false,
+                });
+            };
+            format!("https://api.telegram.org/file/bot{token}/{file_path}")
+        };
+
+        let deadline = tokio::time::Instant::now() + DEFAULT_REQUEST_TIMEOUT;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&url)
+            .body(Full::<Bytes>::new(Bytes::new()))
+            .expect("hyper Request::builder: inputs are known-valid");
+        let response = match tokio::time::timeout_at(deadline, self.client.request(req)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                return Err(TelegramError::Network {
+                    method: "download_file".to_string(),
+                    description: redact_network_error(&e),
+                    retryable: e.is_connect(),
+                });
+            }
+            Err(_) => {
+                return Err(TelegramError::Network {
+                    method: "download_file".to_string(),
+                    description: format!("timed out after {DEFAULT_REQUEST_TIMEOUT:?}"),
+                    retryable: true,
+                });
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            return Err(TelegramError::Api {
+                method: "download_file".to_string(),
+                status: status.as_u16(),
+                description: "non-success HTTP status".to_string(),
+            });
+        }
+        let limited = Limited::new(response.into_body(), MAX_RESPONSE_BYTES);
+        let body = match limited.collect().await {
+            Ok(b) => b.to_bytes(),
+            Err(e) => {
+                return Err(TelegramError::Network {
+                    method: "download_file".to_string(),
+                    description: format!("body read: {e}"),
+                    retryable: false,
+                });
+            }
+        };
+        Ok(body)
     }
 
     /// Surface a chat action (`"typing"`, `"upload_photo"`, …) for ~5 s
