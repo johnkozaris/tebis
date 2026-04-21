@@ -53,6 +53,12 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Maximum redirect hops before we give up. Hugging Face serves model
+/// blobs from their CDN via a single 302 from `huggingface.co/.../resolve/main/…`
+/// to `cas-bridge.xethub.hf.co/…`, so one hop is the common case; allow
+/// 5 for peace of mind without opening a redirect-chain attack vector.
+const MAX_REDIRECTS: u8 = 5;
+
 type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 #[derive(Debug, thiserror::Error)]
@@ -184,35 +190,59 @@ impl FetchClient {
         progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
         cancel: CancellationToken,
     ) -> Result<(), FetchError> {
-        let uri: hyper::Uri = url
-            .parse()
-            .map_err(|e: hyper::http::uri::InvalidUri| FetchError::Network(e.to_string()))?;
-        let host = uri.host().unwrap_or("<unknown>").to_string();
+        // Hugging Face serves via a 302 from huggingface.co → their CDN
+        // (xethub). We follow up to MAX_REDIRECTS hops manually because
+        // hyper-util's legacy Client doesn't do auto-redirect.
+        let mut current_url = url.to_string();
+        let mut hops: u8 = 0;
+        let response = loop {
+            if hops > MAX_REDIRECTS {
+                return Err(FetchError::Network(format!(
+                    "too many redirects (> {MAX_REDIRECTS}) starting from original URL"
+                )));
+            }
+            let uri: hyper::Uri = current_url.parse().map_err(
+                |e: hyper::http::uri::InvalidUri| FetchError::Network(e.to_string()),
+            )?;
+            let host = uri.host().unwrap_or("<unknown>").to_string();
 
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(url)
-            .header(hyper::header::USER_AGENT, "tebis-audio-fetch/0.1")
-            .header(hyper::header::ACCEPT, "*/*")
-            .body(Full::<Bytes>::new(Bytes::new()))
-            .map_err(|e| FetchError::Network(e.to_string()))?;
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(&current_url)
+                .header(hyper::header::USER_AGENT, "tebis-audio-fetch/0.1")
+                .header(hyper::header::ACCEPT, "*/*")
+                .body(Full::<Bytes>::new(Bytes::new()))
+                .map_err(|e| FetchError::Network(e.to_string()))?;
 
-        let response = self.client.request(req).await.map_err(|e| {
-            FetchError::Network(crate::telegram::redact_network_error(&e))
-        })?;
+            let resp = self.client.request(req).await.map_err(|e| {
+                FetchError::Network(crate::telegram::redact_network_error(&e))
+            })?;
+            let status = resp.status();
 
-        let status = response.status();
-        if !status.is_success() {
-            return Err(FetchError::HttpStatus {
-                status: status.as_u16(),
-                url_host: host,
-            });
-        }
-
-        // Follow-redirects is handled by Hugging Face's CDN within a single
-        // request hop; our plain GET already lands at the final object. If
-        // in future an HF move introduces a 302, we'll add redirect support
-        // here — for now, non-2xx is treated as fatal.
+            if status.is_redirection() {
+                let Some(location) = resp
+                    .headers()
+                    .get(hyper::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+                else {
+                    return Err(FetchError::Network(format!(
+                        "redirect {status} missing Location header"
+                    )));
+                };
+                tracing::debug!(from = %host, to = %location, "following redirect");
+                current_url = location;
+                hops = hops.saturating_add(1);
+                continue;
+            }
+            if !status.is_success() {
+                return Err(FetchError::HttpStatus {
+                    status: status.as_u16(),
+                    url_host: host,
+                });
+            }
+            break resp;
+        };
 
         let content_length = response
             .headers()
