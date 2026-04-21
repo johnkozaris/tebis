@@ -45,9 +45,16 @@ async fn main() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let tts_cfg = None;
 
+    // Honor the manifest's own default so the smoke test tracks the
+    // current recommended model without code changes when the default
+    // shifts.
+    let default_model = tebis::audio::manifest::get()
+        .default_stt_model()
+        .context("manifest has no default STT model")?
+        .to_string();
     let cfg = AudioConfig {
         stt: Some(SttConfig {
-            model: "base.en".to_string(),
+            model: default_model,
             language: "en".to_string(),
             max_duration_sec: 120,
             max_bytes: 20 * 1024 * 1024,

@@ -311,7 +311,16 @@ async fn transcribe_voice(
         .map_err(|e| format!("Transcription failed: {e}"))?;
 
     let mut text = transcription.text;
-    if text.trim().is_empty() {
+    // whisper.cpp emits special tokens like `[BLANK_AUDIO]`,
+    // `[Music]`, `(silence)`, `[AUDIO OUT]` when it can't find speech.
+    // Treat them all as empty so the user gets a clean "no speech"
+    // error instead of the internal token string.
+    let trimmed = text.trim();
+    let is_silence_token = trimmed.is_empty()
+        || trimmed.starts_with('[')
+        || trimmed.starts_with('(')
+        || trimmed.eq_ignore_ascii_case("silence");
+    if is_silence_token {
         return Err("Could not transcribe voice message (no speech detected).".to_string());
     }
     if text.len() > MAX_TRANSCRIPT_BYTES {

@@ -8,14 +8,14 @@
       "sha256": "4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f",
       "size_bytes": 59770597,
       "display_name": "Whisper Base (English) Q5_1 — 57 MB",
-      "default": true
+      "default": false
     },
     "small.en": {
       "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en-q5_1.bin",
       "sha256": "bfdff4894dcb76bbf647d56263ea2a96645423f1669176f4844a1bf8e478ad30",
       "size_bytes": 190134239,
       "display_name": "Whisper Small (English) Q5_1 — 181 MB",
-      "default": false
+      "default": true
     },
     "tiny.en": {
       "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en-q5_1.bin",
