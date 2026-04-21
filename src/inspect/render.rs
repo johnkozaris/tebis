@@ -31,6 +31,7 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext) -> String {
     let autostart_rows = build_autostart_rows(snapshot.autostart.as_ref());
     let notify_rows = build_notify_rows(snapshot.notify.as_ref());
     let hooks_rows = build_hooks_rows(&snapshot.hooks);
+    let voice_rows = build_voice_rows(snapshot.voice.as_ref());
     let settings_section = build_settings_section(snapshot);
 
     let default_target_display = default_target.as_deref().map_or_else(
@@ -113,6 +114,7 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext) -> String {
     {autostart_rows}
     {notify_rows}
     {hooks_rows}
+    {voice_rows}
   </dl></div>
 </section>
 
@@ -299,6 +301,27 @@ fn build_hooks_rows(hooks: &super::HooksInfo) -> String {
         out.push_str("</ul></dd>");
     }
     out
+}
+
+fn build_voice_rows(voice: Option<&super::VoiceInfo>) -> String {
+    voice.map_or_else(
+        || r#"<dt>Voice input</dt><dd class="muted">disabled</dd>"#.to_string(),
+        |v| {
+            let status = if v.stt_ready {
+                "<span>ready</span>"
+            } else {
+                r#"<span class="muted">unavailable (see startup logs)</span>"#
+            };
+            format!(
+                "<dt>Voice STT provider</dt><dd><code>{provider}</code></dd>\
+                 <dt>Voice STT model</dt><dd><code>{model}</code></dd>\
+                 <dt>Voice STT status</dt><dd>{status}</dd>",
+                provider = sanitize::escape_html(v.stt_provider),
+                model = sanitize::escape_html(&v.stt_model),
+                status = status,
+            )
+        },
+    )
 }
 
 fn build_notify_rows(notify: Option<&super::NotifyInfo>) -> String {

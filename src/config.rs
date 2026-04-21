@@ -13,6 +13,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::agent_hooks::HooksMode;
+use crate::audio::AudioConfig;
+use crate::audio::stt::{SttConfig, SttProvider};
 use crate::bridge::autoreply::AutoreplyConfig;
 use crate::bridge::session::AutostartConfig;
 use crate::env_file;
@@ -35,6 +37,9 @@ pub struct Config {
     pub autoreply: Option<AutoreplyConfig>,
     /// How tebis handles agent hooks at autostart time.
     pub hooks_mode: HooksMode,
+    /// STT / TTS settings. `stt: None` and `tts: None` inside means the
+    /// audio subsystem is dormant — no model downloads, no memory cost.
+    pub audio: AudioConfig,
 }
 
 /// Parse an env-var toggle with a default when unset or empty.
@@ -107,6 +112,7 @@ impl Config {
         let hooks_mode =
             HooksMode::from_env_str(&env::var("TELEGRAM_HOOKS_MODE").unwrap_or_default())
                 .context("TELEGRAM_HOOKS_MODE")?;
+        let audio = load_audio_config()?;
 
         Ok(Self {
             bot_token,
@@ -118,8 +124,108 @@ impl Config {
             autostart,
             autoreply,
             hooks_mode,
+            audio,
         })
     }
+}
+
+/// Build [`AudioConfig`] from `TELEGRAM_STT_*` env. Returns an
+/// `AudioConfig` with `stt: None` when the master flag is off (the
+/// default). Phase 4 adds `tts` here.
+fn load_audio_config() -> Result<AudioConfig> {
+    let stt = load_stt_config()?;
+    Ok(AudioConfig { stt })
+}
+
+fn load_stt_config() -> Result<Option<SttConfig>> {
+    if !parse_toggle_env("TELEGRAM_STT", false)? {
+        return Ok(None);
+    }
+
+    let provider = SttProvider::parse(
+        &env::var("TELEGRAM_STT_PROVIDER").unwrap_or_else(|_| "local".to_string()),
+    )
+    .context("TELEGRAM_STT_PROVIDER")?;
+
+    let default_model = match provider {
+        SttProvider::Local => crate::audio::manifest::get()
+            .default_stt_model()
+            .context("resolving default local STT model from manifest")?
+            .to_string(),
+        // Sensible per-provider defaults for remote backends.
+        SttProvider::Groq => "whisper-large-v3-turbo".to_string(),
+        SttProvider::OpenAi | SttProvider::OpenAiCompat => "whisper-1".to_string(),
+    };
+    let model = env::var("TELEGRAM_STT_MODEL").unwrap_or(default_model);
+
+    let base_url = env::var("TELEGRAM_STT_BASE_URL").ok().filter(|s| !s.is_empty());
+    if provider == SttProvider::OpenAiCompat && base_url.is_none() {
+        bail!("TELEGRAM_STT_BASE_URL is required when TELEGRAM_STT_PROVIDER=openai_compat");
+    }
+
+    let api_key = env::var("TELEGRAM_STT_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(SecretString::from);
+    if matches!(provider, SttProvider::Groq | SttProvider::OpenAi) && api_key.is_none() {
+        bail!(
+            "TELEGRAM_STT_API_KEY is required when TELEGRAM_STT_PROVIDER={}",
+            provider.as_str()
+        );
+    }
+
+    let language = env::var("TELEGRAM_STT_LANGUAGE").unwrap_or_else(|_| "en".to_string());
+
+    let max_duration_sec: u32 = env::var("TELEGRAM_STT_MAX_DURATION_SEC")
+        .unwrap_or_else(|_| "120".to_string())
+        .parse()
+        .context("TELEGRAM_STT_MAX_DURATION_SEC must be a positive integer")?;
+    if !(1..=900).contains(&max_duration_sec) {
+        bail!("TELEGRAM_STT_MAX_DURATION_SEC must be 1..=900");
+    }
+
+    let max_bytes: u32 = env::var("TELEGRAM_STT_MAX_BYTES")
+        .unwrap_or_else(|_| "20971520".to_string()) // 20 MB
+        .parse()
+        .context("TELEGRAM_STT_MAX_BYTES must be a non-negative integer")?;
+    if !(65_536..=52_428_800).contains(&max_bytes) {
+        bail!("TELEGRAM_STT_MAX_BYTES must be 65536..=52428800 (64 KiB .. 50 MiB)");
+    }
+
+    let threads: u32 = match env::var("TELEGRAM_STT_THREADS")
+        .unwrap_or_else(|_| "auto".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "auto" | "" => default_threads(),
+        s => s
+            .parse()
+            .context("TELEGRAM_STT_THREADS must be 'auto' or a positive integer")?,
+    };
+    if !(1..=32).contains(&threads) {
+        bail!("TELEGRAM_STT_THREADS must be 1..=32");
+    }
+
+    Ok(Some(SttConfig {
+        provider,
+        model,
+        base_url,
+        api_key,
+        language,
+        max_duration_sec,
+        max_bytes,
+        threads,
+    }))
+}
+
+/// Half of logical CPUs, clamped to `[2, 8]`. Whisper.cpp scales well up
+/// to ~8 threads on small models; past that it's contention. Half-of-all
+/// leaves headroom for tokio + the rest of tebis.
+fn default_threads() -> u32 {
+    let total = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let half = (total / 2).clamp(2, 8);
+    u32::try_from(half).unwrap_or(4)
 }
 
 /// Autoreply (pane-settle) is on by default as the universal fallback

@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 
 use tebis::bridge::session;
 use tebis::{
-    bridge, config, hooks_cli, inspect, lockfile, metrics, notify, security, service, setup,
+    audio, bridge, config, hooks_cli, inspect, lockfile, metrics, notify, security, service, setup,
     telegram, tmux,
 };
 
@@ -284,8 +284,56 @@ async fn run_bridge() -> Result<()> {
         ),
         Err(_) => None,
     };
+
+    let autoreply_cfg = config.autoreply.take().map(Arc::new);
+
+    // Audio subsystem: constructed lazily. With everything off (the
+    // public-release default) `new` touches nothing — no download, no
+    // memory — and returns an Arc whose `transcribe`/`synthesize`
+    // respond with `AudioError::NotEnabled`. When STT is on, this is
+    // the blocking model-download path (~53 s on first run for
+    // `base.en`); we run it on the current thread so startup waits for
+    // a cached-and-ready subsystem before the bridge accepts messages.
+    //
+    // Fail-open: if model download / load fails we log a warn and
+    // continue text-only. Bot token problems are different (handled by
+    // `unauthorized_dead_end` above); audio problems are recoverable
+    // with `TELEGRAM_STT_PROVIDER=groq` etc., so we shouldn't crash.
+    let audio = if config.audio.any_enabled() {
+        match audio::AudioSubsystem::new(&config.audio, &tracker, shutdown.clone()).await {
+            Ok(a) => {
+                if let Some(m) = a.stt_model_name() {
+                    tracing::info!(model = %m, "Audio: local STT ready");
+                }
+                Some(a)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "Audio subsystem failed to initialize; continuing text-only. \
+                     Options: unset TELEGRAM_STT, switch to a cloud provider, or fix the cause above."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Silence unused-variable warnings until Phase 3 wires this into HandlerContext.
+    let _ = &audio;
+
+    // Snapshot is built AFTER the audio subsystem so the dashboard's
+    // Voice section can reflect real initialization state (model loaded
+    // vs download failed) rather than guessing from config alone.
     let inspect_snapshot = if inspect_port.is_some() {
         let tmux_ver = inspect::tmux_version().await;
+        let voice_info = config.audio.stt.as_ref().map(|scfg| inspect::VoiceInfo {
+            stt_provider: scfg.provider.as_str(),
+            stt_model: scfg.model.clone(),
+            stt_ready: audio
+                .as_ref()
+                .is_some_and(|a| a.stt_model_name().is_some()),
+        });
         Some(Arc::new(inspect::Snapshot {
             bridge: inspect::BridgeInfo {
                 version: env!("CARGO_PKG_VERSION"),
@@ -323,13 +371,12 @@ async fn run_bridge() -> Result<()> {
                     })
                     .collect(),
             },
+            voice: voice_info,
             env_file: env::var("BRIDGE_ENV_FILE").ok(),
         }))
     } else {
         None
     };
-
-    let autoreply_cfg = config.autoreply.take().map(Arc::new);
 
     let tmux = Arc::new(tmux::Tmux::new(
         config.allowed_sessions.clone(),

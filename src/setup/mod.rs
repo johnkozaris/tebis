@@ -35,6 +35,15 @@ const WIZARD_MANAGED_KEYS: &[&str] = &[
     "INSPECT_PORT",
     "BRIDGE_ENV_FILE",
     "TELEGRAM_HOOKS_MODE",
+    // Voice input (STT). Phase 1 wires only the `local` provider; the
+    // wizard writes just the on/off flag + the model choice. Cloud
+    // providers (Groq, OpenAI) and their API keys are not yet in the
+    // wizard but can be hand-added to the env file — those keys are
+    // deliberately NOT in `WIZARD_MANAGED_KEYS` so hand-edits survive
+    // a wizard re-run.
+    "TELEGRAM_STT",
+    "TELEGRAM_STT_PROVIDER",
+    "TELEGRAM_STT_MODEL",
 ];
 
 /// Autostart triple. Shared between the step that collects it and the
@@ -43,6 +52,14 @@ pub(super) struct Autostart {
     pub(super) session: String,
     pub(super) dir: String,
     pub(super) command: String,
+}
+
+/// Voice / STT wizard choice. Phase 1 surfaces only local whisper.cpp.
+#[derive(Clone, Debug)]
+pub(super) struct VoiceChoice {
+    pub(super) enabled: bool,
+    /// Key from `audio::manifest.stt_models` — only meaningful when `enabled`.
+    pub(super) model: String,
 }
 
 /// What the caller should do after `run()` returns. Separates wizard
@@ -85,6 +102,7 @@ pub fn run() -> Result<Next> {
     let autostart = steps::step_autostart(&theme, &sessions, discovered.autostart.as_ref())?;
     let hooks_mode = steps::step_hooks_mode(&theme, autostart.as_ref(), discovered.hooks_mode)?;
     let inspect_port = steps::step_inspect_port(&theme, discovered.inspect_port)?;
+    let voice = steps::step_voice(&theme, discovered.voice.as_ref())?;
 
     ui::print_summary(
         &token,
@@ -93,6 +111,7 @@ pub fn run() -> Result<Next> {
         autostart.as_ref(),
         hooks_mode,
         inspect_port,
+        voice.as_ref(),
     );
     if !Confirm::with_theme(&theme)
         .with_prompt("Save this config?")
@@ -119,6 +138,7 @@ pub fn run() -> Result<Next> {
         autostart.as_ref(),
         inspect_port,
         hooks_mode,
+        voice.as_ref(),
         &env_path,
     );
     if !extras.is_empty() {
@@ -203,6 +223,10 @@ pub fn env_file_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config/tebis/env"))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "grouping wizard outputs into a struct just for fn-arity hurts readability"
+)]
 fn build_env_file(
     token: &str,
     user_id: i64,
@@ -210,6 +234,7 @@ fn build_env_file(
     autostart: Option<&Autostart>,
     inspect_port: Option<u16>,
     hooks_mode: HooksChoice,
+    voice: Option<&VoiceChoice>,
     env_path: &Path,
 ) -> String {
     use std::fmt::Write as _;
@@ -250,6 +275,19 @@ fn build_env_file(
         let _ = writeln!(out, "INSPECT_PORT={port}");
         out.push_str("# Enables the Settings-edit form on the dashboard.\n");
         let _ = writeln!(out, "BRIDGE_ENV_FILE={}", env_path.display());
+    }
+
+    if let Some(v) = voice {
+        out.push_str("\n# Voice input (STT). Transcribes Telegram voice notes in-process\n");
+        out.push_str("# via whisper-rs. Model downloads on first run to\n");
+        out.push_str("# $XDG_DATA_HOME/tebis/models/ (about 148 MB for base.en).\n");
+        if v.enabled {
+            let _ = writeln!(out, "TELEGRAM_STT=on");
+            out.push_str("TELEGRAM_STT_PROVIDER=local\n");
+            let _ = writeln!(out, "TELEGRAM_STT_MODEL={}", v.model);
+        } else {
+            out.push_str("TELEGRAM_STT=off\n");
+        }
     }
 
     out

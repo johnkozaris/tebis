@@ -35,8 +35,26 @@ pub struct Snapshot {
     pub autostart: Option<AutostartInfo>,
     pub notify: Option<NotifyInfo>,
     pub hooks: HooksInfo,
+    /// `None` when no audio features are enabled. `Some(VoiceInfo)`
+    /// when at least one provider (STT, eventually TTS) was configured
+    /// at startup.
+    pub voice: Option<VoiceInfo>,
     /// `Some` → Settings panel becomes editable and writes here.
     pub env_file: Option<String>,
+}
+
+/// Snapshot of STT (and eventually TTS) state for the dashboard Voice
+/// section. Built once at startup — no live sampling needed because
+/// config can't change without restart anyway.
+pub struct VoiceInfo {
+    /// `"local"` in Phase 1; `"groq"` / `"openai"` / `"openai_compat"`
+    /// in Phase 2. Human-readable; rendered verbatim.
+    pub stt_provider: &'static str,
+    /// Manifest key for local; provider-side model name for remote.
+    pub stt_model: String,
+    /// Whether the subsystem initialized successfully. `false` means
+    /// the daemon is running text-only — the banner shows it in red.
+    pub stt_ready: bool,
 }
 
 /// Hooks-mode policy + snapshot of installed project dirs. `entries`

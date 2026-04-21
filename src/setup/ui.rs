@@ -126,6 +126,7 @@ pub(super) fn print_summary(
     autostart: Option<&Autostart>,
     hooks_mode: HooksChoice,
     inspect_port: Option<u16>,
+    voice: Option<&super::VoiceChoice>,
 ) {
     divider_rule("Review");
     let masked_token = mask_token(token);
@@ -158,12 +159,23 @@ pub(super) fn print_summary(
             )
         },
     );
+    let voice_row = voice.map_or_else(
+        || style("(not configured)").dim().to_string(),
+        |v| {
+            if v.enabled {
+                format!("local whisper.cpp · model: {}", style(&v.model).bold())
+            } else {
+                style("(disabled)").dim().to_string()
+            }
+        },
+    );
     row("Bot token", &masked_token);
     row("User id", &user_id.to_string());
     row("Sessions", &sessions_row);
     row("Agent", &autostart_row);
     row("Hooks", &hooks_row);
     row("Dashboard", &dashboard_row);
+    row("Voice", &voice_row);
     println!();
 }
 

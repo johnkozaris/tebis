@@ -38,6 +38,20 @@ tokio-util = {version = "0.7.18", features = ["rt"]}
 tracing = "0.1.44"
 tracing-subscriber = {version = "0.3.23", features = ["fmt", "env-filter"]}
 
+# Local STT — whisper.cpp Rust bindings, linked in-process. Inference
+# runs inside the tebis daemon, no subprocess / server / network hop.
+# Models are downloaded on first use (see src/audio/fetch.rs) and
+# kept under $XDG_DATA_HOME/tebis/models/. On macOS we enable Metal
+# so inference uses the GPU; Core ML would add another tier of
+# acceleration but requires a separate `.mlmodelc` download per
+# model — deferred to a later phase. On Linux the default build is
+# pure CPU (OpenBLAS can be layered later via a cargo feature).
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = {version = "0.16", default-features = false, features = ["metal"]}
+
+[target.'cfg(target_os = "linux")'.dependencies]
+whisper-rs = {version = "0.16", default-features = false}
+
 [profile.release]
 codegen-units = 1
 debug = false

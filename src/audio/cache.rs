@@ -32,7 +32,7 @@ const MODELS_SUBDIR: &str = "models";
 /// Mirrors `agent_hooks/jsonfile.rs`'s `.tebis.tmp` convention.
 pub(crate) const TMP_SUFFIX: &str = ".tebis.tmp";
 
-/// Base directory for tebis-owned data — same as agent_hooks uses.
+/// Base directory for tebis-owned data — same as `agent_hooks` uses.
 /// Re-exports the existing function so we have exactly one XDG-lookup
 /// implementation in the crate.
 pub fn base_dir() -> Result<PathBuf> {

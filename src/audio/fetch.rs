@@ -19,7 +19,7 @@
 //!   scheme that does can't leak.
 //! - **10 (payload cap + read timeout)**: hard cap of 1 GiB per download
 //!   (catches runaway transfers); per-operation deadline of 10 minutes.
-//! - **12 (TaskTracker for background)**: `download_verified` is
+//! - **12 (`TaskTracker` for background)**: `download_verified` is
 //!   cancel-safe so callers can spawn it on the shared tracker and
 //!   have shutdown drain cleanly.
 
@@ -48,7 +48,7 @@ const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 /// Overall deadline per `download_verified` call. Pitched for a slow
 /// home-network downloading the 488 MB small model — ~8 Mbps still
 /// finishes inside this.
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -86,6 +86,10 @@ pub enum FetchError {
 }
 
 impl FetchError {
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "used as a function pointer in `.map_err(FetchError::from_io)`"
+    )]
     fn from_io(e: io::Error) -> Self {
         Self::Io(e.to_string())
     }
@@ -161,10 +165,7 @@ impl FetchClient {
         )
         .await;
 
-        let outcome = match result {
-            Ok(inner) => inner,
-            Err(_) => Err(FetchError::Timeout),
-        };
+        let outcome = result.unwrap_or(Err(FetchError::Timeout));
 
         if outcome.is_err() {
             // Best-effort cleanup — the fs::remove_file can itself fail

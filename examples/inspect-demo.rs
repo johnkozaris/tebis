@@ -165,6 +165,11 @@ async fn main() -> Result<()> {
             mode: "off",
             entries: Vec::new(),
         },
+        voice: Some(inspect::VoiceInfo {
+            stt_provider: "local",
+            stt_model: "base.en".to_string(),
+            stt_ready: true,
+        }),
         // Demo passes through BRIDGE_ENV_FILE if you set it, so you can
         // test the Settings edit flow locally against a throwaway file.
         env_file: std::env::var("BRIDGE_ENV_FILE").ok(),

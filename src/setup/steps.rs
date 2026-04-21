@@ -5,10 +5,11 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use console::style;
 use dialoguer::theme::ColorfulTheme;
-use dialoguer::{Confirm, Input};
+use dialoguer::{Confirm, Input, Select};
 
-use super::{Autostart, HooksChoice, normalize_dir, ui};
+use super::{Autostart, HooksChoice, VoiceChoice, normalize_dir, ui};
 use crate::agent_hooks::AgentKind;
+use crate::audio;
 use crate::tmux::is_valid_session_name;
 
 pub(super) fn step_bot_token(theme: &ColorfulTheme, existing: Option<&str>) -> Result<String> {
@@ -330,6 +331,85 @@ pub(super) fn step_inspect_port(
         .context("prompt: dashboard port")?;
 
     Ok(Some(port))
+}
+
+/// Voice / STT — Phase 1 exposes only the `local` provider. The cloud
+/// providers live in config but aren't user-selectable from the wizard
+/// yet (they want API keys and a cleaner interactive flow; deferred to
+/// Phase 2 to avoid a half-finished story).
+pub(super) fn step_voice(
+    theme: &ColorfulTheme,
+    existing: Option<&VoiceChoice>,
+) -> Result<Option<VoiceChoice>> {
+    ui::step_header(7, "Voice input (optional)");
+    println!(
+        "Transcribe Telegram {} messages in-process with {} —",
+        style("voice").cyan().bold(),
+        style("whisper.cpp").bold(),
+    );
+    println!(
+        "no cloud round-trip, no extra service. The model downloads on",
+    );
+    println!(
+        "first run to {} (about {} for {}).",
+        style("$XDG_DATA_HOME/tebis/models/").dim(),
+        style("148 MB").bold(),
+        style("base.en").bold(),
+    );
+    println!();
+
+    // Default to on for users who re-run the wizard and had it enabled;
+    // default off for first-run (matches public-release posture).
+    let default_on = existing.is_some_and(|v| v.enabled);
+    let enabled = Confirm::with_theme(theme)
+        .with_prompt("Enable voice-to-text for voice messages?")
+        .default(default_on)
+        .interact()
+        .context("prompt: enable voice")?;
+
+    if !enabled {
+        return Ok(Some(VoiceChoice {
+            enabled: false,
+            model: String::new(),
+        }));
+    }
+
+    // Pull labeled options from the manifest so upstream model additions
+    // don't require a wizard change.
+    let manifest = audio::manifest::get();
+    let mut choices: Vec<(String, String)> = manifest
+        .stt_models
+        .iter()
+        .map(|(k, m)| (k.clone(), m.display_name.clone()))
+        .collect();
+    // Show the default first so hitting Enter picks the 148 MB base.en.
+    choices.sort_by_key(|(k, _)| {
+        !manifest
+            .stt_models
+            .get(k)
+            .is_some_and(|m| m.default)
+    });
+
+    let existing_key = existing.and_then(|v| {
+        (!v.model.is_empty() && manifest.stt_models.contains_key(&v.model)).then_some(v.model.clone())
+    });
+    let default_idx = existing_key
+        .as_deref()
+        .and_then(|k| choices.iter().position(|(ck, _)| ck == k))
+        .unwrap_or(0);
+
+    let labels: Vec<&str> = choices.iter().map(|(_, d)| d.as_str()).collect();
+    let picked = Select::with_theme(theme)
+        .with_prompt("Whisper model")
+        .items(labels.as_slice())
+        .default(default_idx)
+        .interact()
+        .context("prompt: whisper model")?;
+
+    Ok(Some(VoiceChoice {
+        enabled: true,
+        model: choices[picked].0.clone(),
+    }))
 }
 
 // ---------- validators ----------

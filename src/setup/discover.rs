@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 
-use super::{Autostart, HooksChoice};
+use super::{Autostart, HooksChoice, VoiceChoice};
 use crate::env_file;
 
 /// Previously-saved values extracted from the env file. Every field is
@@ -16,6 +16,7 @@ pub(super) struct Discovered {
     pub(super) autostart: Option<Autostart>,
     pub(super) inspect_port: Option<u16>,
     pub(super) hooks_mode: Option<HooksChoice>,
+    pub(super) voice: Option<VoiceChoice>,
 }
 
 /// Parse `KEY=VALUE` lines. Comments (`#`) and blank lines skipped;
@@ -30,6 +31,8 @@ pub(super) fn discover(env_path: &Path) -> Discovered {
     let mut auto_session: Option<String> = None;
     let mut auto_dir: Option<String> = None;
     let mut auto_command: Option<String> = None;
+    let mut stt_enabled: Option<bool> = None;
+    let mut stt_model: Option<String> = None;
     for line in content.lines() {
         let Some((key, value)) = env_file::parse_kv_line(line) else {
             continue;
@@ -70,6 +73,12 @@ pub(super) fn discover(env_path: &Path) -> Discovered {
                     _ => None, // unknown → let the wizard prompt fresh
                 };
             }
+            "TELEGRAM_STT" => {
+                stt_enabled = crate::env_file::parse_toggle(value).ok().flatten();
+            }
+            "TELEGRAM_STT_MODEL" if !value.is_empty() => {
+                stt_model = Some(value.to_string());
+            }
             _ => {}
         }
     }
@@ -78,6 +87,15 @@ pub(super) fn discover(env_path: &Path) -> Discovered {
             session,
             dir,
             command,
+        });
+    }
+    if let Some(enabled) = stt_enabled {
+        d.voice = Some(VoiceChoice {
+            enabled,
+            // Honor the existing model if the user picked one; otherwise
+            // leave it empty and let `step_voice` fall through to the
+            // manifest default.
+            model: stt_model.unwrap_or_default(),
         });
     }
     d
