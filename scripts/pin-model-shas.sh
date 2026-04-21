@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Pin real SHA-256 hashes for every audio asset in src/audio/manifest.json.
 #
 # Why this is a separate, manual step:
@@ -11,11 +11,14 @@
 #   - once before the first release that enables `TELEGRAM_STT=on` by default
 #   - again whenever an asset URL or the upstream file changes
 #
-# The script downloads everything to a temp dir, computes SHA-256 for
-# each, and prints `sed`-style updates the user can eyeball + apply
-# with `bash scripts/pin-model-shas.sh --apply`.
+# Dry run (prints old → new SHAs, writes nothing):
+#   bash scripts/pin-model-shas.sh
 #
-# Dependencies: `curl`, `shasum` (ships with macOS), `jq`.
+# Apply (rewrites src/audio/manifest.json in place):
+#   bash scripts/pin-model-shas.sh --apply
+#
+# Dependencies: `curl`, `shasum` (ships with macOS), `jq`. Plain bash
+# 3.2 compatible — no associative arrays, no `readarray`.
 
 set -euo pipefail
 
@@ -47,40 +50,69 @@ download_and_hash() {
   local out="${TMP_DIR}/${basename}"
 
   echo "  fetching ${basename} from ${url}…" >&2
-  curl --fail --location --silent --show-error "${url}" -o "${out}"
+  # On 404 / network error, print a SKIP marker and return success so
+  # the loop continues. The caller treats an empty string as "leave
+  # the existing value alone" — useful when a manifest entry has a URL
+  # that hasn't stabilized yet (e.g. a Phase-4 TTS model).
+  if ! curl --fail --location --silent --show-error "${url}" -o "${out}" 2>/dev/null; then
+    echo "  ⚠  download failed for ${basename}; leaving its SHA untouched" >&2
+    return 0
+  fi
   shasum -a 256 "${out}" | awk '{print $1}'
 }
 
-# Enumerate STT models: key + url + sha256 placeholder.
-readarray -t stt_keys < <(jq -r '.stt_models | keys[]' "${MANIFEST}")
-echo "STT models (${#stt_keys[@]}):"
-declare -A stt_updates
-for key in "${stt_keys[@]}"; do
-  url=$(jq -r ".stt_models[\"${key}\"].url" "${MANIFEST}")
-  old=$(jq -r ".stt_models[\"${key}\"].sha256" "${MANIFEST}")
-  new=$(download_and_hash "${url}")
-  stt_updates["${key}"]="${new}"
-  printf "  %-20s  %s → %s\n" "${key}" "${old:0:12}…" "${new}"
-done
+# We stage updates by writing a fresh `jq` invocation per asset to a tmp
+# copy of the manifest, then `mv` it over at the end if `--apply`.
+STAGE_MANIFEST="${TMP_DIR}/manifest.staged.json"
+cp "${MANIFEST}" "${STAGE_MANIFEST}"
 
-# Enumerate TTS models: key + onnx_url + voices_url + both shas.
-readarray -t tts_keys < <(jq -r '.tts_models | keys[]' "${MANIFEST}")
+# --- STT models ---
+echo "STT models:"
+stt_keys="$(jq -r '.stt_models | keys[]' "${MANIFEST}")"
+while IFS= read -r key; do
+  [[ -z "${key}" ]] && continue
+  url=$(jq -r --arg k "${key}" '.stt_models[$k].url' "${MANIFEST}")
+  old=$(jq -r --arg k "${key}" '.stt_models[$k].sha256' "${MANIFEST}")
+  new="$(download_and_hash "${url}")"
+  if [[ -z "${new}" ]]; then
+    printf "  %-20s  %s → (skipped)\n" "${key}" "${old:0:12}…"
+    continue
+  fi
+  printf "  %-20s  %s → %s\n" "${key}" "${old:0:12}…" "${new}"
+  jq --arg k "${key}" --arg sha "${new}" \
+    '.stt_models[$k].sha256 = $sha' "${STAGE_MANIFEST}" > "${STAGE_MANIFEST}.work"
+  mv "${STAGE_MANIFEST}.work" "${STAGE_MANIFEST}"
+done <<< "${stt_keys}"
+
+# --- TTS models ---
 echo
-echo "TTS models (${#tts_keys[@]}):"
-declare -A tts_onnx_updates
-declare -A tts_voices_updates
-for key in "${tts_keys[@]}"; do
-  onnx_url=$(jq -r ".tts_models[\"${key}\"].onnx_url" "${MANIFEST}")
-  voices_url=$(jq -r ".tts_models[\"${key}\"].voices_url" "${MANIFEST}")
-  old_onnx=$(jq -r ".tts_models[\"${key}\"].onnx_sha256" "${MANIFEST}")
-  old_voices=$(jq -r ".tts_models[\"${key}\"].voices_sha256" "${MANIFEST}")
-  new_onnx=$(download_and_hash "${onnx_url}")
-  new_voices=$(download_and_hash "${voices_url}")
-  tts_onnx_updates["${key}"]="${new_onnx}"
-  tts_voices_updates["${key}"]="${new_voices}"
-  printf "  %-20s  onnx:   %s → %s\n" "${key}" "${old_onnx:0:12}…" "${new_onnx}"
-  printf "  %-20s  voices: %s → %s\n" "${key}" "${old_voices:0:12}…" "${new_voices}"
-done
+echo "TTS models:"
+tts_keys="$(jq -r '.tts_models | keys[]' "${MANIFEST}")"
+while IFS= read -r key; do
+  [[ -z "${key}" ]] && continue
+  onnx_url=$(jq -r --arg k "${key}" '.tts_models[$k].onnx_url' "${MANIFEST}")
+  voices_url=$(jq -r --arg k "${key}" '.tts_models[$k].voices_url' "${MANIFEST}")
+  old_onnx=$(jq -r --arg k "${key}" '.tts_models[$k].onnx_sha256' "${MANIFEST}")
+  old_voices=$(jq -r --arg k "${key}" '.tts_models[$k].voices_sha256' "${MANIFEST}")
+  new_onnx="$(download_and_hash "${onnx_url}")"
+  new_voices="$(download_and_hash "${voices_url}")"
+  if [[ -n "${new_onnx}" ]]; then
+    printf "  %-20s  onnx:   %s → %s\n" "${key}" "${old_onnx:0:12}…" "${new_onnx}"
+    jq --arg k "${key}" --arg sha "${new_onnx}" \
+      '.tts_models[$k].onnx_sha256 = $sha' "${STAGE_MANIFEST}" > "${STAGE_MANIFEST}.work"
+    mv "${STAGE_MANIFEST}.work" "${STAGE_MANIFEST}"
+  else
+    printf "  %-20s  onnx:   %s → (skipped)\n" "${key}" "${old_onnx:0:12}…"
+  fi
+  if [[ -n "${new_voices}" ]]; then
+    printf "  %-20s  voices: %s → %s\n" "${key}" "${old_voices:0:12}…" "${new_voices}"
+    jq --arg k "${key}" --arg sha "${new_voices}" \
+      '.tts_models[$k].voices_sha256 = $sha' "${STAGE_MANIFEST}" > "${STAGE_MANIFEST}.work"
+    mv "${STAGE_MANIFEST}.work" "${STAGE_MANIFEST}"
+  else
+    printf "  %-20s  voices: %s → (skipped)\n" "${key}" "${old_voices:0:12}…"
+  fi
+done <<< "${tts_keys}"
 
 if [[ ${APPLY} -eq 0 ]]; then
   echo
@@ -88,25 +120,7 @@ if [[ ${APPLY} -eq 0 ]]; then
   exit 0
 fi
 
-# Apply via jq in-place — safe atomic rewrite via mktemp + mv.
-TMP_MANIFEST="$(mktemp "${MANIFEST}.XXXXXX")"
-cp "${MANIFEST}" "${TMP_MANIFEST}"
-for key in "${stt_keys[@]}"; do
-  new="${stt_updates[${key}]}"
-  jq --arg k "${key}" --arg sha "${new}" '.stt_models[$k].sha256 = $sha' "${TMP_MANIFEST}" \
-    > "${TMP_MANIFEST}.work"
-  mv "${TMP_MANIFEST}.work" "${TMP_MANIFEST}"
-done
-for key in "${tts_keys[@]}"; do
-  new_onnx="${tts_onnx_updates[${key}]}"
-  new_voices="${tts_voices_updates[${key}]}"
-  jq --arg k "${key}" --arg o "${new_onnx}" --arg v "${new_voices}" \
-    '.tts_models[$k].onnx_sha256 = $o | .tts_models[$k].voices_sha256 = $v' \
-    "${TMP_MANIFEST}" > "${TMP_MANIFEST}.work"
-  mv "${TMP_MANIFEST}.work" "${TMP_MANIFEST}"
-done
-
-mv "${TMP_MANIFEST}" "${MANIFEST}"
+mv "${STAGE_MANIFEST}" "${MANIFEST}"
 echo
 echo "Updated ${MANIFEST}."
 echo "Verify with: git diff src/audio/manifest.json && cargo test --lib audio::manifest"

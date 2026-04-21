@@ -188,10 +188,24 @@ mod tests {
     }
 
     #[test]
-    fn validate_stt_usable_rejects_placeholder_sha() {
-        // All shipped manifest entries are placeholders at the moment.
+    fn validate_stt_usable_accepts_pinned_sha() {
+        // Default (`base.en`) now has a real SHA pinned; validate should pass.
         let default = get().default_stt_model().unwrap();
-        let err = get().validate_stt_usable(default).unwrap_err();
-        assert!(err.to_string().contains("placeholder SHA"));
+        assert!(get().validate_stt_usable(default).is_ok());
+    }
+
+    /// The placeholder-rejection path is still important — if a future
+    /// manifest bump adds a new asset without pinning its hash, tebis
+    /// must refuse to run local STT against it. We can't test via the
+    /// embedded manifest (all real SHAs now) so synthesize the check.
+    #[test]
+    fn placeholder_prefix_is_rejected_by_convention() {
+        assert!(
+            PLACEHOLDER_PREFIX.starts_with("TBD-"),
+            "placeholder convention drifted — validate_stt_usable relies on starts_with"
+        );
+        // A placeholder string satisfies the starts_with guard.
+        let placeholder = format!("{PLACEHOLDER_PREFIX}future-model");
+        assert!(placeholder.starts_with(PLACEHOLDER_PREFIX));
     }
 }

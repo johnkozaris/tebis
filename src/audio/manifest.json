@@ -5,21 +5,21 @@
   "stt_models": {
     "base.en": {
       "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
-      "sha256": "TBD-PLACEHOLDER-base-en",
+      "sha256": "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
       "size_bytes": 147964211,
       "display_name": "Whisper Base (English) — 148 MB",
       "default": true
     },
     "small.en": {
       "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
-      "sha256": "TBD-PLACEHOLDER-small-en",
+      "sha256": "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
       "size_bytes": 511662473,
       "display_name": "Whisper Small (English) — 488 MB",
       "default": false
     },
     "tiny.en": {
       "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
-      "sha256": "TBD-PLACEHOLDER-tiny-en",
+      "sha256": "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
       "size_bytes": 77691713,
       "display_name": "Whisper Tiny (English) — 78 MB",
       "default": false
