@@ -23,11 +23,11 @@ pub mod stt;
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use self::stt::{SttConfig, SttError, SttProvider, Transcription};
+use self::stt::{Stt as _, SttConfig, SttError, Transcription};
 
 /// Composite config consumed by [`AudioSubsystem::new`]. Built from env
 /// in `config::load_audio_config`.
@@ -69,28 +69,11 @@ pub enum AudioError {
     NotEnabled { feature: &'static str },
 }
 
-/// Closed enum over STT backends. Each Phase adds variants:
-/// Phase 1 ships `Local`; Phase 2 adds `OpenAiCompat`/`Groq`/`OpenAi`.
-///
-/// Enum dispatch (vs `Box<dyn Stt>`) so the `Stt` trait can keep its
-/// ergonomic AFIT shape. The trait still exists in `stt::mod` as a
-/// test seam and shape contract for each concrete backend.
-enum SttBackend {
-    Local(stt::local::LocalStt),
-}
-
-impl SttBackend {
-    async fn transcribe(&self, pcm: &[f32], lang: &str) -> Result<Transcription, SttError> {
-        use stt::Stt as _;
-        match self {
-            Self::Local(b) => b.transcribe(pcm, lang).await,
-        }
-    }
-}
-
 pub struct AudioSubsystem {
-    stt: Option<SttBackend>,
-    // tts: Option<TtsBackend>, // Phase 4
+    /// `None` when STT is disabled. Local whisper.cpp is the only
+    /// backend tebis ships — no cloud / LAN escape hatches.
+    stt: Option<stt::local::LocalStt>,
+    // tts: Option<tts::local::LocalTts>, // Phase 4
     stt_model_name: Option<String>,
 }
 
@@ -113,7 +96,7 @@ impl AudioSubsystem {
         let (stt, stt_model_name) = match &cfg.stt {
             None => (None, None),
             Some(scfg) => {
-                let (backend, model_name) = build_stt(scfg, shutdown.clone()).await?;
+                let (backend, model_name) = build_local_stt(scfg, shutdown.clone()).await?;
                 (Some(backend), Some(model_name))
             }
         };
@@ -138,28 +121,13 @@ impl AudioSubsystem {
     }
 }
 
-/// Returns `(backend_enum, model_name_for_display)`.
-async fn build_stt(
-    cfg: &SttConfig,
-    shutdown: CancellationToken,
-) -> Result<(SttBackend, String)> {
-    match cfg.provider {
-        SttProvider::Local => build_local_stt(cfg, shutdown).await,
-        SttProvider::OpenAiCompat | SttProvider::Groq | SttProvider::OpenAi => {
-            // Phase 2 unlocks these. Fail loudly at startup so the user
-            // doesn't get a surprise at first voice note.
-            bail!(
-                "STT provider `{}` will arrive in Phase 2 — set TELEGRAM_STT_PROVIDER=local for now",
-                cfg.provider.as_str()
-            )
-        }
-    }
-}
-
+/// Returns `(LocalStt, model_name_for_display)`. The only backend tebis
+/// ships — if the model download or whisper-rs load fails, the caller
+/// logs a warn and the bridge continues text-only.
 async fn build_local_stt(
     cfg: &SttConfig,
     shutdown: CancellationToken,
-) -> Result<(SttBackend, String)> {
+) -> Result<(stt::local::LocalStt, String)> {
     let manifest = manifest::get();
     manifest
         .validate_stt_usable(&cfg.model)
@@ -220,7 +188,7 @@ async fn build_local_stt(
 
     let backend = stt::local::LocalStt::load(&model_path, cfg.threads, &cfg.language)
         .context("loading whisper-rs context")?;
-    Ok((SttBackend::Local(backend), cfg.model.clone()))
+    Ok((backend, cfg.model.clone()))
 }
 
 /// Extract the filename from an HF download URL (the basename of the

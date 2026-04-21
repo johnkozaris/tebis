@@ -35,14 +35,9 @@ const WIZARD_MANAGED_KEYS: &[&str] = &[
     "INSPECT_PORT",
     "BRIDGE_ENV_FILE",
     "TELEGRAM_HOOKS_MODE",
-    // Voice input (STT). Phase 1 wires only the `local` provider; the
-    // wizard writes just the on/off flag + the model choice. Cloud
-    // providers (Groq, OpenAI) and their API keys are not yet in the
-    // wizard but can be hand-added to the env file — those keys are
-    // deliberately NOT in `WIZARD_MANAGED_KEYS` so hand-edits survive
-    // a wizard re-run.
+    // Voice input (STT). Local whisper.cpp is the only backend —
+    // the wizard writes just the on/off flag + the model choice.
     "TELEGRAM_STT",
-    "TELEGRAM_STT_PROVIDER",
     "TELEGRAM_STT_MODEL",
 ];
 
@@ -283,7 +278,6 @@ fn build_env_file(
         out.push_str("# $XDG_DATA_HOME/tebis/models/ (about 148 MB for base.en).\n");
         if v.enabled {
             let _ = writeln!(out, "TELEGRAM_STT=on");
-            out.push_str("TELEGRAM_STT_PROVIDER=local\n");
             let _ = writeln!(out, "TELEGRAM_STT_MODEL={}", v.model);
         } else {
             out.push_str("TELEGRAM_STT=off\n");

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::agent_hooks::HooksMode;
 use crate::audio::AudioConfig;
-use crate::audio::stt::{SttConfig, SttProvider};
+use crate::audio::stt::SttConfig;
 use crate::bridge::autoreply::AutoreplyConfig;
 use crate::bridge::session::AutostartConfig;
 use crate::env_file;
@@ -142,37 +142,11 @@ fn load_stt_config() -> Result<Option<SttConfig>> {
         return Ok(None);
     }
 
-    let provider = SttProvider::parse(
-        &env::var("TELEGRAM_STT_PROVIDER").unwrap_or_else(|_| "local".to_string()),
-    )
-    .context("TELEGRAM_STT_PROVIDER")?;
-
-    let default_model = match provider {
-        SttProvider::Local => crate::audio::manifest::get()
-            .default_stt_model()
-            .context("resolving default local STT model from manifest")?
-            .to_string(),
-        // Sensible per-provider defaults for remote backends.
-        SttProvider::Groq => "whisper-large-v3-turbo".to_string(),
-        SttProvider::OpenAi | SttProvider::OpenAiCompat => "whisper-1".to_string(),
-    };
+    let default_model = crate::audio::manifest::get()
+        .default_stt_model()
+        .context("resolving default STT model from manifest")?
+        .to_string();
     let model = env::var("TELEGRAM_STT_MODEL").unwrap_or(default_model);
-
-    let base_url = env::var("TELEGRAM_STT_BASE_URL").ok().filter(|s| !s.is_empty());
-    if provider == SttProvider::OpenAiCompat && base_url.is_none() {
-        bail!("TELEGRAM_STT_BASE_URL is required when TELEGRAM_STT_PROVIDER=openai_compat");
-    }
-
-    let api_key = env::var("TELEGRAM_STT_API_KEY")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(SecretString::from);
-    if matches!(provider, SttProvider::Groq | SttProvider::OpenAi) && api_key.is_none() {
-        bail!(
-            "TELEGRAM_STT_API_KEY is required when TELEGRAM_STT_PROVIDER={}",
-            provider.as_str()
-        );
-    }
 
     let language = env::var("TELEGRAM_STT_LANGUAGE").unwrap_or_else(|_| "en".to_string());
 
@@ -208,10 +182,7 @@ fn load_stt_config() -> Result<Option<SttConfig>> {
     }
 
     Ok(Some(SttConfig {
-        provider,
         model,
-        base_url,
-        api_key,
         language,
         max_duration_sec,
         max_bytes,

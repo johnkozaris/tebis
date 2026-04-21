@@ -313,10 +313,8 @@ fn build_voice_rows(voice: Option<&super::VoiceInfo>) -> String {
                 r#"<span class="muted">unavailable (see startup logs)</span>"#
             };
             format!(
-                "<dt>Voice STT provider</dt><dd><code>{provider}</code></dd>\
-                 <dt>Voice STT model</dt><dd><code>{model}</code></dd>\
+                "<dt>Voice STT model</dt><dd><code>{model}</code></dd>\
                  <dt>Voice STT status</dt><dd>{status}</dd>",
-                provider = sanitize::escape_html(v.stt_provider),
                 model = sanitize::escape_html(&v.stt_model),
                 status = status,
             )

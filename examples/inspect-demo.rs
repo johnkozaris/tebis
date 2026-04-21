@@ -166,7 +166,6 @@ async fn main() -> Result<()> {
             entries: Vec::new(),
         },
         voice: Some(inspect::VoiceInfo {
-            stt_provider: "local",
             stt_model: "base.en".to_string(),
             stt_ready: true,
         }),

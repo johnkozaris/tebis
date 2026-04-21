@@ -287,18 +287,18 @@ async fn run_bridge() -> Result<()> {
 
     let autoreply_cfg = config.autoreply.take().map(Arc::new);
 
-    // Audio subsystem: constructed lazily. With everything off (the
+    // Audio subsystem: constructed lazily. With STT off (the
     // public-release default) `new` touches nothing — no download, no
-    // memory — and returns an Arc whose `transcribe`/`synthesize`
-    // respond with `AudioError::NotEnabled`. When STT is on, this is
-    // the blocking model-download path (~53 s on first run for
-    // `base.en`); we run it on the current thread so startup waits for
-    // a cached-and-ready subsystem before the bridge accepts messages.
+    // memory. When STT is on, this is the blocking model-download path
+    // (~53 s on first run for `base.en`); we run it on the current
+    // task so startup waits for a cached-and-ready subsystem before
+    // the bridge accepts messages.
     //
-    // Fail-open: if model download / load fails we log a warn and
-    // continue text-only. Bot token problems are different (handled by
-    // `unauthorized_dead_end` above); audio problems are recoverable
-    // with `TELEGRAM_STT_PROVIDER=groq` etc., so we shouldn't crash.
+    // Fail-open: if model download or whisper-rs load fails we log a
+    // warn and continue text-only. Bot token problems are different
+    // (handled by `unauthorized_dead_end` above); audio problems are
+    // recoverable by unsetting TELEGRAM_STT or fixing the underlying
+    // cause, so we shouldn't crash.
     let audio = if config.audio.any_enabled() {
         match audio::AudioSubsystem::new(&config.audio, &tracker, shutdown.clone()).await {
             Ok(a) => {
@@ -311,7 +311,7 @@ async fn run_bridge() -> Result<()> {
                 tracing::warn!(
                     err = %e,
                     "Audio subsystem failed to initialize; continuing text-only. \
-                     Options: unset TELEGRAM_STT, switch to a cloud provider, or fix the cause above."
+                     Set TELEGRAM_STT=off or fix the cause above to silence this."
                 );
                 None
             }
@@ -328,7 +328,6 @@ async fn run_bridge() -> Result<()> {
     let inspect_snapshot = if inspect_port.is_some() {
         let tmux_ver = inspect::tmux_version().await;
         let voice_info = config.audio.stt.as_ref().map(|scfg| inspect::VoiceInfo {
-            stt_provider: scfg.provider.as_str(),
             stt_model: scfg.model.clone(),
             stt_ready: audio
                 .as_ref()
