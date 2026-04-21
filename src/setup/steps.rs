@@ -7,7 +7,7 @@ use console::style;
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input, Select};
 
-use super::{Autostart, HooksChoice, VoiceChoice, normalize_dir, ui};
+use super::{Autostart, HooksChoice, TtsChoice, VoiceChoice, normalize_dir, ui};
 use crate::agent_hooks::AgentKind;
 use crate::audio;
 use crate::tmux::is_valid_session_name;
@@ -409,6 +409,71 @@ pub(super) fn step_voice(
     Ok(Some(VoiceChoice {
         enabled: true,
         model: choices[picked].0.clone(),
+    }))
+}
+
+/// Voice replies (TTS). macOS-only — on Linux we silently skip the
+/// prompt and return `None` so the env file stays clean. If the user
+/// already had `TELEGRAM_TTS=on` from an earlier Mac-side setup, we
+/// don't delete it (the env-file write path only manages keys we
+/// actually prompt for; Linux run → we don't prompt → nothing gets
+/// written).
+#[cfg(not(target_os = "macos"))]
+pub(super) fn step_tts(
+    _theme: &ColorfulTheme,
+    _existing: Option<&TtsChoice>,
+) -> Result<Option<TtsChoice>> {
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn step_tts(
+    theme: &ColorfulTheme,
+    existing: Option<&TtsChoice>,
+) -> Result<Option<TtsChoice>> {
+    ui::step_header(8, "Voice replies (optional, macOS-only)");
+    println!(
+        "When enabled, tebis synthesizes text replies through the macOS {}",
+        style("`say`").bold(),
+    );
+    println!("binary and sends them back as Telegram voice notes. By default it");
+    println!("only voice-replies to voice messages — voice-in → voice-out.");
+    println!();
+
+    let default_on = existing.is_some_and(|t| t.enabled);
+    let enabled = Confirm::with_theme(theme)
+        .with_prompt("Enable voice replies?")
+        .default(default_on)
+        .interact()
+        .context("prompt: enable tts")?;
+
+    if !enabled {
+        return Ok(Some(TtsChoice {
+            enabled: false,
+            ..Default::default()
+        }));
+    }
+
+    let default_voice = existing
+        .filter(|t| !t.voice.is_empty())
+        .map_or_else(|| "Samantha".to_string(), |t| t.voice.clone());
+    let voice = Input::<String>::with_theme(theme)
+        .with_prompt("`say` voice name (e.g. Samantha, Alex, Ava (Premium))")
+        .default(default_voice)
+        .interact_text()
+        .context("prompt: tts voice")?;
+
+    let default_all = existing.is_some_and(|t| t.respond_to_all);
+    let respond_to_all = Confirm::with_theme(theme)
+        .with_prompt("Also voice-reply to typed messages (not just voice)?")
+        .default(default_all)
+        .interact()
+        .context("prompt: respond_to_all")?;
+
+    Ok(Some(TtsChoice {
+        enabled: true,
+        voice,
+        respond_to_all,
     }))
 }
 

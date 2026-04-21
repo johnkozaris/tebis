@@ -20,14 +20,17 @@ pub mod codec;
 pub mod fetch;
 pub mod manifest;
 pub mod stt;
+pub mod tts;
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use self::stt::{Stt as _, SttConfig, SttError, Transcription};
+use self::tts::{TtsConfig, TtsError};
 
 /// Composite config consumed by [`AudioSubsystem::new`]. Built from env
 /// in `config::load_audio_config`.
@@ -35,7 +38,9 @@ use self::stt::{Stt as _, SttConfig, SttError, Transcription};
 pub struct AudioConfig {
     /// `None` means STT is disabled (the master flag `TELEGRAM_STT=off`).
     pub stt: Option<SttConfig>,
-    // Phase 4 will add `pub tts: Option<TtsConfig>`.
+    /// `None` means TTS is disabled. Default off — voice replies are
+    /// low-value for Claude's typical multi-line output.
+    pub tts: Option<TtsConfig>,
 }
 
 impl AudioConfig {
@@ -43,7 +48,7 @@ impl AudioConfig {
     /// the subsystem at all — if both branches are off, the whole subsystem
     /// stays uninitialized.
     pub const fn any_enabled(&self) -> bool {
-        self.stt.is_some()
+        self.stt.is_some() || self.tts.is_some()
     }
 }
 
@@ -62,6 +67,9 @@ pub enum AudioError {
     #[error(transparent)]
     Stt(#[from] SttError),
 
+    #[error(transparent)]
+    Tts(#[from] TtsError),
+
     #[error("audio subsystem config: {0}")]
     Config(String),
 
@@ -73,13 +81,21 @@ pub struct AudioSubsystem {
     /// `None` when STT is disabled. Local whisper.cpp is the only
     /// backend tebis ships — no cloud / LAN escape hatches.
     stt: Option<stt::local::LocalStt>,
-    // tts: Option<tts::local::LocalTts>, // Phase 4
+    /// `None` when TTS is disabled. Currently macOS-only (`say`);
+    /// `tts::Backend` is variantless on non-macOS targets so `Option<_>`
+    /// is statically always `None` there.
+    tts: Option<tts::Backend>,
     stt_model_name: Option<String>,
     /// Snapshot of STT runtime caps. `None` when STT is off. The bridge
     /// reads these to enforce duration/size limits before downloading.
     stt_limits: Option<SttLimits>,
     /// ISO-639-1 hint to pass to whisper; `None` means auto-detect.
     stt_language: Option<String>,
+    /// TTS voice name — what the backend uses. `None` when TTS is off.
+    tts_voice: Option<String>,
+    /// Whether TTS applies to every outbound reply or only replies to
+    /// inbound voice messages.
+    tts_respond_to_all: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -121,11 +137,24 @@ impl AudioSubsystem {
             }
         };
 
+        let (tts, tts_voice, tts_respond_to_all) = match &cfg.tts {
+            None => (None, None, false),
+            Some(tcfg) => {
+                let backend = build_tts(tcfg)
+                    .await
+                    .context("initializing TTS backend")?;
+                (Some(backend), Some(tcfg.voice.clone()), tcfg.respond_to_all)
+            }
+        };
+
         Ok(Arc::new(Self {
             stt,
+            tts,
             stt_model_name,
             stt_limits,
             stt_language,
+            tts_voice,
+            tts_respond_to_all,
         }))
     }
 
@@ -152,6 +181,41 @@ impl AudioSubsystem {
     /// auto-detect. Returns `None` when STT is disabled.
     pub fn stt_language(&self) -> Option<&str> {
         self.stt_language.as_deref()
+    }
+
+    /// Synthesize `text` to an OGG/Opus byte blob ready for `sendVoice`.
+    /// Returns [`AudioError::NotEnabled`] when TTS is off.
+    pub async fn synthesize(&self, text: &str) -> Result<Bytes, AudioError> {
+        let backend = self
+            .tts
+            .as_ref()
+            .ok_or(AudioError::NotEnabled { feature: "tts" })?;
+        let voice = self.tts_voice.as_deref().unwrap_or("");
+        let synthesis = backend.synthesize(text, voice).await?;
+        let opus = codec::encode_pcm_to_opus(&synthesis.pcm)?;
+        Ok(opus)
+    }
+
+    /// Whether the caller should voice-reply to a given inbound payload.
+    /// `is_voice_reply` is true when the originating user message was a
+    /// voice/audio payload; when false we only voice-reply if the
+    /// `respond_to_all` config flag is set.
+    pub const fn should_tts_reply(&self, is_voice_reply: bool) -> bool {
+        self.tts.is_some() && (is_voice_reply || self.tts_respond_to_all)
+    }
+}
+
+/// Construct the concrete TTS backend. macOS → `say` shell-out.
+/// Linux and other platforms return `TtsError::UnsupportedPlatform`.
+async fn build_tts(_cfg: &TtsConfig) -> Result<tts::Backend, TtsError> {
+    #[cfg(target_os = "macos")]
+    {
+        tts::say::SayTts::probe().await?;
+        Ok(tts::Backend::Say(tts::say::SayTts::new()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(TtsError::UnsupportedPlatform)
     }
 }
 
@@ -273,7 +337,7 @@ mod tests {
 
     #[test]
     fn audio_config_any_enabled_tracks_stt() {
-        let off = AudioConfig { stt: None };
+        let off = AudioConfig { stt: None, tts: None };
         assert!(!off.any_enabled());
     }
 }

@@ -166,8 +166,10 @@ async fn main() -> Result<()> {
             entries: Vec::new(),
         },
         voice: Some(inspect::VoiceInfo {
-            stt_model: "base.en".to_string(),
+            stt_model: Some("base.en".to_string()),
             stt_ready: true,
+            tts_voice: Some("Samantha".to_string()),
+            tts_scope: "voice-only",
         }),
         // Demo passes through BRIDGE_ENV_FILE if you set it, so you can
         // test the Settings edit flow locally against a throwaway file.

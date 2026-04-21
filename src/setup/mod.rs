@@ -39,6 +39,10 @@ const WIZARD_MANAGED_KEYS: &[&str] = &[
     // the wizard writes just the on/off flag + the model choice.
     "TELEGRAM_STT",
     "TELEGRAM_STT_MODEL",
+    // Voice replies (TTS). macOS `say` is the Phase 4 backend.
+    "TELEGRAM_TTS",
+    "TELEGRAM_TTS_VOICE",
+    "TELEGRAM_TTS_RESPOND_TO_ALL",
 ];
 
 /// Autostart triple. Shared between the step that collects it and the
@@ -49,12 +53,23 @@ pub(super) struct Autostart {
     pub(super) command: String,
 }
 
-/// Voice / STT wizard choice. Phase 1 surfaces only local whisper.cpp.
+/// Voice / STT wizard choice. Only local whisper.cpp is offered.
 #[derive(Clone, Debug)]
 pub(super) struct VoiceChoice {
     pub(super) enabled: bool,
     /// Key from `audio::manifest.stt_models` — only meaningful when `enabled`.
     pub(super) model: String,
+}
+
+/// Voice replies (TTS) wizard choice. macOS-only for now — the wizard
+/// skips the prompt entirely on other platforms, so this is always
+/// `None` on Linux (regardless of `enabled`'s value in an existing
+/// env file, which would be filtered out at load too).
+#[derive(Clone, Debug, Default)]
+pub(super) struct TtsChoice {
+    pub(super) enabled: bool,
+    pub(super) voice: String,
+    pub(super) respond_to_all: bool,
 }
 
 /// What the caller should do after `run()` returns. Separates wizard
@@ -98,6 +113,7 @@ pub fn run() -> Result<Next> {
     let hooks_mode = steps::step_hooks_mode(&theme, autostart.as_ref(), discovered.hooks_mode)?;
     let inspect_port = steps::step_inspect_port(&theme, discovered.inspect_port)?;
     let voice = steps::step_voice(&theme, discovered.voice.as_ref())?;
+    let tts = steps::step_tts(&theme, discovered.tts.as_ref())?;
 
     ui::print_summary(
         &token,
@@ -107,6 +123,7 @@ pub fn run() -> Result<Next> {
         hooks_mode,
         inspect_port,
         voice.as_ref(),
+        tts.as_ref(),
     );
     if !Confirm::with_theme(&theme)
         .with_prompt("Save this config?")
@@ -134,6 +151,7 @@ pub fn run() -> Result<Next> {
         inspect_port,
         hooks_mode,
         voice.as_ref(),
+        tts.as_ref(),
         &env_path,
     );
     if !extras.is_empty() {
@@ -230,6 +248,7 @@ fn build_env_file(
     inspect_port: Option<u16>,
     hooks_mode: HooksChoice,
     voice: Option<&VoiceChoice>,
+    tts: Option<&TtsChoice>,
     env_path: &Path,
 ) -> String {
     use std::fmt::Write as _;
@@ -281,6 +300,20 @@ fn build_env_file(
             let _ = writeln!(out, "TELEGRAM_STT_MODEL={}", v.model);
         } else {
             out.push_str("TELEGRAM_STT=off\n");
+        }
+    }
+
+    if let Some(t) = tts {
+        out.push_str("\n# Voice replies (TTS). Currently macOS-only — shells out to the\n");
+        out.push_str("# built-in `say` binary with LEI16@16000 WAV output.\n");
+        if t.enabled {
+            let _ = writeln!(out, "TELEGRAM_TTS=on");
+            let _ = writeln!(out, "TELEGRAM_TTS_VOICE={}", t.voice);
+            if t.respond_to_all {
+                out.push_str("TELEGRAM_TTS_RESPOND_TO_ALL=on\n");
+            }
+        } else {
+            out.push_str("TELEGRAM_TTS=off\n");
         }
     }
 

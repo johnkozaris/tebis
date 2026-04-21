@@ -43,15 +43,19 @@ pub struct Snapshot {
     pub env_file: Option<String>,
 }
 
-/// Snapshot of STT (and eventually TTS) state for the dashboard Voice
-/// section. Built once at startup — no live sampling needed because
-/// config can't change without restart anyway.
+/// Snapshot of STT + TTS state for the dashboard Voice section. Built
+/// once at startup — config can't change without restart anyway. Live
+/// counters (transcribe/synthesize metrics) come from `LiveContext::metrics`.
 pub struct VoiceInfo {
-    /// Manifest key — `"base.en"`, `"small.en"`, etc.
-    pub stt_model: String,
-    /// Whether the subsystem initialized successfully. `false` means
-    /// the daemon is running text-only — the banner shows it in red.
+    /// Manifest key — `"base.en"`, `"small.en"`, etc. `None` when STT off.
+    pub stt_model: Option<String>,
+    /// Whether STT initialized successfully.
     pub stt_ready: bool,
+    /// `Some` when `TELEGRAM_TTS=on`. Holds the resolved voice name.
+    pub tts_voice: Option<String>,
+    /// "all" if `TELEGRAM_TTS_RESPOND_TO_ALL=on`, else "voice-only".
+    /// Only meaningful when `tts_voice.is_some()`.
+    pub tts_scope: &'static str,
 }
 
 /// Hooks-mode policy + snapshot of installed project dirs. `entries`

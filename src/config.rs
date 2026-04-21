@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use crate::agent_hooks::HooksMode;
 use crate::audio::AudioConfig;
 use crate::audio::stt::SttConfig;
+use crate::audio::tts::TtsConfig;
 use crate::bridge::autoreply::AutoreplyConfig;
 use crate::bridge::session::AutostartConfig;
 use crate::env_file;
@@ -129,12 +130,32 @@ impl Config {
     }
 }
 
-/// Build [`AudioConfig`] from `TELEGRAM_STT_*` env. Returns an
-/// `AudioConfig` with `stt: None` when the master flag is off (the
-/// default). Phase 4 adds `tts` here.
+/// Build [`AudioConfig`] from `TELEGRAM_{STT,TTS}_*` env. Both
+/// branches are independent; default for both is off.
 fn load_audio_config() -> Result<AudioConfig> {
     let stt = load_stt_config()?;
-    Ok(AudioConfig { stt })
+    let tts = load_tts_config()?;
+    Ok(AudioConfig { stt, tts })
+}
+
+fn load_tts_config() -> Result<Option<TtsConfig>> {
+    if !parse_toggle_env("TELEGRAM_TTS", false)? {
+        return Ok(None);
+    }
+
+    // Default voice depends on platform; `say` understands
+    // `"Samantha"` (built-in) and premium voices like `"Ava (Premium)"`
+    // if the user has downloaded them via System Settings → Spoken
+    // Content. We pick Samantha as the lowest-common-denominator
+    // default so first-run works without extra setup.
+    let voice = env::var("TELEGRAM_TTS_VOICE").unwrap_or_else(|_| "Samantha".to_string());
+
+    let respond_to_all = parse_toggle_env("TELEGRAM_TTS_RESPOND_TO_ALL", false)?;
+
+    Ok(Some(TtsConfig {
+        voice,
+        respond_to_all,
+    }))
 }
 
 fn load_stt_config() -> Result<Option<SttConfig>> {

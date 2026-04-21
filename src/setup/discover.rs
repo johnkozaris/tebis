@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 
-use super::{Autostart, HooksChoice, VoiceChoice};
+use super::{Autostart, HooksChoice, TtsChoice, VoiceChoice};
 use crate::env_file;
 
 /// Previously-saved values extracted from the env file. Every field is
@@ -17,6 +17,7 @@ pub(super) struct Discovered {
     pub(super) inspect_port: Option<u16>,
     pub(super) hooks_mode: Option<HooksChoice>,
     pub(super) voice: Option<VoiceChoice>,
+    pub(super) tts: Option<TtsChoice>,
 }
 
 /// Parse `KEY=VALUE` lines. Comments (`#`) and blank lines skipped;
@@ -33,6 +34,9 @@ pub(super) fn discover(env_path: &Path) -> Discovered {
     let mut auto_command: Option<String> = None;
     let mut stt_enabled: Option<bool> = None;
     let mut stt_model: Option<String> = None;
+    let mut tts_enabled: Option<bool> = None;
+    let mut tts_voice: Option<String> = None;
+    let mut tts_respond_to_all: Option<bool> = None;
     for line in content.lines() {
         let Some((key, value)) = env_file::parse_kv_line(line) else {
             continue;
@@ -79,6 +83,15 @@ pub(super) fn discover(env_path: &Path) -> Discovered {
             "TELEGRAM_STT_MODEL" if !value.is_empty() => {
                 stt_model = Some(value.to_string());
             }
+            "TELEGRAM_TTS" => {
+                tts_enabled = crate::env_file::parse_toggle(value).ok().flatten();
+            }
+            "TELEGRAM_TTS_VOICE" if !value.is_empty() => {
+                tts_voice = Some(value.to_string());
+            }
+            "TELEGRAM_TTS_RESPOND_TO_ALL" => {
+                tts_respond_to_all = crate::env_file::parse_toggle(value).ok().flatten();
+            }
             _ => {}
         }
     }
@@ -96,6 +109,13 @@ pub(super) fn discover(env_path: &Path) -> Discovered {
             // leave it empty and let `step_voice` fall through to the
             // manifest default.
             model: stt_model.unwrap_or_default(),
+        });
+    }
+    if let Some(enabled) = tts_enabled {
+        d.tts = Some(TtsChoice {
+            enabled,
+            voice: tts_voice.unwrap_or_default(),
+            respond_to_all: tts_respond_to_all.unwrap_or(false),
         });
     }
     d

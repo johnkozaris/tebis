@@ -119,6 +119,10 @@ pub(super) fn mask_token(token: &str) -> String {
     format!("{head}:{prefix}{}{suffix}", style("…").dim())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "wizard-only helper; flat args map to flat output"
+)]
 pub(super) fn print_summary(
     token: &str,
     user_id: i64,
@@ -127,6 +131,7 @@ pub(super) fn print_summary(
     hooks_mode: HooksChoice,
     inspect_port: Option<u16>,
     voice: Option<&super::VoiceChoice>,
+    tts: Option<&super::TtsChoice>,
 ) {
     divider_rule("Review");
     let masked_token = mask_token(token);
@@ -169,13 +174,29 @@ pub(super) fn print_summary(
             }
         },
     );
+    let tts_row = tts.map_or_else(
+        || style("(not configured)").dim().to_string(),
+        |t| {
+            if t.enabled {
+                let scope = if t.respond_to_all {
+                    "all replies"
+                } else {
+                    "voice replies only"
+                };
+                format!("macOS `say` · voice: {} · {}", style(&t.voice).bold(), scope)
+            } else {
+                style("(disabled)").dim().to_string()
+            }
+        },
+    );
     row("Bot token", &masked_token);
     row("User id", &user_id.to_string());
     row("Sessions", &sessions_row);
     row("Agent", &autostart_row);
     row("Hooks", &hooks_row);
     row("Dashboard", &dashboard_row);
-    row("Voice", &voice_row);
+    row("Voice in", &voice_row);
+    row("Voice out", &tts_row);
     println!();
 }
 

@@ -97,6 +97,10 @@ pub async fn handle_update(
     // Payload dispatch. Voice/audio goes through STT first and then
     // re-enters the text path with the transcribed string — all
     // downstream code is unchanged from the text-only era.
+    //
+    // `inbound_was_voice` drives whether the outbound `Response::Text`
+    // also gets synthesized + sent as a voice reply.
+    let inbound_was_voice = matches!(payload, Payload::Voice { .. });
     let text = match payload {
         Payload::Text(t) => t,
         Payload::Voice {
@@ -139,6 +143,15 @@ pub async fn handle_update(
             if let Err(e) = ctx.tg.send_message(chat_id, &body).await {
                 ctx.metrics.record_handler_error();
                 tracing::error!(err = %e, "Failed to send response");
+            }
+            // TTS: if the user's inbound was a voice note (or they opted
+            // into `respond_to_all`), also send a voice reply. The
+            // synthesize + sendVoice is best-effort — a failure here
+            // does NOT retry or escalate; the user already has the text.
+            if let Some(audio) = ctx.audio.as_ref()
+                && audio.should_tts_reply(inbound_was_voice)
+            {
+                synthesize_and_send_voice(&ctx, chat_id, &body).await;
             }
         }
         Response::ReactSuccess => {
@@ -319,6 +332,59 @@ async fn transcribe_voice(
     );
     ctx.metrics.record_stt_success(transcription.duration_ms);
     Ok(text)
+}
+
+/// Synthesize `body` → OGG/Opus → `sendVoice`. Best-effort; logs and
+/// records a metric on failure but never retries (user already has the
+/// text reply). HTML in the body (from `escape_html`) is stripped to
+/// plain text before synthesis so the TTS engine doesn't read `&lt;`
+/// and friends aloud. Tebis's outbound text is simple — wrapping in
+/// `<pre>`/`<code>` for the /read path is the main offender — so a
+/// straightforward "drop angle-bracket tags" pass suffices.
+async fn synthesize_and_send_voice(ctx: &HandlerContext, chat_id: i64, body: &str) {
+    let Some(audio) = ctx.audio.as_ref() else {
+        return;
+    };
+    let plain = strip_html_for_tts(body);
+    if plain.trim().is_empty() {
+        return;
+    }
+    let voice_bytes = match audio.synthesize(&plain).await {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.metrics.record_tts_failure();
+            tracing::warn!(err = %e, "TTS synthesis failed; text reply already sent");
+            return;
+        }
+    };
+    let duration_guess = u32::try_from(voice_bytes.len() / (2_000)).unwrap_or(0);
+    if let Err(e) = ctx.tg.send_voice(chat_id, voice_bytes, Some(duration_guess)).await {
+        ctx.metrics.record_tts_failure();
+        tracing::warn!(err = %e, "sendVoice failed; text reply already sent");
+        return;
+    }
+    ctx.metrics.record_tts_success();
+}
+
+/// Minimal HTML-strip for TTS input. The bodies we send go through
+/// `sanitize::escape_html` (invariant 4) so `<` becomes `&lt;`, but we
+/// also wrap tmux output in `<pre>` / `<code>` tags on some paths.
+/// For synthesis we want the inner text verbatim and no entity names.
+fn strip_html_for_tts(body: &str) -> String {
+    // Drop obvious tags; decode common entities. This isn't a general
+    // HTML parser — the only tags we produce are `<pre>` and `<code>`
+    // (both single-word, no attributes) and we escape everything else.
+    let no_tags = body
+        .replace("<pre>", "")
+        .replace("</pre>", "")
+        .replace("<code>", "")
+        .replace("</code>", "");
+    no_tags
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
 }
 
 /// Maximum wall-clock the typing indicator will refresh on the

@@ -52,6 +52,12 @@ pub struct Metrics {
     /// Wall-clock milliseconds of the last successful transcription
     /// (whisper-rs inference only, not download / decode).
     pub last_stt_duration_ms: AtomicU64,
+
+    /// Outbound voice replies synthesized + sent successfully.
+    pub tts_success: AtomicU64,
+    /// TTS failures — backend synthesis errors, sendVoice API errors,
+    /// etc. Best-effort path, so these don't bubble back to the user.
+    pub tts_failures: AtomicU64,
 }
 
 impl Metrics {
@@ -102,6 +108,14 @@ impl Metrics {
 
     pub fn record_stt_failure(&self) {
         self.stt_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_tts_success(&self) {
+        self.tts_success.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_tts_failure(&self) {
+        self.tts_failures.fetch_add(1, Ordering::Relaxed);
     }
 }
 

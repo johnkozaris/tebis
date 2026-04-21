@@ -59,6 +59,11 @@ your numeric user id is the only entry point.
   downloads on first run to `$XDG_DATA_HOME/tebis/models/` with SHA-256
   verification, then loads into the daemon. Metal on Apple Silicon;
   OpenBLAS optional on Linux.
+- **Opt-in voice replies (macOS).** Set `TELEGRAM_TTS=on` and text
+  replies are also synthesized via the macOS `say` binary and sent
+  back as Telegram voice notes. Defaults to "voice-in → voice-out
+  only"; flip `TELEGRAM_TTS_RESPOND_TO_ALL=on` for every reply. Linux
+  backend TBD.
 - **Auto-wired hooks.** Set `TELEGRAM_HOOKS_MODE=auto` and tebis writes
   Claude Code / Copilot CLI hook configs into your project dir at
   autostart time so replies arrive via the agent's native `Stop` event

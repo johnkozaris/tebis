@@ -307,35 +307,65 @@ fn build_voice_rows(
     voice: Option<&super::VoiceInfo>,
     metrics: &crate::metrics::Metrics,
 ) -> String {
-    voice.map_or_else(
-        || r#"<dt>Voice input</dt><dd class="muted">disabled</dd>"#.to_string(),
-        |v| {
-            let status = if v.stt_ready {
-                "<span>ready</span>"
-            } else {
-                r#"<span class="muted">unavailable (see startup logs)</span>"#
-            };
-            let received = metrics.voice_received.load(Ordering::Relaxed);
-            let success = metrics.stt_success.load(Ordering::Relaxed);
-            let failures = metrics.stt_failures.load(Ordering::Relaxed);
-            let last_ms = metrics.last_stt_duration_ms.load(Ordering::Relaxed);
-            let activity = if received == 0 {
-                "<span class=\"muted\">no voice messages yet</span>".to_string()
-            } else {
-                format!(
-                    "<code>{received}</code> received · <code>{success}</code> transcribed \
-                     · <code>{failures}</code> failed · last took <code>{last_ms} ms</code>",
-                )
-            };
+    use std::fmt::Write as _;
+
+    let Some(v) = voice else {
+        return r#"<dt>Voice</dt><dd class="muted">disabled</dd>"#.to_string();
+    };
+
+    let mut out = String::new();
+
+    // STT section.
+    if let Some(model) = &v.stt_model {
+        let status = if v.stt_ready {
+            "<span>ready</span>"
+        } else {
+            r#"<span class="muted">unavailable (see startup logs)</span>"#
+        };
+        let received = metrics.voice_received.load(Ordering::Relaxed);
+        let success = metrics.stt_success.load(Ordering::Relaxed);
+        let failures = metrics.stt_failures.load(Ordering::Relaxed);
+        let last_ms = metrics.last_stt_duration_ms.load(Ordering::Relaxed);
+        let activity = if received == 0 {
+            "<span class=\"muted\">no voice messages yet</span>".to_string()
+        } else {
             format!(
-                "<dt>Voice STT model</dt><dd><code>{model}</code></dd>\
-                 <dt>Voice STT status</dt><dd>{status}</dd>\
-                 <dt>Voice STT activity</dt><dd>{activity}</dd>",
-                model = sanitize::escape_html(&v.stt_model),
-                status = status,
+                "<code>{received}</code> received · <code>{success}</code> transcribed \
+                 · <code>{failures}</code> failed · last took <code>{last_ms} ms</code>",
             )
-        },
-    )
+        };
+        let _ = write!(
+            out,
+            "<dt>Voice STT model</dt><dd><code>{model}</code></dd>\
+             <dt>Voice STT status</dt><dd>{status}</dd>\
+             <dt>Voice STT activity</dt><dd>{activity}</dd>",
+            model = sanitize::escape_html(model),
+        );
+    } else {
+        out.push_str(r#"<dt>Voice input</dt><dd class="muted">disabled</dd>"#);
+    }
+
+    // TTS section.
+    if let Some(voice_name) = &v.tts_voice {
+        let tts_success = metrics.tts_success.load(Ordering::Relaxed);
+        let tts_failures = metrics.tts_failures.load(Ordering::Relaxed);
+        let activity = if tts_success + tts_failures == 0 {
+            "<span class=\"muted\">no replies synthesized yet</span>".to_string()
+        } else {
+            format!("<code>{tts_success}</code> sent · <code>{tts_failures}</code> failed")
+        };
+        let _ = write!(
+            out,
+            "<dt>Voice TTS voice</dt><dd><code>{voice}</code> <span class=\"muted\">({scope})</span></dd>\
+             <dt>Voice TTS activity</dt><dd>{activity}</dd>",
+            voice = sanitize::escape_html(voice_name),
+            scope = sanitize::escape_html(v.tts_scope),
+        );
+    } else {
+        out.push_str(r#"<dt>Voice replies</dt><dd class="muted">disabled</dd>"#);
+    }
+
+    out
 }
 
 fn build_notify_rows(notify: Option<&super::NotifyInfo>) -> String {

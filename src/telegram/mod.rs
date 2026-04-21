@@ -342,6 +342,98 @@ impl TelegramClient {
         Ok(body)
     }
 
+    /// Send a voice message (OGG/Opus container) to `chat_id`. The
+    /// audio shows as a playable voice-note bubble with a waveform
+    /// and speed controls; any other codec/container degrades to a
+    /// file attachment.
+    ///
+    /// Hand-rolled `multipart/form-data` — no reqwest, no mpart
+    /// crate. The body layout: `chat_id` text field, `voice` binary
+    /// field with filename `voice.oga`, optional `duration` text field.
+    /// Boundary is 32 hex chars from ring's `SystemRandom` (the same
+    /// crypto provider we already link for rustls).
+    ///
+    /// Network errors are redacted via `redact_network_error`; the
+    /// request URL contains the bot token.
+    pub async fn send_voice(
+        &self,
+        chat_id: i64,
+        voice_ogg: Bytes,
+        duration_sec: Option<u32>,
+    ) -> Result<Message> {
+        use ring::rand::{SecureRandom, SystemRandom};
+
+        // 16 random bytes → 32 hex chars; more than enough to defeat
+        // any plausible boundary collision in user-provided filename.
+        let mut boundary_bytes = [0u8; 16];
+        SystemRandom::new()
+            .fill(&mut boundary_bytes)
+            .map_err(|_| TelegramError::Network {
+                method: "sendVoice".to_string(),
+                description: "ring RNG failure".to_string(),
+                retryable: false,
+            })?;
+        let mut boundary = String::with_capacity(boundary_bytes.len() * 2);
+        for byte in boundary_bytes {
+            use std::fmt::Write as _;
+            let _ = write!(boundary, "{byte:02x}");
+        }
+
+        let body = build_send_voice_body(chat_id, &voice_ogg, duration_sec, &boundary);
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let url = format!("{}/sendVoice", self.base_url.expose_secret());
+
+        let deadline = tokio::time::Instant::now() + DEFAULT_REQUEST_TIMEOUT;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(&url)
+            .header(hyper::header::CONTENT_TYPE, content_type)
+            .body(Full::new(body))
+            .expect("hyper Request::builder: inputs are known-valid");
+
+        let response = match tokio::time::timeout_at(deadline, self.client.request(req)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                return Err(TelegramError::Network {
+                    method: "sendVoice".to_string(),
+                    description: redact_network_error(&e),
+                    retryable: e.is_connect(),
+                });
+            }
+            Err(_) => {
+                return Err(TelegramError::Network {
+                    method: "sendVoice".to_string(),
+                    description: format!("timed out after {DEFAULT_REQUEST_TIMEOUT:?}"),
+                    retryable: true,
+                });
+            }
+        };
+
+        let status = response.status();
+        let limited = Limited::new(response.into_body(), MAX_RESPONSE_BYTES);
+        let body_bytes = limited.collect().await.map_err(|e| TelegramError::Network {
+            method: "sendVoice".to_string(),
+            description: format!("body read: {e}"),
+            retryable: false,
+        })?;
+        let envelope: ApiResponse<Message> = serde_json::from_slice(&body_bytes.to_bytes())
+            .map_err(|e| TelegramError::Parse {
+                method: "sendVoice".to_string(),
+                description: format!("response parse: {e}"),
+            })?;
+
+        if !envelope.ok {
+            return Err(TelegramError::Api {
+                method: "sendVoice".to_string(),
+                status: status.as_u16(),
+                description: envelope.description.unwrap_or_default(),
+            });
+        }
+        envelope.result.ok_or_else(|| TelegramError::EmptyResult {
+            method: "sendVoice".to_string(),
+        })
+    }
+
     /// Surface a chat action (`"typing"`, `"upload_photo"`, …) for ~5 s
     /// on the user's screen. Refresh on a loop to keep it active.
     pub async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<()> {
@@ -520,6 +612,52 @@ pub fn install_crypto_provider() {
         .expect("rustls default crypto provider already installed — unexpected");
 }
 
+/// Build a `multipart/form-data` body for `sendVoice`. Three fields
+/// maximum: `chat_id` (text), `voice` (binary file), optional
+/// `duration` (text). CRLF line endings as per RFC 7578.
+fn build_send_voice_body(
+    chat_id: i64,
+    voice: &[u8],
+    duration_sec: Option<u32>,
+    boundary: &str,
+) -> Bytes {
+    let mut out: Vec<u8> = Vec::with_capacity(voice.len() + 512);
+
+    let write_text_field = |out: &mut Vec<u8>, name: &str, value: &str| {
+        out.extend_from_slice(b"--");
+        out.extend_from_slice(boundary.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    };
+
+    write_text_field(&mut out, "chat_id", &chat_id.to_string());
+    if let Some(d) = duration_sec {
+        write_text_field(&mut out, "duration", &d.to_string());
+    }
+
+    // `voice` binary field.
+    out.extend_from_slice(b"--");
+    out.extend_from_slice(boundary.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"voice\"; filename=\"voice.oga\"\r\n",
+    );
+    out.extend_from_slice(b"Content-Type: audio/ogg\r\n\r\n");
+    out.extend_from_slice(voice);
+    out.extend_from_slice(b"\r\n");
+
+    // Closing boundary.
+    out.extend_from_slice(b"--");
+    out.extend_from_slice(boundary.as_bytes());
+    out.extend_from_slice(b"--\r\n");
+
+    Bytes::from(out)
+}
+
 /// Render a hyper-util client error into a token-safe string. Walks to the
 /// root cause, then substring-checks for `/bot` or `api.telegram.org` as
 /// belt-and-suspenders against future hyper regressions.
@@ -587,5 +725,41 @@ mod tests {
     /// `install_crypto_provider` panics on repeat.
     fn install_crypto_provider_idempotent() {
         let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    #[test]
+    fn send_voice_body_shape() {
+        let voice = b"OggS\x00\x02fake-opus-bytes\x00";
+        let body = build_send_voice_body(987_654, voice, Some(3), "abcdef0123456789");
+        let as_str = std::str::from_utf8(&body).unwrap_or("");
+        // Boundary markers appear before each field and a closing --\r\n.
+        assert!(as_str.contains("--abcdef0123456789\r\n"));
+        assert!(as_str.contains("--abcdef0123456789--\r\n"));
+        // chat_id field.
+        assert!(as_str.contains(
+            "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n987654\r\n"
+        ));
+        // duration field.
+        assert!(
+            as_str.contains("Content-Disposition: form-data; name=\"duration\"\r\n\r\n3\r\n")
+        );
+        // voice field header + content-type.
+        assert!(as_str.contains(
+            "Content-Disposition: form-data; name=\"voice\"; filename=\"voice.oga\"\r\n"
+        ));
+        assert!(as_str.contains("Content-Type: audio/ogg\r\n\r\n"));
+        // Binary payload preserved byte-for-byte.
+        let offset = body
+            .windows(voice.len())
+            .position(|w| w == voice)
+            .expect("voice bytes embedded verbatim");
+        assert!(offset > 0);
+    }
+
+    #[test]
+    fn send_voice_body_omits_duration_when_none() {
+        let body = build_send_voice_body(1, b"x", None, "bnd");
+        let as_str = std::str::from_utf8(&body).unwrap_or("");
+        assert!(!as_str.contains("name=\"duration\""));
     }
 }

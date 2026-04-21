@@ -127,11 +127,111 @@ pub fn decode_opus_to_pcm16k(oga_bytes: &[u8]) -> Result<Vec<f32>, CodecError> {
     Ok(out)
 }
 
-/// Encode 16 kHz mono PCM `f32` samples to an OGG/Opus byte blob suitable
-/// for `POST /sendVoice`. **Phase 4 stub.**
-pub fn encode_pcm_to_opus(_pcm: &[f32]) -> Result<Bytes, CodecError> {
-    todo!("Phase 4: wire opus encode + ogg mux for /sendVoice")
+/// Encode 16 kHz mono PCM `f32` samples to an OGG/Opus byte blob
+/// suitable for `POST /sendVoice`. 20 ms frames at `VoIP` complexity
+/// (matches Telegram's voice-note recording conventions).
+///
+/// Telegram's voice-message bubble displays only for OGG/Opus at
+/// 16 kHz mono (cloud Bot API). Higher rates / other codecs land as a
+/// file attachment.
+pub fn encode_pcm_to_opus(pcm: &[f32]) -> Result<Bytes, CodecError> {
+    use opus::{Application, Encoder as OpusEncoder};
+
+    if pcm.is_empty() {
+        return Err(CodecError::Encode("empty PCM input".to_string()));
+    }
+
+    let mut encoder = OpusEncoder::new(OUTPUT_RATE, Channels::Mono, Application::Voip)
+        .map_err(|e| CodecError::Encode(format!("encoder init: {e}")))?;
+
+    // Pad the input to a whole number of frames. Telegram tolerates the
+    // ~20 ms of trailing silence, and Opus needs fixed-size input.
+    let total_samples = pcm.len().div_ceil(FRAME_SAMPLES) * FRAME_SAMPLES;
+
+    let mut packets: Vec<Vec<u8>> = Vec::with_capacity(total_samples / FRAME_SAMPLES);
+    let mut buf = vec![0u8; 4000]; // Opus packets typically < 500 B, but headroom is cheap.
+    let mut frame_buf = vec![0.0_f32; FRAME_SAMPLES];
+    let mut offset = 0;
+    while offset < total_samples {
+        let end = (offset + FRAME_SAMPLES).min(pcm.len());
+        let have = end - offset;
+        frame_buf[..have].copy_from_slice(&pcm[offset..end]);
+        if have < FRAME_SAMPLES {
+            for sample in &mut frame_buf[have..] {
+                *sample = 0.0;
+            }
+        }
+        let n = encoder
+            .encode_float(&frame_buf, &mut buf)
+            .map_err(|e| CodecError::Encode(format!("encode_float: {e}")))?;
+        packets.push(buf[..n].to_vec());
+        offset += FRAME_SAMPLES;
+    }
+
+    // Mux into an OGG container. Serial number is arbitrary (Telegram
+    // ignores it but requires a unique stream-serial in the page header);
+    // a timestamp-derived 32-bit value is fine.
+    let serial: u32 = u32::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros() & 0xFFFF_FFFF),
+    )
+    .unwrap_or(0xC0FF_EE42);
+
+    let mut out: Vec<u8> = Vec::with_capacity(total_samples * 2 / 10);
+    {
+        let mut writer = ogg::writing::PacketWriter::new(std::io::Cursor::new(&mut out));
+
+        // OpusHead (19 bytes): magic + version(1) + channels(1) +
+        // preskip(0) + input_rate(16000) + output_gain(0) +
+        // channel_mapping_family(0).
+        let mut head = Vec::with_capacity(19);
+        head.extend_from_slice(b"OpusHead");
+        head.push(1);
+        head.push(1);
+        head.extend_from_slice(&0u16.to_le_bytes());
+        head.extend_from_slice(&OUTPUT_RATE.to_le_bytes());
+        head.extend_from_slice(&0i16.to_le_bytes());
+        head.push(0);
+        writer
+            .write_packet(head, serial, ogg::PacketWriteEndInfo::EndPage, 0)
+            .map_err(|e| CodecError::Encode(format!("ogg OpusHead: {e}")))?;
+
+        // OpusTags: magic + empty vendor + empty user-comments.
+        let mut tags = Vec::with_capacity(16);
+        tags.extend_from_slice(b"OpusTags");
+        tags.extend_from_slice(&0u32.to_le_bytes());
+        tags.extend_from_slice(&0u32.to_le_bytes());
+        writer
+            .write_packet(tags, serial, ogg::PacketWriteEndInfo::EndPage, 0)
+            .map_err(|e| CodecError::Encode(format!("ogg OpusTags: {e}")))?;
+
+        // Audio packets. OGG Opus granule positions are counted at 48 kHz
+        // regardless of encoded rate — multiply our frame size by 3 to
+        // convert 16 kHz samples to 48 kHz granules.
+        let granule_per_frame = (FRAME_SAMPLES as u64) * 48 / u64::from(OUTPUT_RATE);
+        let last_idx = packets.len() - 1;
+        let mut granule: u64 = 0;
+        for (i, pkt) in packets.into_iter().enumerate() {
+            granule += granule_per_frame;
+            let end_kind = if i == last_idx {
+                ogg::PacketWriteEndInfo::EndStream
+            } else {
+                ogg::PacketWriteEndInfo::NormalPacket
+            };
+            writer
+                .write_packet(pkt, serial, end_kind, granule)
+                .map_err(|e| CodecError::Encode(format!("ogg audio packet: {e}")))?;
+        }
+    }
+
+    Ok(Bytes::from(out))
 }
+
+/// 20 ms frame at 16 kHz mono = 320 samples. Opus natively supports
+/// 2.5/5/10/20/40/60 ms; 20 ms is Telegram voice's de-facto frame size.
+const FRAME_MS: usize = 20;
+const FRAME_SAMPLES: usize = (OUTPUT_RATE as usize) * FRAME_MS / 1000;
 
 #[cfg(test)]
 mod tests {
@@ -180,89 +280,32 @@ mod tests {
         );
     }
 
-    /// Synthesize a minimal OGG/Opus round-trip locally to exercise the
-    /// decode path end-to-end without a fixture file. We use `opus` to
-    /// encode 1 second of silence, then wrap the packets in a bare OGG
-    /// container and decode it back.
+    /// Round-trip exercise using both public codec fns: encode 1 s of
+    /// silence, decode it back, assert sample count + amplitude.
+    /// Replaces the old inline-encoder test now that `encode_pcm_to_opus`
+    /// is a real public API.
     #[test]
-    fn decode_round_trip_silence() {
-        use opus::Application;
-        use std::io::Write as _;
-
-        // 1 second of silence at 16 kHz mono = 16000 samples.
-        const SAMPLE_RATE: u32 = 16_000;
-        const FRAME_MS: usize = 20;
-        const FRAME_SAMPLES: usize = (SAMPLE_RATE as usize) * FRAME_MS / 1000;
-        const TOTAL_FRAMES: usize = 1000 / FRAME_MS;
-
-        // Encode 50 × 20ms frames of silence.
-        let mut encoder = opus::Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip)
-            .expect("encoder init");
-        let silence = vec![0.0_f32; FRAME_SAMPLES];
-        let mut packets: Vec<Vec<u8>> = Vec::new();
-        for _ in 0..TOTAL_FRAMES {
-            let mut pkt = vec![0u8; 4000];
-            let n = encoder
-                .encode_float(&silence, &mut pkt)
-                .expect("encode packet");
-            pkt.truncate(n);
-            packets.push(pkt);
-        }
-
-        // Mux into an OGG container using the ogg crate's PacketWriter.
-        let mut oga_bytes: Vec<u8> = Vec::new();
-        {
-            let mut writer =
-                ogg::writing::PacketWriter::new(std::io::Cursor::new(&mut oga_bytes));
-            let serial = 0xA1B2_C3D4;
-
-            // OpusHead: 8-byte magic + version(1) + channels(1) + preskip(0)
-            // + input_sample_rate(16000) + output_gain(0) + mapping_family(0)
-            let mut head = Vec::with_capacity(19);
-            head.extend_from_slice(b"OpusHead");
-            head.push(1); // version
-            head.push(1); // mono
-            head.extend_from_slice(&0u16.to_le_bytes()); // preskip
-            head.extend_from_slice(&SAMPLE_RATE.to_le_bytes()); // input rate
-            head.extend_from_slice(&0i16.to_le_bytes()); // output gain
-            head.push(0); // channel mapping family
-            writer
-                .write_packet(head, serial, ogg::PacketWriteEndInfo::EndPage, 0)
-                .unwrap();
-
-            // OpusTags: magic + empty vendor + empty user-comment list.
-            let mut tags = Vec::with_capacity(16);
-            tags.extend_from_slice(b"OpusTags");
-            tags.extend_from_slice(&0u32.to_le_bytes()); // vendor length = 0
-            tags.extend_from_slice(&0u32.to_le_bytes()); // user-comment count = 0
-            writer
-                .write_packet(tags, serial, ogg::PacketWriteEndInfo::EndPage, 0)
-                .unwrap();
-
-            let last_idx = packets.len() - 1;
-            let mut granule: u64 = 0;
-            for (i, pkt) in packets.into_iter().enumerate() {
-                granule += FRAME_SAMPLES as u64 * 48 / 16; // OGG Opus granules use 48kHz
-                let end = if i == last_idx {
-                    ogg::PacketWriteEndInfo::EndStream
-                } else {
-                    ogg::PacketWriteEndInfo::NormalPacket
-                };
-                writer.write_packet(pkt, serial, end, granule).unwrap();
-            }
-            writer.inner_mut().flush().unwrap();
-        }
+    fn encode_decode_round_trip_silence() {
+        let silence = vec![0.0_f32; OUTPUT_RATE as usize]; // 1 s
+        let oga_bytes = encode_pcm_to_opus(&silence).expect("encode");
+        assert!(!oga_bytes.is_empty());
+        // OGG pages always start with "OggS".
+        assert_eq!(&oga_bytes[..4], b"OggS");
 
         let pcm = decode_opus_to_pcm16k(&oga_bytes).expect("decode");
-        // 1 second of silence at 16 kHz ≈ 16000 samples. Opus has a
-        // preskip + small internal latency so we allow some tolerance.
+        // Opus has a small internal preskip + latency; allow tolerance.
         assert!(
             pcm.len() > 14_000 && pcm.len() < 18_000,
             "unexpected sample count: {}",
             pcm.len()
         );
-        // All samples should be near zero (silence).
         let peak = pcm.iter().copied().map(f32::abs).fold(0.0_f32, f32::max);
         assert!(peak < 0.05, "silence decoded with peak {peak}");
+    }
+
+    #[test]
+    fn encode_empty_input_errors() {
+        let err = encode_pcm_to_opus(&[]).unwrap_err();
+        assert!(err.to_string().contains("empty"));
     }
 }

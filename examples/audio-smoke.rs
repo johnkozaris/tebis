@@ -17,6 +17,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tebis::audio::{AudioConfig, AudioSubsystem, stt::SttConfig};
+#[cfg(target_os = "macos")]
+use tebis::audio::tts::TtsConfig;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -35,6 +37,14 @@ async fn main() -> Result<()> {
 
     tebis::telegram::install_crypto_provider();
 
+    #[cfg(target_os = "macos")]
+    let tts_cfg = Some(TtsConfig {
+        voice: "Samantha".to_string(),
+        respond_to_all: false,
+    });
+    #[cfg(not(target_os = "macos"))]
+    let tts_cfg = None;
+
     let cfg = AudioConfig {
         stt: Some(SttConfig {
             model: "base.en".to_string(),
@@ -43,6 +53,7 @@ async fn main() -> Result<()> {
             max_bytes: 20 * 1024 * 1024,
             threads: 4,
         }),
+        tts: tts_cfg,
     };
     let tracker = TaskTracker::new();
     let shutdown = CancellationToken::new();
@@ -84,6 +95,26 @@ async fn main() -> Result<()> {
         t2.elapsed().as_secs_f64(),
         result2.duration_ms
     );
+
+    #[cfg(target_os = "macos")]
+    {
+        println!();
+        println!("Synthesizing 'hello from tebis' via macOS `say`…");
+        let t3 = Instant::now();
+        let oga = audio
+            .synthesize("hello from tebis")
+            .await
+            .context("synthesize failed")?;
+        let out_path = std::env::temp_dir().join("tebis-smoke.oga");
+        std::fs::write(&out_path, &oga).context("write OGG")?;
+        println!(
+            "  ✓ Done in {:.2}s · {} bytes written to {}",
+            t3.elapsed().as_secs_f64(),
+            oga.len(),
+            out_path.display()
+        );
+        println!("  (open with QuickTime / afplay to hear it)");
+    }
 
     println!();
     println!("✓ Smoke test passed.");
