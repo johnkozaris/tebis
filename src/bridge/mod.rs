@@ -188,11 +188,18 @@ async fn react_ok(ctx: &HandlerContext, chat_id: i64, message_id: i64) {
     }
 }
 
-/// Maximum characters of transcript we'll feed into `handler::parse`.
-/// Matches `TELEGRAM_MAX_OUTPUT_CHARS`'s upper bound — a noisy long
-/// recording should not be able to paste 100 KiB of text into tmux and
-/// bypass the existing plumbing limits (new proposed invariant 19).
-const MAX_TRANSCRIPT_CHARS: usize = 4000;
+/// Maximum transcript **bytes** (not chars) we'll feed into
+/// `handler::parse`. Matches `TELEGRAM_MAX_OUTPUT_CHARS`'s upper bound
+/// — a noisy long recording should not be able to paste 100 KiB of text
+/// into tmux and bypass the existing plumbing limits (proposed
+/// invariant 19). Named "BYTES" because `text.len()` is bytes; the
+/// config key uses "CHARS" for historical reasons.
+const MAX_TRANSCRIPT_BYTES: usize = 4000;
+
+/// Samples per second the Opus decoder emits (we configure it at 16 kHz
+/// to match whisper-rs input). Used for the post-decode duration sanity
+/// check below.
+const PCM_SAMPLE_RATE: usize = 16_000;
 
 /// Voice/audio dispatch: downloads the file from Telegram, decodes
 /// OGG/Opus → PCM, runs whisper-rs, returns either the transcript (to
@@ -268,6 +275,22 @@ async fn transcribe_voice(
         format!("Voice decode failed: {e}. Tebis only accepts OGG/Opus voice notes — music files in other formats aren't supported.")
     })?;
 
+    // Defense-in-depth: `duration_sec` above is sender-supplied per the
+    // Telegram Bot API (not server-verified). A malicious client can
+    // lie about duration to bypass the pre-download cap. After we have
+    // real PCM samples, compute actual duration from sample count and
+    // re-check. Opus decode is cheap (~20x real-time), so this adds
+    // negligible latency for honest clients and immediately bails on
+    // exploit attempts before we pay for whisper inference.
+    let actual_duration_sec = u32::try_from(pcm.len() / PCM_SAMPLE_RATE).unwrap_or(u32::MAX);
+    if actual_duration_sec > limits.max_duration_sec {
+        return Err(format!(
+            "Voice message is longer than claimed ({actual}s decoded > {cap}s cap).",
+            actual = actual_duration_sec,
+            cap = limits.max_duration_sec,
+        ));
+    }
+
     let language = audio.stt_language().unwrap_or("");
     let transcription = audio
         .transcribe(&pcm, language)
@@ -278,10 +301,10 @@ async fn transcribe_voice(
     if text.trim().is_empty() {
         return Err("Could not transcribe voice message (no speech detected).".to_string());
     }
-    if text.len() > MAX_TRANSCRIPT_CHARS {
+    if text.len() > MAX_TRANSCRIPT_BYTES {
         // Char-boundary-safe truncation — `text.truncate` panics on
-        // multi-byte boundaries.
-        let mut end = MAX_TRANSCRIPT_CHARS;
+        // multi-byte boundaries. At most 3 iterations (UTF-8 max 4 bytes).
+        let mut end = MAX_TRANSCRIPT_BYTES;
         while !text.is_char_boundary(end) {
             end -= 1;
         }

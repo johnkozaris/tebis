@@ -236,8 +236,13 @@ impl FetchClient {
         let mut body = response.into_body();
         loop {
             tokio::select! {
-                // Bias toward cancel check so a very fast stream can't
-                // starve it out of the select scheduler.
+                // `biased`: poll the cancel branch first every iteration.
+                // On a saturated network, random-scheduled select could
+                // consume thousands of chunks before observing cancel,
+                // delaying shutdown by seconds. Biased flips the priority
+                // so SIGTERM drains promptly; the cost is negligible
+                // because `cancel.cancelled()` returns immediately to
+                // `Pending` when not yet fired.
                 biased;
                 () = cancel.cancelled() => return Err(FetchError::Cancelled),
                 frame = body.frame() => {

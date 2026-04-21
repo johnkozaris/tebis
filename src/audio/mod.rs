@@ -9,8 +9,8 @@
 //!   atomic model install, stale-tmp reaping.
 //! - `fetch.rs` — HTTPS streaming download with SHA-256 verification.
 //! - `codec.rs` — OGG/Opus ↔ PCM for Telegram voice (stub, Phase 3).
-//! - `stt/` — Phase 1: `whisper-rs` in-process + remote stubs.
-//! - `tts/` — Phase 4: `any-tts` in-process + remote stubs.
+//! - `stt/` — whisper-rs in-process. The only STT backend tebis ships.
+//! - `tts/` — Phase 4 (not yet implemented): `any-tts` with Kokoro.
 //!
 //! See `/PLAN-VOICE.md` for the end-to-end design, including invariant
 //! compliance (CLAUDE.md 4, 5, 6, 9, 10, 12) and the rollout phases.
@@ -175,7 +175,12 @@ async fn build_local_stt(
     let model_path = cache::model_path(&file_name)
         .context("resolving model cache path")?;
 
-    cache::reap_stale_tmps(model_path.parent().unwrap_or(&model_path))
+    // `model_path` is always `<base>/models/<file>`, so `.parent()` is
+    // always `Some` — but fall back to the models dir explicitly rather
+    // than trusting `unwrap_or(&model_path)` which would feed a file
+    // path to `read_dir` and surface a confusing `NotADirectory` error.
+    let models_dir = cache::models_dir()?;
+    cache::reap_stale_tmps(&models_dir)
         .context("reaping stale .tmp files in models dir")?;
 
     if model_path.exists() {

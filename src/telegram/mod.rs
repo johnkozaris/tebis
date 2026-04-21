@@ -33,6 +33,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+/// Ceiling for `download_file`. Cloud Bot API serves files up to 20 MiB
+/// and the local Bot API up to 50 MiB — we size for the local cap so
+/// self-hosted deployments work without special-casing. Distinct from
+/// [`MAX_RESPONSE_BYTES`] (JSON API responses) so tightening one doesn't
+/// silently truncate user audio.
+const MAX_FILE_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
 const MAX_RETRIES: usize = 5;
 
 #[derive(Debug, thiserror::Error)]
@@ -229,10 +235,22 @@ impl TelegramClient {
     /// errors can never leak it to the journal.
     ///
     /// Caller should pre-check `file_size` against
-    /// `TELEGRAM_STT_MAX_BYTES`; this method still enforces a
-    /// [`MAX_RESPONSE_BYTES`] ceiling so a server lying about its size
-    /// can't blow memory. Cloud Bot API maxes at 20 MiB regardless.
+    /// `TELEGRAM_STT_MAX_BYTES`; this method additionally enforces a
+    /// [`MAX_FILE_DOWNLOAD_BYTES`] ceiling so a server lying about its
+    /// size can't blow memory. The Bot API serves files up to 20 MiB
+    /// (cloud) / 50 MiB (local) — the constant is sized for the latter.
+    ///
+    /// Retry policy: one attempt on connect-level errors, then bubble.
+    /// Voice files are small (typically < 1 MB), and a single retry on
+    /// transient TCP hiccups is the right shape — full `post_with_timeout`
+    /// backoff is overkill and slows the user feedback loop.
     pub async fn download_file(&self, file_path: &str) -> Result<Bytes> {
+        // Defensive: Telegram's API currently never returns `file_path`
+        // with a leading slash, but if it ever did we'd build
+        // `/file/bot<TOKEN>//voice/…`. Most servers normalize, some
+        // don't; strip to be safe.
+        let file_path = file_path.trim_start_matches('/');
+
         // `base_url` is `https://api.telegram.org/bot<TOKEN>` — swap
         // `/bot<TOKEN>` for `/file/bot<TOKEN>` to reach the file-serving
         // endpoint. The token stays wrapped in `SecretString` so `Debug`
@@ -249,10 +267,40 @@ impl TelegramClient {
             format!("https://api.telegram.org/file/bot{token}/{file_path}")
         };
 
+        let mut last_err: Option<TelegramError> = None;
+        for attempt in 0..=1 {
+            match self.download_file_once(&url).await {
+                Ok(body) => return Ok(body),
+                Err(e) => {
+                    if attempt == 0 && matches!(
+                        &e,
+                        TelegramError::Network { retryable: true, .. }
+                    ) {
+                        tracing::warn!(
+                            attempt,
+                            err = %e,
+                            "download_file: retrying once on connect-level error"
+                        );
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        // Unreachable: loop always returns or continues.
+        Err(last_err.unwrap_or_else(|| TelegramError::Network {
+            method: "download_file".to_string(),
+            description: "retry loop exited without result".to_string(),
+            retryable: false,
+        }))
+    }
+
+    async fn download_file_once(&self, url: &str) -> Result<Bytes> {
         let deadline = tokio::time::Instant::now() + DEFAULT_REQUEST_TIMEOUT;
         let req = Request::builder()
             .method(Method::GET)
-            .uri(&url)
+            .uri(url)
             .body(Full::<Bytes>::new(Bytes::new()))
             .expect("hyper Request::builder: inputs are known-valid");
         let response = match tokio::time::timeout_at(deadline, self.client.request(req)).await {
@@ -280,7 +328,7 @@ impl TelegramClient {
                 description: "non-success HTTP status".to_string(),
             });
         }
-        let limited = Limited::new(response.into_body(), MAX_RESPONSE_BYTES);
+        let limited = Limited::new(response.into_body(), MAX_FILE_DOWNLOAD_BYTES);
         let body = match limited.collect().await {
             Ok(b) => b.to_bytes(),
             Err(e) => {

@@ -31,7 +31,10 @@ pub enum CodecError {
     #[error("input is not OGG/Opus (missing OpusHead magic in first packet)")]
     NotOpus,
 
-    #[error("unsupported channel configuration: {0} (only mono is supported)")]
+    #[error(
+        "this audio file has {0} channels — tebis only handles mono voice recordings. \
+         Record a voice note (hold the mic button) instead of sending a music file."
+    )]
     UnsupportedChannels(u8),
 
     #[error("ogg read error: {0}")]
@@ -74,7 +77,12 @@ pub fn decode_opus_to_pcm16k(oga_bytes: &[u8]) -> Result<Vec<f32>, CodecError> {
         .map_err(|e| CodecError::OggRead(e.to_string()))?
         .ok_or_else(|| CodecError::Decode("no packets in OGG stream".to_string()))?;
 
-    if head.data.len() < 10 || &head.data[..8] != b"OpusHead" {
+    // A valid OpusHead is at least 19 bytes: 8-byte magic + 11 bytes of
+    // fixed fields (version, channels, preskip, input_sample_rate,
+    // output_gain, channel_mapping_family). Checking `< 19` catches
+    // truncated / maliciously short headers up front; libopus would fail
+    // later anyway but with a less useful error.
+    if head.data.len() < 19 || &head.data[..8] != b"OpusHead" {
         return Err(CodecError::NotOpus);
     }
     let channel_count = head.data[9];
