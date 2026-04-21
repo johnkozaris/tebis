@@ -390,7 +390,11 @@ pub fn install_crypto_provider() {
 /// Render a hyper-util client error into a token-safe string. Walks to the
 /// root cause, then substring-checks for `/bot` or `api.telegram.org` as
 /// belt-and-suspenders against future hyper regressions.
-fn redact_network_error(err: &hyper_util::client::legacy::Error) -> String {
+///
+/// `pub(crate)` so `audio::fetch` can route its HTTP errors through the
+/// same redactor — same crypto stack, same failure modes, same secret
+/// leakage risk if a future hyper change starts including URIs in errors.
+pub(crate) fn redact_network_error(err: &hyper_util::client::legacy::Error) -> String {
     const MAX_SOURCE_DEPTH: usize = 16;
     let mut cur: &dyn std::error::Error = err;
     for _ in 0..MAX_SOURCE_DEPTH {
