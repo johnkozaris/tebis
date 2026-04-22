@@ -1,6 +1,4 @@
-//! Duration + unix-timestamp formatting for the dashboard. `never` for
-//! zero, ordinary `Ns` / `Nm Ns` / `Nh Nm Ns` / `Nd Nh Nm Ns` for
-//! anything else. Used both by the HTML page and the JSON endpoint.
+//! Duration + unix-timestamp formatting for the dashboard.
 
 use std::fmt::Write as _;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

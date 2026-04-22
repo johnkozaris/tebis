@@ -1,12 +1,4 @@
-//! Outbound-notification listener (UDS) with a pluggable [`Forwarder`] sink.
-//!
-//! Hook scripts push one JSON line per event; the listener parses, hands to
-//! the forwarder, and writes a status line back. UDS-only so it's
-//! unreachable from the network; mode 0600 + `peer_cred` keeps it local.
-//!
-//! - `mod.rs` — `spawn` entry + `Forwarder` trait + `TelegramForwarder`
-//! - `format.rs` — pure `Payload` → HTML body
-//! - `listener.rs` — bind + accept loop + per-connection protocol
+//! Outbound-notify listener (UDS) + `Forwarder` sink. UDS-only (invariants 9–12).
 
 mod format;
 mod listener;
@@ -26,9 +18,7 @@ pub struct NotifyConfig {
     pub chat_id: i64,
 }
 
-/// Hook-script wire format. `kind` is the event classification
-/// (`"stop"`, `"subagent_stop"`, `"permission_prompt"`, `"idle_prompt"`)
-/// which renders as a `[tag]` prefix; unknown kinds render with no tag.
+/// Hook wire format. `kind` renders as a `[tag]` prefix; unknown → no tag.
 #[derive(Deserialize, Debug, Clone)]
 pub struct Payload {
     pub text: String,
@@ -40,15 +30,13 @@ pub struct Payload {
     pub kind: Option<String>,
 }
 
-/// Listener-facing error. Structured upstream errors (`TelegramError`) are
-/// collapsed to a string so the listener doesn't pattern-match on specifics.
 #[derive(Debug, thiserror::Error)]
 pub enum ForwardError {
     #[error("delivery failed: {0}")]
     Delivery(String),
 }
 
-/// Test seam: production wires `TelegramForwarder`, tests inject a recorder.
+/// Test seam: production wires `TelegramForwarder`; tests inject a recorder.
 pub trait Forwarder: Send + Sync + 'static {
     fn forward(
         &self,
@@ -59,12 +47,7 @@ pub trait Forwarder: Send + Sync + 'static {
 pub struct TelegramForwarder {
     tg: Arc<TelegramClient>,
     chat_id: i64,
-    /// Caps concurrent in-flight forwards so a hook storm (Claude +
-    /// several SubagentStops landing within seconds) can't pin
-    /// Telegram's retry budget in every connection handler at once.
-    /// Two permits: enough for one in-flight + one queued — new
-    /// events above that wait their turn, which is fine because
-    /// notify is best-effort asynchronous.
+    /// 2 permits cap fan-out under hook storms (Stop + several SubagentStops).
     send_sem: Arc<tokio::sync::Semaphore>,
 }
 

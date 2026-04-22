@@ -1,9 +1,5 @@
-//! Telegram Bot API client on `hyper` + `hyper-rustls` + `ring`.
-//!
-//! Hand-rolled instead of `reqwest` to keep the dependency graph small and
-//! the binary reproducible. Bot token lives in the URL path (per the Bot
-//! API) and never appears in logs or `Debug` output — see
-//! `redact_network_error`.
+//! Telegram Bot API client on `hyper` + `hyper-rustls` + `ring`. Bot token
+//! lives in the URL path; `redact_network_error` keeps it out of logs.
 
 use std::time::Duration;
 
@@ -24,8 +20,7 @@ use types::{
     SetMessageReactionRequest, TelegramFile, Update,
 };
 
-/// Extra time above the caller's long-poll window for connect + headers.
-/// Per-request deadline so a 60 s long-poll waits 65 s, not a hardcoded 35.
+/// Headroom above the caller's long-poll window for connect + headers.
 const REQUEST_HEADROOM: Duration = Duration::from_secs(5);
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -33,11 +28,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-/// Ceiling for `download_file`. Cloud Bot API serves files up to 20 MiB
-/// and the local Bot API up to 50 MiB — we size for the local cap so
-/// self-hosted deployments work without special-casing. Distinct from
-/// [`MAX_RESPONSE_BYTES`] (JSON API responses) so tightening one doesn't
-/// silently truncate user audio.
+/// Ceiling for `download_file`. Sized for the local Bot API (50 MiB); cloud is 20 MiB.
 const MAX_FILE_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
 const MAX_RETRIES: usize = 5;
 
@@ -75,9 +66,7 @@ impl TelegramError {
         matches!(self, Self::Api { status: 409, .. })
     }
 
-    /// 401 Unauthorized — the bot token is wrong or revoked. Distinguishing
-    /// this from generic `Api` errors lets `main.rs` dead-end with a
-    /// paste-a-fresh-token message instead of crash-looping under launchd.
+    /// 401 Unauthorized — `main.rs` dead-ends on this instead of crash-looping.
     #[must_use]
     pub const fn is_unauthorized(&self) -> bool {
         matches!(self, Self::Api { status: 401, .. })
@@ -90,8 +79,7 @@ type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 pub struct TelegramClient {
     client: HyperClient,
-    /// URL prefix including the bot token. `SecretString` zeros on drop and
-    /// redacts via `Debug`.
+    /// URL prefix including the bot token. `SecretString` redacts via `Debug`.
     base_url: SecretString,
 }
 
@@ -138,8 +126,7 @@ impl TelegramClient {
         Self { client, base_url }
     }
 
-    /// Delete any existing webhook + drop pending updates. Must be called
-    /// before `getUpdates` or the server returns 409.
+    /// Delete any existing webhook + drop pending updates. Required before `getUpdates` or 409.
     pub async fn delete_webhook(&self) -> Result<()> {
         let _: bool = self
             .post_with_timeout(
@@ -216,9 +203,7 @@ impl TelegramClient {
         Ok(())
     }
 
-    /// Resolve a `file_id` (from a `voice` / `audio` / `document` field)
-    /// to a [`TelegramFile`] with the server-visible `file_path`. Pair
-    /// with [`Self::download_file`] to fetch the bytes.
+    /// Resolve a `file_id` to a [`TelegramFile`]. Pair with [`Self::download_file`].
     pub async fn get_file(&self, file_id: &str) -> Result<TelegramFile> {
         self.post_with_timeout(
             "getFile",
@@ -228,32 +213,13 @@ impl TelegramClient {
         .await
     }
 
-    /// Download a file at `file_path` (from a prior `get_file` call)
-    /// via the Bot API's file-serving endpoint. The URL contains the
-    /// bot token — same as every other Telegram URL — and is routed
-    /// through the same `redact_network_error` redactor so network
-    /// errors can never leak it to the journal.
-    ///
-    /// Caller should pre-check `file_size` against
-    /// `TELEGRAM_STT_MAX_BYTES`; this method additionally enforces a
-    /// [`MAX_FILE_DOWNLOAD_BYTES`] ceiling so a server lying about its
-    /// size can't blow memory. The Bot API serves files up to 20 MiB
-    /// (cloud) / 50 MiB (local) — the constant is sized for the latter.
-    ///
-    /// Retry policy: one attempt on connect-level errors, then bubble.
-    /// Voice files are small (typically < 1 MB), and a single retry on
-    /// transient TCP hiccups is the right shape — full `post_with_timeout`
-    /// backoff is overkill and slows the user feedback loop.
+    /// Download a file via the Bot API's file-serving endpoint. Enforces
+    /// [`MAX_FILE_DOWNLOAD_BYTES`] regardless of server claims; one retry
+    /// on connect-level errors.
     pub async fn download_file(&self, file_path: &str) -> Result<Bytes> {
-        // Strip leading slash defensively — Telegram doesn't send one
-        // today, but builds `//voice/…` if they ever do.
         let file_path = file_path.trim_start_matches('/');
 
-        // Defence in depth against a hostile/bugged server response.
-        // The Bot API documents `file_path` as a relative path like
-        // `voice/file_123.oga`. Reject anything that tries to break
-        // out — `..` segments (path traversal) or `://` (full-URL
-        // injection that'd redirect the request).
+        // Reject traversal / full-URL injection in server-provided path.
         if file_path.split('/').any(|seg| seg == "..")
             || file_path.contains("://")
         {
@@ -264,13 +230,9 @@ impl TelegramClient {
             });
         }
 
-        // `base_url` = `https://api.telegram.org/bot<TOKEN>`. Swap
-        // `/bot<TOKEN>` for `/file/bot<TOKEN>`. Token stays wrapped in
-        // `SecretString` for `Debug` redaction.
+        // Swap `/bot<TOKEN>` → `/file/bot<TOKEN>`.
         let url = {
             let base = self.base_url.expose_secret();
-            // The constant URL must start with this — if ever changed
-            // it's a coupled edit. Fail fast at test time.
             debug_assert!(
                 base.starts_with("https://api.telegram.org/bot"),
                 "base_url shape invariant broken"
@@ -285,9 +247,6 @@ impl TelegramClient {
             format!("https://api.telegram.org/file/bot{token}/{file_path}")
         };
 
-        // Two-shot: first attempt fails on a retryable connect-level
-        // error → retry once. Any non-retryable error bubbles
-        // immediately. The second attempt's outcome is terminal.
         match self.download_file_once(&url).await {
             Ok(body) => return Ok(body),
             Err(e) if matches!(&e, TelegramError::Network { retryable: true, .. }) => {
@@ -344,19 +303,8 @@ impl TelegramClient {
         Ok(body)
     }
 
-    /// Send a voice message (OGG/Opus container) to `chat_id`. The
-    /// audio shows as a playable voice-note bubble with a waveform
-    /// and speed controls; any other codec/container degrades to a
-    /// file attachment.
-    ///
-    /// Hand-rolled `multipart/form-data` — no reqwest, no mpart
-    /// crate. The body layout: `chat_id` text field, `voice` binary
-    /// field with filename `voice.oga`, optional `duration` text field.
-    /// Boundary is 32 hex chars from ring's `SystemRandom` (the same
-    /// crypto provider we already link for rustls).
-    ///
-    /// Network errors are redacted via `redact_network_error`; the
-    /// request URL contains the bot token.
+    /// Send an OGG/Opus voice note. Any other codec degrades to a file attachment
+    /// in the Telegram UI. Hand-rolled multipart body; boundary from ring RNG.
     pub async fn send_voice(
         &self,
         chat_id: i64,
@@ -365,8 +313,6 @@ impl TelegramClient {
     ) -> Result<Message> {
         use ring::rand::{SecureRandom, SystemRandom};
 
-        // 16 random bytes → 32 hex chars; more than enough to defeat
-        // any plausible boundary collision in user-provided filename.
         let mut boundary_bytes = [0u8; 16];
         SystemRandom::new()
             .fill(&mut boundary_bytes)
@@ -436,8 +382,7 @@ impl TelegramClient {
         })
     }
 
-    /// Surface a chat action (`"typing"`, `"upload_photo"`, …) for ~5 s
-    /// on the user's screen. Refresh on a loop to keep it active.
+    /// Chat action (`typing`, `upload_photo`, …) — auto-expires after ~5s.
     pub async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<()> {
         let _: bool = self
             .post_with_timeout(
@@ -515,13 +460,7 @@ impl TelegramClient {
         let body_bytes = Bytes::from(body_bytes);
 
         let mut backoff = Duration::from_secs(1);
-        // Wall-clock cap across the whole retry loop. Individual
-        // requests get `request_timeout`, but `MAX_RETRIES` + worst-case
-        // 429 `retry_after` could stretch to ~25 minutes otherwise —
-        // and the caller (bridge handler) holds its semaphore permit
-        // the entire time. 3 minutes is plenty for real transient
-        // outages and bounds permit-starvation under a Telegram-side
-        // incident.
+        // Wall-clock cap so retries can't starve the handler semaphore permit.
         const TOTAL_RETRY_BUDGET: Duration = Duration::from_mins(3);
         let start = std::time::Instant::now();
 
@@ -586,10 +525,7 @@ impl TelegramClient {
             }
 
             if status.as_u16() == 429 {
-                // Upper-bound the server-provided `retry_after` so a
-                // malformed or malicious response can't stall the poll
-                // loop for days. 5 minutes covers every realistic
-                // Bot-API rate-limit window.
+                // Cap server-provided `retry_after` so a malformed value can't stall for days.
                 const MAX_RETRY_AFTER_SECS: u64 = 300;
                 let retry_after = api_response
                     .parameters
@@ -623,18 +559,15 @@ impl TelegramClient {
     }
 }
 
-/// Install rustls's process-wide crypto provider. Panics if another
-/// provider is already installed — that would mean a dep silently picked
-/// a different backend than we want.
+/// Install rustls's process-wide crypto provider. Panics if another is already installed
+/// — that means a dep silently picked a different backend.
 pub fn install_crypto_provider() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("rustls default crypto provider already installed — unexpected");
 }
 
-/// Build a `multipart/form-data` body for `sendVoice`. Three fields
-/// maximum: `chat_id` (text), `voice` (binary file), optional
-/// `duration` (text). CRLF line endings as per RFC 7578.
+/// Build a `multipart/form-data` body for `sendVoice`. CRLF per RFC 7578.
 fn build_send_voice_body(
     chat_id: i64,
     voice: &[u8],
@@ -659,7 +592,6 @@ fn build_send_voice_body(
         write_text_field(&mut out, "duration", &d.to_string());
     }
 
-    // `voice` binary field.
     out.extend_from_slice(b"--");
     out.extend_from_slice(boundary.as_bytes());
     out.extend_from_slice(b"\r\n");
@@ -670,7 +602,6 @@ fn build_send_voice_body(
     out.extend_from_slice(voice);
     out.extend_from_slice(b"\r\n");
 
-    // Closing boundary.
     out.extend_from_slice(b"--");
     out.extend_from_slice(boundary.as_bytes());
     out.extend_from_slice(b"--\r\n");
@@ -678,14 +609,9 @@ fn build_send_voice_body(
     Bytes::from(out)
 }
 
-/// Render a hyper-util client error into a token-safe string. Walks to the
-/// root cause, then substring-checks for `/bot<digit>` (the Telegram
-/// token-URL shape) or `api.telegram.org` as belt-and-suspenders against
-/// future hyper regressions.
-///
-/// `pub(crate)` so `audio::fetch` can route its HTTP errors through the
-/// same redactor — same crypto stack, same failure modes, same secret
-/// leakage risk if a future hyper change starts including URIs in errors.
+/// Render a hyper-util error into a token-safe string. Walks to root cause,
+/// redacts on `/bot<digit>` or `api.telegram.org`. Invariant 6. `pub(crate)`
+/// so `audio::fetch` can route its errors through the same redactor.
 pub(crate) fn redact_network_error(err: &hyper_util::client::legacy::Error) -> String {
     const MAX_SOURCE_DEPTH: usize = 16;
     let mut cur: &dyn std::error::Error = err;
@@ -699,10 +625,7 @@ pub(crate) fn redact_network_error(err: &hyper_util::client::legacy::Error) -> S
         "request"
     };
     let raw = format!("{kind}: {cur}");
-    // Bare `/bot` is too aggressive — a benign hyper error containing a
-    // path segment, user-agent string, or random token `/bot` elsewhere
-    // in its chain would get scrubbed. Telegram's bot token URL is
-    // always `/bot<digit>...`, so gate on that.
+    // Gate on `/bot<digit>` — bare `/bot` false-positives on benign paths.
     if contains_bot_token_shape(&raw) || raw.contains("api.telegram.org") {
         tracing::warn!("Network error contained URI-like data; replaced with redacted placeholder");
         return format!("{kind}: <redacted network error>");
@@ -710,9 +633,7 @@ pub(crate) fn redact_network_error(err: &hyper_util::client::legacy::Error) -> S
     raw
 }
 
-/// True when `s` contains `/bot` immediately followed by an ASCII digit.
-/// Cheap manual scan — the alternative would be a regex or a crate
-/// dependency for one substring check.
+/// True when `s` contains `/bot` followed by an ASCII digit.
 fn contains_bot_token_shape(s: &str) -> bool {
     let bytes = s.as_bytes();
     let needle = b"/bot";
@@ -749,8 +670,6 @@ mod tests {
 
     #[test]
     fn bare_bot_path_does_not_trigger_false_positive() {
-        // Without a trailing digit, `/bot` is not the Telegram token
-        // shape — could be a user-agent, a random subpath, etc.
         for benign in [
             "connect: tcp stream closed to /bot/health",
             "request: /botanical-garden sensor error",
@@ -784,8 +703,7 @@ mod tests {
         assert!(!dbg.contains("TESTTESTTEST"));
     }
 
-    /// Tests share a process and run in arbitrary order; the real
-    /// `install_crypto_provider` panics on repeat.
+    /// Real `install_crypto_provider` panics on repeat; tests share a process.
     fn install_crypto_provider_idempotent() {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
@@ -795,23 +713,18 @@ mod tests {
         let voice = b"OggS\x00\x02fake-opus-bytes\x00";
         let body = build_send_voice_body(987_654, voice, Some(3), "abcdef0123456789");
         let as_str = std::str::from_utf8(&body).unwrap_or("");
-        // Boundary markers appear before each field and a closing --\r\n.
         assert!(as_str.contains("--abcdef0123456789\r\n"));
         assert!(as_str.contains("--abcdef0123456789--\r\n"));
-        // chat_id field.
         assert!(as_str.contains(
             "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n987654\r\n"
         ));
-        // duration field.
         assert!(
             as_str.contains("Content-Disposition: form-data; name=\"duration\"\r\n\r\n3\r\n")
         );
-        // voice field header + content-type.
         assert!(as_str.contains(
             "Content-Disposition: form-data; name=\"voice\"; filename=\"voice.oga\"\r\n"
         ));
         assert!(as_str.contains("Content-Type: audio/ogg\r\n\r\n"));
-        // Binary payload preserved byte-for-byte.
         let offset = body
             .windows(voice.len())
             .position(|w| w == voice)

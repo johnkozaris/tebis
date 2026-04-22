@@ -1,10 +1,5 @@
-//! Background-service lifecycle — install, uninstall, start, stop, status.
-//!
-//! macOS → launchd user agent at `~/Library/LaunchAgents/local.tebis.plist`.
-//! Linux → systemd user unit at `~/.config/systemd/user/tebis.service`.
-//!
-//! All commands are idempotent: re-install reloads, uninstall on a missing
-//! service is a no-op, start/stop on an unknown service reports clearly.
+//! Background-service lifecycle: install/uninstall/start/stop/status for
+//! launchd (macOS) or systemd user (Linux).
 
 use std::env;
 use std::ffi::OsStr;
@@ -18,11 +13,9 @@ use console::style;
 
 use crate::{lockfile, setup};
 
-/// launchd plist template. `USERNAME` is substituted at install time.
 #[cfg(target_os = "macos")]
 const MACOS_PLIST_TEMPLATE: &str = include_str!("../contrib/macos/local.tebis.plist");
 
-/// systemd user unit. Uses `%h` for $HOME (systemd expands it).
 #[cfg(target_os = "linux")]
 const LINUX_SERVICE: &str = include_str!("../contrib/linux/tebis.service");
 
@@ -30,8 +23,6 @@ const LINUX_SERVICE: &str = include_str!("../contrib/linux/tebis.service");
 const LAUNCHD_LABEL: &str = "local.tebis";
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const SYSTEMD_UNIT_NAME: &str = "tebis";
-
-// ---------- install ----------
 
 pub fn install() -> Result<()> {
     let env_path = setup::env_file_path()?;
@@ -88,11 +79,7 @@ pub fn install() -> Result<()> {
     Ok(())
 }
 
-/// Atomic write with mode 0644 for service config files (launchd plist /
-/// systemd unit). These files are non-secret but truncation-sensitive:
-/// a partial plist makes `launchctl load` fail with a cryptic parse
-/// error. `fs::write` could produce torn content if the process is
-/// killed mid-write; tmp-then-rename guarantees all-or-nothing.
+/// Tmp-then-rename 0644 write. A torn plist would break `launchctl load`.
 fn atomic_write_0644(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write as _;
     let nanos = std::time::SystemTime::now()
@@ -126,7 +113,6 @@ fn install_binary(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    // Skip a self-copy (already-installed binary invoking `tebis install`).
     if fs::canonicalize(src).ok() == fs::canonicalize(dst).ok() {
         return Ok(());
     }
@@ -138,13 +124,8 @@ fn install_binary(src: &Path, dst: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn install_macos() -> Result<()> {
-    // Derive the installing user from `$HOME`'s final path component,
-    // not from `$USER`. Under `sudo -E tebis install` / similar, `$USER`
-    // and `$HOME` can disagree (e.g. `$USER=root`, `$HOME=/Users/USERNAME`)
-    // which ends up writing a plist with the wrong username — launchd
-    // then loads it into root's domain instead of john's login
-    // session. `$HOME` is what drives the env-file + binary paths, so
-    // using its final component keeps everything internally consistent.
+    // Derive user from `$HOME`, not `$USER` — under `sudo -E` they disagree
+    // and a mismatched username loads the plist into the wrong launchd domain.
     let home = env::var("HOME").context("HOME env var not set")?;
     let user = std::path::Path::new(&home)
         .file_name()
@@ -161,7 +142,6 @@ fn install_macos() -> Result<()> {
         .with_context(|| format!("writing {}", plist_path.display()))?;
     println!("    plist   {}", short(&plist_path));
 
-    // Idempotent: unload first (ignore failure when not loaded).
     let _ = launchctl_quiet(&[OsStr::new("unload"), plist_path.as_os_str()]);
     run("launchctl", [OsStr::new("load"), plist_path.as_os_str()])?;
     println!("    launchd loaded (label: {LAUNCHD_LABEL})");
@@ -194,8 +174,6 @@ fn install_linux() -> Result<()> {
     println!("    logs    journalctl --user -u tebis -f");
     Ok(())
 }
-
-// ---------- uninstall ----------
 
 pub fn uninstall() -> Result<()> {
     println!();
@@ -244,8 +222,6 @@ fn uninstall_macos() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn uninstall_linux() -> Result<()> {
-    // `disable --now` handles both stopping and removing from the
-    // wanted-by target. Tolerate failure (service might not be enabled).
     let _ = run_quiet(
         "systemctl",
         ["--user", "disable", "--now", SYSTEMD_UNIT_NAME],
@@ -260,8 +236,6 @@ fn uninstall_linux() -> Result<()> {
     let _ = run_quiet("systemctl", ["--user", "daemon-reload"]);
     Ok(())
 }
-
-// ---------- start / stop / restart ----------
 
 pub fn start() -> Result<()> {
     ensure_installed()?;
@@ -284,15 +258,11 @@ pub fn stop() -> Result<()> {
     Ok(())
 }
 
-/// Stop-then-start the installed service. Useful after editing the env
-/// file. Idempotent: a not-running service just starts.
 pub fn restart() -> Result<()> {
     ensure_installed()?;
     #[cfg(target_os = "macos")]
     {
-        // `launchctl kickstart -k` stops and restarts the job atomically.
-        // SAFETY: `getuid(2)` is async-signal-safe and infallible — it
-        // reads the process's own real uid with no pointer arguments.
+        // SAFETY: `getuid(2)` is async-signal-safe and infallible.
         let user_domain = format!("gui/{}", unsafe { libc::getuid() });
         let target = format!("{user_domain}/{LAUNCHD_LABEL}");
         run("launchctl", ["kickstart", "-k", target.as_str()])?;
@@ -303,8 +273,6 @@ pub fn restart() -> Result<()> {
     Ok(())
 }
 
-// ---------- status ----------
-
 pub fn status() -> Result<()> {
     println!();
     #[cfg(target_os = "macos")]
@@ -314,9 +282,6 @@ pub fn status() -> Result<()> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     bail!("unsupported platform");
 
-    // Foreground-lock status, independent of the service. Reports when a
-    // `tebis` invoked directly (not via launchd/systemd) holds the
-    // single-instance lock.
     let lock_path = lockfile::default_path();
     match lockfile::active_holder(&lock_path) {
         Some(pid) => println!("  Foreground  {} (pid {pid})", style("running").green()),
@@ -338,7 +303,6 @@ fn status_macos() -> Result<()> {
         }
     );
     if installed {
-        // `launchctl list LABEL` exits 0 if loaded, non-zero otherwise.
         let loaded = Command::new("launchctl")
             .args(["list", LAUNCHD_LABEL])
             .output()
@@ -383,8 +347,6 @@ fn status_linux() -> Result<()> {
     Ok(())
 }
 
-/// True when tebis is running as a background service. Used by the
-/// foreground `tebis` to warn about double-pollers.
 #[cfg(target_os = "macos")]
 pub fn is_running() -> bool {
     Command::new("launchctl")
@@ -405,8 +367,6 @@ pub fn is_running() -> bool {
 pub fn is_running() -> bool {
     false
 }
-
-// ---------- helpers ----------
 
 fn ensure_installed() -> Result<()> {
     #[cfg(target_os = "macos")]
@@ -438,7 +398,6 @@ fn systemd_unit_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".config/systemd/user/tebis.service"))
 }
 
-/// Replace `$HOME` prefix with `~` for compact display.
 fn short(p: &Path) -> String {
     let s = p.display().to_string();
     if let Ok(home) = env::var("HOME")
@@ -483,9 +442,7 @@ fn launchctl_quiet(args: &[&OsStr]) -> Result<()> {
     run_quiet("launchctl", args.iter().copied())
 }
 
-/// Refuse to touch the service when a foreground tebis holds the
-/// single-instance lock. Installing / starting on top of it would create
-/// two pollers fighting for the same bot token (409 Conflict loop).
+/// Avoid the two-poller 409 loop when a foreground tebis already holds the lock.
 fn refuse_if_foreground_running(verb: &str) -> Result<()> {
     let lock_path = lockfile::default_path();
     if let Some(pid) = lockfile::active_holder(&lock_path) {

@@ -1,8 +1,4 @@
-//! Session state: default target, autostart config, and the lock that
-//! serializes lazy-provisioning.
-//!
-//! Recovery: `clear_target_if` drops the cache when tmux reports
-//! `NotFound`; the next plain-text message re-enters `resolve_or_autostart`.
+//! Default-target + autostart + provisioning lock + hooked-session tracking.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -19,8 +15,7 @@ pub struct AutostartConfig {
     pub command: String,
 }
 
-/// Post-spawn sleep: Claude Code's Ink/React TUI takes ~1–2 s to accept
-/// input. Keystrokes sent before that are silently dropped.
+/// Claude Code's Ink/React TUI drops input for ~1–2 s after spawn.
 const TUI_BOOT_DELAY: Duration = Duration::from_secs(3);
 
 pub struct SessionState {
@@ -28,10 +23,6 @@ pub struct SessionState {
     autostart: Option<AutostartConfig>,
     autostart_lock: tokio::sync::Mutex<()>,
     hooks_mode: HooksMode,
-    /// Sessions whose project dir has tebis-managed agent hooks
-    /// installed. Reply delivery for those sessions comes via the
-    /// hook → UDS path, so `bridge::handle_update` skips pane-settle
-    /// for them.
     hooked_sessions: Mutex<HashSet<String>>,
 }
 
@@ -46,8 +37,6 @@ impl SessionState {
         }
     }
 
-    /// Record that hooks were installed for `session` (reply will arrive
-    /// via the hook path; suppress pane-settle).
     pub fn mark_hooked(&self, session: &str) {
         self.hooked_sessions
             .lock()
@@ -55,9 +44,6 @@ impl SessionState {
             .insert(session.to_string());
     }
 
-    /// Drop `session` from the hooked set — used by `/kill` / `/restart`
-    /// so a re-spawned bare session doesn't inherit a false
-    /// "already hooked" flag and suppress pane-settle incorrectly.
     pub fn unmark_hooked(&self, session: &str) {
         self.hooked_sessions
             .lock()
@@ -65,8 +51,6 @@ impl SessionState {
             .remove(session);
     }
 
-    /// True when `session` has tebis-installed hooks. Cheap lookup on
-    /// the hot path of every plain-text message.
     #[must_use]
     pub fn is_hooked(&self, session: &str) -> bool {
         self.hooked_sessions
@@ -75,7 +59,6 @@ impl SessionState {
             .contains(session)
     }
 
-    /// Owned snapshot so the caller can drop the guard before any `.await`.
     pub fn target(&self) -> Option<String> {
         self.lock_target().clone()
     }
@@ -84,8 +67,7 @@ impl SessionState {
         *self.lock_target() = Some(session);
     }
 
-    /// Clear only if the target still points at `session` — prevents a
-    /// handler stomping on a concurrent `/target` swap.
+    /// Compare-and-clear so a NotFound handler doesn't stomp a concurrent `/target`.
     pub fn clear_target_if(&self, session: &str) {
         let mut guard = self.lock_target();
         if guard.as_deref() == Some(session) {
@@ -97,15 +79,9 @@ impl SessionState {
         self.autostart.as_ref().map(|a| a.session.as_str())
     }
 
-    /// Resolve the plain-text target, provisioning the autostart session if
-    /// no target is set. `autostart_lock` serializes provisioning so two
-    /// concurrent messages don't race the TUI-boot sleep.
-    ///
-    /// Hook install happens *outside* the lock: it's per-project-dir
-    /// (idempotent atomic write) and has no ordering dependency with
-    /// concurrent messages. Holding the lock across `try_install_hooks`
-    /// would serialize disk I/O behind every first-message provisioning
-    /// for no correctness win.
+    /// Invariant 14: `autostart_lock` serializes provisioning so concurrent
+    /// messages don't race the TUI-boot sleep. Hook install runs outside
+    /// the lock — it's idempotent and has no ordering dep.
     pub async fn resolve_or_autostart(&self, tmux: &Tmux) -> Result<String, ResolveError> {
         if let Some(existing) = self.target() {
             return Ok(existing);
@@ -115,23 +91,15 @@ impl SessionState {
             return Err(ResolveError::NoTarget);
         };
 
-        // Install hooks *before* new_session so Claude / Copilot see them
-        // on first read. If we raced another first-message and they won,
-        // we'll return from the lock re-check below before wasting a
-        // send_keys — the install cost was one JSON read + zero writes
-        // (atomic_write_0600 is a no-op when content matches).
         let hooked = self.try_install_hooks(auto).await;
 
         let _guard = self.autostart_lock.lock().await;
 
-        // Re-check under the lock in case another task just finished.
         if let Some(existing) = self.target() {
             return Ok(existing);
         }
 
-        // `has_session` / `new_session` is a TOCTOU window; fold
-        // `AlreadyExists` into success and skip the boot sleep (the TUI
-        // is presumed up if the session pre-existed).
+        // `has_session`/`new_session` is a TOCTOU window; fold `AlreadyExists` into success.
         let we_provisioned = if tmux.has_session(&auto.session).await? {
             false
         } else {
@@ -154,21 +122,13 @@ impl SessionState {
             }
         };
 
-        // If we provisioned and the session is already gone, the command
-        // died during the boot window — surface that clearly instead of
-        // letting send_keys fail with a misleading NotFound.
+        // If the session died during the boot window, say so explicitly.
         if we_provisioned && !tmux.has_session(&auto.session).await? {
             return Err(ResolveError::AutostartCommandDied(auto.command.clone()));
         }
 
-        // Mark or unmark hooked before publishing the target so no
-        // observer ever sees an inconsistent `(target, is_hooked)`
-        // pair. The `else` branch is load-bearing: on a re-provision
-        // after a failed hook install (disk full, EACCES,
-        // `TELEGRAM_HOOKS_MODE=off` after a prior `auto` run), a stale
-        // `is_hooked == true` would make `bridge::mod::handle_sent`
-        // suppress pane-settle and only show 20 s of `HOOK_TYPING_CAP`
-        // before silence.
+        // `else` branch is load-bearing: a re-provision after hook install
+        // failure must clear a stale `is_hooked` or pane-settle stays suppressed.
         if hooked {
             self.mark_hooked(&auto.session);
         } else {
@@ -178,21 +138,13 @@ impl SessionState {
         Ok(auto.session.clone())
     }
 
-    /// Install agent-native hooks for this autostart, if enabled and the
-    /// command resolves to a known agent. Returns `true` when installed
-    /// (caller should `mark_hooked`). All error paths log-and-return
-    /// false so pane-settle takes over transparently.
-    ///
-    /// Filesystem work happens inside `spawn_blocking` so a slow disk
-    /// (SMB, full `NVMe`) never stalls the tokio runtime.
+    /// Returns `true` when hooks were installed. Any error falls through to
+    /// pane-settle via `false`. Filesystem I/O runs under `spawn_blocking`.
     async fn try_install_hooks(&self, auto: &AutostartConfig) -> bool {
         if self.hooks_mode != HooksMode::Auto {
             return false;
         }
         let Some(kind) = AgentKind::detect(&auto.command) else {
-            // User explicitly opted into HOOKS_MODE=auto — they deserve
-            // an info-level log when we can't oblige, not a quiet debug
-            // line that only shows with RUST_LOG=debug.
             tracing::info!(
                 command = %auto.command,
                 "TELEGRAM_HOOKS_MODE=auto but autostart command is not a recognized agent \
@@ -200,12 +152,7 @@ impl SessionState {
             );
             return false;
         };
-        // Legacy-hook warning for upgraders whose settings.local.json
-        // still references a pre-Phase-2 repo-checkout path. Without
-        // this, installing a second (data-dir-rooted) entry silently
-        // doubles every delivery. The CLI prints the same warning to
-        // stderr; for the autostart path we log at warn so it surfaces
-        // in journalctl / the tebis log even under launchd.
+        // Warn about pre-Phase-2 repo-path entries that would double-deliver.
         if matches!(kind, AgentKind::Claude) {
             let legacy = agent_hooks::legacy::scan_claude(Path::new(&auto.dir));
             if !legacy.is_empty() {
@@ -237,9 +184,6 @@ impl SessionState {
                     events = ?report.events,
                     "hooks installed for autostart session"
                 );
-                // Also surface on the terminal so interactive users see
-                // that tebis wrote into their project dir (P0-3 from
-                // the UX review).
                 if console::Term::stdout().is_term() {
                     eprintln!(
                         "  {}  installed {} hooks in {}",
@@ -260,8 +204,7 @@ impl SessionState {
         }
     }
 
-    /// For `/read [session]` etc. Explicit arg wins; otherwise default
-    /// target. Never provisions.
+    /// Explicit arg wins, otherwise default target. Never provisions.
     pub fn resolve_explicit(&self, explicit: Option<String>) -> Result<String, ResolveError> {
         if let Some(s) = explicit {
             return Ok(s);

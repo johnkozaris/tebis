@@ -266,10 +266,8 @@ pub fn is_valid_session_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
-/// Classify tmux stderr into a typed error. `send-keys` reports "can't find
-/// pane"; most other subcommands report "can't find session" — both fold
-/// into `NotFound`. `session` is the bare name so user-facing strings never
-/// leak the `=NAME` prefix.
+/// `send-keys` says "can't find pane"; others say "can't find session".
+/// Both fold into `NotFound`.
 fn classify_status(output: &std::process::Output, op: &'static str, session: &str) -> Result<()> {
     if output.status.success() {
         return Ok(());
@@ -295,7 +293,6 @@ fn classify_status(output: &std::process::Output, op: &'static str, session: &st
     })
 }
 
-/// Strip the `=` that `new-session` echoes back in "duplicate session: =NAME".
 fn strip_equals_prefix(stderr: &str) -> std::borrow::Cow<'_, str> {
     if stderr.contains(": =") {
         std::borrow::Cow::Owned(stderr.replace(": =", ": "))
@@ -304,7 +301,6 @@ fn strip_equals_prefix(stderr: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// 5 s bound; on timeout the child is dropped and `kill_on_drop` sends SIGKILL.
 async fn run_tmux(op: &'static str, args: &[&str]) -> Result<std::process::Output> {
     let child = Command::new("tmux")
         .args(args)

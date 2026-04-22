@@ -1,8 +1,4 @@
 //! `espeak-ng` detection, package-manager probe, interactive install.
-//!
-//! Two callers: the wizard (`step_tts`, interactive) and the audio
-//! subsystem (startup probe, non-interactive — fail-open to text-only
-//! if missing).
 
 use std::path::PathBuf;
 use std::process::Command;

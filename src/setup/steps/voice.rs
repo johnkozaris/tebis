@@ -41,15 +41,13 @@ pub(in crate::setup) fn step_voice(
         }));
     }
 
-    // Pull labeled options from the manifest so upstream model
-    // additions don't require a wizard change.
     let manifest = audio::manifest::get();
     let mut choices: Vec<(String, String)> = manifest
         .stt_models
         .iter()
         .map(|(k, m)| (k.clone(), m.display_name.clone()))
         .collect();
-    // Show the default first so hitting Enter picks the 148 MB base.en.
+    // Default model first so Enter picks it.
     choices.sort_by_key(|(k, _)| !manifest.stt_models.get(k).is_some_and(|m| m.default));
 
     let existing_key = existing.and_then(|v| {

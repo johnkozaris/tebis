@@ -6,8 +6,7 @@ use std::path::Path;
 use super::{Autostart, HooksChoice, TtsChoice, VoiceChoice};
 use crate::env_file;
 
-/// Previously-saved values extracted from the env file. Every field is
-/// `Option` so a missing or partial file falls through to fresh defaults.
+/// Pre-fill values from an existing env file; missing → fresh defaults.
 #[derive(Default)]
 pub(super) struct Discovered {
     pub(super) bot_token: Option<String>,
@@ -20,10 +19,7 @@ pub(super) struct Discovered {
     pub(super) tts: Option<TtsChoice>,
 }
 
-/// Parse `KEY=VALUE` lines. Comments (`#`) and blank lines skipped;
-/// unknown keys ignored; malformed integer values silently fall back
-/// to `None`. Uses [`env_file::parse_kv_line`] so `export FOO=bar` and
-/// quoted values round-trip identically with the `load_env_file` path.
+/// Parse an env file via [`env_file::parse_kv_line`]. Unknown / malformed keys → `None`.
 pub(super) fn discover(env_path: &Path) -> Discovered {
     let Ok(content) = fs::read_to_string(env_path) else {
         return Discovered::default();
@@ -35,9 +31,7 @@ pub(super) fn discover(env_path: &Path) -> Discovered {
     let mut stt_enabled: Option<bool> = None;
     let mut stt_model: Option<String> = None;
 
-    // TTS parsing — new env layout. We collect raw values and build the
-    // TtsChoice variant at the end so ordering in the file doesn't
-    // matter.
+    // Raw values collected first so file-line order doesn't matter.
     let mut tts_backend: Option<String> = None;
     let mut legacy_tts_on: Option<bool> = None;
     let mut tts_voice: Option<String> = None;
@@ -86,7 +80,7 @@ pub(super) fn discover(env_path: &Path) -> Discovered {
                 d.hooks_mode = match value.trim().to_ascii_lowercase().as_str() {
                     "auto" | "on" | "true" | "1" | "yes" => Some(HooksChoice::Auto),
                     "off" | "false" | "0" | "no" | "" => Some(HooksChoice::Off),
-                    _ => None, // unknown → let the wizard prompt fresh
+                    _ => None,
                 };
             }
             "TELEGRAM_STT" => {
@@ -138,18 +132,11 @@ pub(super) fn discover(env_path: &Path) -> Discovered {
     if let Some(enabled) = stt_enabled {
         d.voice = Some(VoiceChoice {
             enabled,
-            // Honor the existing model if the user picked one; otherwise
-            // leave it empty and let `step_voice` fall through to the
-            // manifest default.
             model: stt_model.unwrap_or_default(),
         });
     }
 
-    // Resolve TTS choice. Priority:
-    //   1. Explicit TELEGRAM_TTS_BACKEND → use that.
-    //   2. Legacy `TELEGRAM_TTS=on` (pre-v2 env files) → interpret as
-    //      Say (macOS) / unknown (Linux falls through to None).
-    //   3. Nothing set → None (wizard starts fresh on the TTS step).
+    // Priority: explicit BACKEND → legacy `TELEGRAM_TTS=on` (Say) → None.
     d.tts = resolve_tts_choice(
         tts_backend.as_deref(),
         legacy_tts_on,
@@ -181,10 +168,6 @@ fn resolve_tts_choice(
     let backend_kind = match backend {
         Some(s) => s,
         None => {
-            // Legacy path — if the old TELEGRAM_TTS toggle was set,
-            // interpret it: `on` → Say (the only backend that existed
-            // in Phase 4a), `off` → TtsChoice::Off. Unset → no
-            // discovery (wizard prompts fresh).
             return match legacy_on {
                 Some(true) => Some(TtsChoice::Say {
                     voice: voice.unwrap_or_else(|| "Samantha".to_string()),
@@ -208,9 +191,7 @@ fn resolve_tts_choice(
             respond_to_all,
         }),
         "kokoro-remote" | "kokoro_remote" | "remote" => {
-            // URL is the only hard requirement; without it, fall back
-            // to None so the wizard surfaces a fresh prompt instead of
-            // pre-filling a broken config.
+            // URL is hard-required; otherwise surface a fresh prompt.
             let url = remote_url?;
             Some(TtsChoice::KokoroRemote {
                 url,
@@ -222,7 +203,7 @@ fn resolve_tts_choice(
                 respond_to_all,
             })
         }
-        _ => None, // unknown backend — let wizard prompt fresh
+        _ => None,
     }
 }
 
@@ -385,9 +366,6 @@ INSPECT_PORT=51624
 
     #[test]
     fn discover_remote_without_url_returns_none() {
-        // Explicit kokoro-remote backend but missing URL — we refuse
-        // to pre-fill a broken config. Wizard falls through to a fresh
-        // prompt on the TTS step.
         let tmp = std::env::temp_dir()
             .join(format!("tebis-discover-tts-noremote-{}.env", std::process::id()));
         fs::write(&tmp, "TELEGRAM_TTS_BACKEND=kokoro-remote\n").unwrap();
@@ -398,9 +376,6 @@ INSPECT_PORT=51624
 
     #[test]
     fn discover_legacy_tts_on_interpreted_as_say() {
-        // Pre-v2 env files used `TELEGRAM_TTS=on` (no backend selector).
-        // Re-running the wizard must recognize this and offer Say as
-        // the prefilled default instead of treating it as "nothing set."
         let tmp = std::env::temp_dir()
             .join(format!("tebis-discover-legacy-{}.env", std::process::id()));
         fs::write(
@@ -441,8 +416,6 @@ INSPECT_PORT=51624
             d.bot_token.as_deref(),
             Some("123:ABCdefGHIjklMNOpqrSTUvwxYZ-1234567890_abcd")
         );
-        // Autostart isn't built (only 1 of 3 keys), but the parser
-        // successfully handled both `export` and matched quotes above.
         let _ = fs::remove_file(&tmp);
     }
 }

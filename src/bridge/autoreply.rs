@@ -1,25 +1,5 @@
-//! TUI-agnostic reply detection: poll the tmux pane, and when its
-//! normalized content hash is stable for `stable_duration`, send the
-//! **delta since baseline** (or a tail if no baseline) back to Telegram.
-//!
-//! Why this exists: the hook-based path (Claude Code's `Stop` hook) gives
-//! a pinpoint "reply finished" signal but requires per-agent integration.
-//! This path needs nothing — if the agent's a TUI in a tmux pane, the
-//! pane's rendered buffer is the only input.
-//!
-//! UX details:
-//!
-//! - A sub-task sends `sendChatAction=typing` on a 4-second loop so the
-//!   chat shows "typing…" until the final message lands.
-//! - We diff the settled capture against a baseline captured *before* the
-//!   send, so the user sees only what's new — not the agent's whole
-//!   scrollback plus banner.
-//! - Normalization strategy for settle-detection: strip Braille Pattern
-//!   codepoints (U+2800..U+28FF — Ink/React TUI spinners) and C0/C1
-//!   control chars, collapse whitespace runs, trim. Two rapid snapshots
-//!   of an idle Claude UI hash equal even while the cursor blinks; a
-//!   Claude UI streaming tokens hashes differently because alphanumeric
-//!   content is actually changing.
+//! Pane-settle reply detection. Normalization strips Braille spinners
+//! (U+2800..U+28FF) + C0/C1 + collapses whitespace so idle frames hash equal.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -33,24 +13,13 @@ use super::typing::TypingGuard;
 use crate::telegram::TelegramClient;
 use crate::tmux::Tmux;
 
-/// Tunables for the pane-settle auto-reply. No env knobs for
-/// individual fields in v1 — a single `TELEGRAM_AUTOREPLY=off` switch
-/// disables the whole feature. Lives next to `watch_and_forward`
-/// (the sole consumer) rather than in `config.rs`, same pattern as
-/// `AutostartConfig` / `NotifyConfig`.
 #[derive(Clone)]
 pub struct AutoreplyConfig {
-    /// Minimum wait before the first capture (let `send_keys` land).
     pub min_wait: Duration,
-    /// Give-up deadline if the pane never stabilizes.
     pub max_wait: Duration,
-    /// How often to capture + hash.
     pub poll_interval: Duration,
-    /// How long the normalized hash must be unchanged to declare "settled".
     pub stable_duration: Duration,
-    /// Lines of scrollback to capture (same order as `/read`).
     pub capture_lines: usize,
-    /// Max chars of the tail we'll actually send.
     pub tail_chars: usize,
 }
 
@@ -67,17 +36,10 @@ impl Default for AutoreplyConfig {
     }
 }
 
-/// Poll the pane until content stabilizes (or the max deadline passes),
-/// then send the new content back. Intended for `tracker.spawn` — no
-/// return value, all errors are logged + swallowed.
-///
-/// `tracker` is threaded through so the typing-refresh subtask also
-/// runs on the shared `TaskTracker` (CLAUDE.md invariant 12):
-/// shutdown drains every outstanding typing loop alongside in-flight
-/// handlers.
+/// Poll → settle → send delta. Spawn on `tracker` (invariant 12).
 #[allow(
     clippy::too_many_arguments,
-    reason = "wires together tracker + tg + tmux + identifiers + baseline + cfg + shutdown; a context struct adds more code than it saves"
+    reason = "a context struct adds more code than it saves"
 )]
 pub async fn watch_and_forward(
     tracker: TaskTracker,
@@ -90,12 +52,7 @@ pub async fn watch_and_forward(
     cfg: Arc<AutoreplyConfig>,
     shutdown: CancellationToken,
 ) {
-    // Kick off the typing indicator immediately — before min_wait — so
-    // the user sees feedback within a second of sending. The guard
-    // auto-cancels on Drop, which happens at every exit below
-    // (early return on capture failure, normal completion after
-    // send_message, or max_wait timeout). Shutdown propagates via
-    // child_token so SIGTERM cancels the refresh loop immediately.
+    // Typing indicator kicks in before min_wait; RAII cancel on every exit.
     let typing = TypingGuard::start(&tracker, tg.clone(), chat_id, &shutdown);
 
     tokio::time::sleep(cfg.min_wait).await;
@@ -125,11 +82,7 @@ pub async fn watch_and_forward(
                 }
             }
             Err(e) => {
-                // Mid-watch capture failure (session killed externally,
-                // tmux server died). The user's keystroke already landed
-                // — we owe them *some* ack or they see only the fading
-                // "typing…" dots. Fall back to 👍 like the empty-tail
-                // branch below; don't swallow silently.
+                // Keystroke landed; owe the user an ack or they see only fading dots.
                 tracing::debug!(session = %session, err = %e, "autoreply: capture failed, falling back to 👍");
                 typing.cancel();
                 if let Err(re) = tg.set_message_reaction(chat_id, message_id, "👍").await {
@@ -144,20 +97,11 @@ pub async fn watch_and_forward(
         tokio::time::sleep(cfg.poll_interval).await;
     }
 
-    // Stop typing once we're ready to send. (Sending a message
-    // client-side also clears the indicator, but explicit cancel
-    // ends the refresh task immediately.)
     typing.cancel();
 
     let new_content = extract_new(baseline.as_deref(), &latest_pane);
     let tail = tail_chars(new_content.trim(), cfg.tail_chars);
     if tail.trim().is_empty() {
-        // Nothing new in the pane — but the user's command still
-        // landed (we're here because the keystroke send succeeded).
-        // Fall back to the 👍 reaction so (a) the user gets an
-        // acknowledgement, (b) the residual "typing…" indicator
-        // on the client is replaced by the reaction animation
-        // instead of silently fading after 5 s.
         tracing::debug!(session = %session, "autoreply: nothing new; reacting 👍");
         if let Err(e) = tg.set_message_reaction(chat_id, message_id, "👍").await {
             tracing::warn!(err = %e, session = %session, "autoreply: fallback reaction failed");
@@ -166,9 +110,6 @@ pub async fn watch_and_forward(
     }
     let body = format_pane_reply(&tail);
     if let Err(e) = tg.send_message(chat_id, &body).await {
-        // send_message failed — the user still deserves an ack that
-        // the command landed. Try 👍 as a last resort so the client's
-        // typing indicator doesn't just fade without any signal.
         tracing::warn!(err = %e, session = %session, "autoreply: send_message failed, trying 👍 fallback");
         if let Err(re) = tg.set_message_reaction(chat_id, message_id, "👍").await {
             tracing::warn!(
@@ -179,30 +120,18 @@ pub async fn watch_and_forward(
     }
 }
 
-/// Shared HTML-wrap for pane-captured replies. Kept private to this
-/// module since only the pane-settle path uses it.
 fn format_pane_reply(pane: &str) -> String {
     let escaped = crate::sanitize::escape_html(pane);
     crate::sanitize::wrap_and_truncate(&escaped, "<pre>", "</pre>")
 }
 
-/// Return only what's new in `after` relative to `baseline`. If no
-/// baseline (first send after autostart) or the anchor can't be located,
-/// returns `after` as-is — the later `tail_chars` truncation will handle
-/// any excess.
-///
-/// Anchor strategy: take the last few non-empty lines of the baseline
-/// (joined) and look for them in `after`. When found, everything after
-/// that point is new. This handles the Claude case well: the baseline's
-/// last line is usually the `❯` prompt or the previous response's tail,
-/// and the new content begins right after.
+/// Anchor on the last 3 non-empty baseline lines; everything after that
+/// point in `after` is new. `find` not `rfind` so a reply that echoes the
+/// anchor back (quoted prompt) doesn't strip the real content before it.
 fn extract_new(baseline: Option<&str>, after: &str) -> String {
     let Some(baseline) = baseline else {
         return after.to_string();
     };
-    // Use the last 3 non-empty baseline lines as the anchor. Fewer →
-    // higher chance of false matches (e.g. `❯` appears often); more →
-    // might not find a match if the pane scrolled.
     let anchor_lines: Vec<&str> = baseline
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -217,41 +146,26 @@ fn extract_new(baseline: Option<&str>, after: &str) -> String {
         .rev()
         .collect::<Vec<_>>()
         .join("\n");
-    // Use `find` (first match), NOT `rfind`. The baseline's last lines
-    // appear near the top of `after` (the pane grows downward as the
-    // agent replies). If the agent echoes the anchor verbatim in its
-    // new output (quoting the prompt, repeating an error, etc.),
-    // `rfind` would land inside the reply and strip the real content
-    // that preceded it. `find` anchors to the earlier occurrence —
-    // the one in the baseline portion — so everything after is new.
     after.find(&anchor).map_or_else(
         || after.to_string(),
         |pos| after[pos + anchor.len()..].to_string(),
     )
 }
 
-/// Hash a pane snapshot with animation noise filtered out. See module
-/// docs for the normalization rules.
 fn normalized_hash(s: &str) -> u64 {
-    // Collect normalized output, then trim leading/trailing whitespace
-    // and hash the result. Building the string (instead of streaming into
-    // the hasher) lets us handle the trim cleanly without lookahead.
     let mut out = String::with_capacity(s.len());
     let mut prev_ws = false;
     for c in s.chars() {
         let cp = c as u32;
-        // Skip Braille Pattern spinners.
         if (0x2800..=0x28FF).contains(&cp) {
             continue;
         }
-        // Skip C0 (except \n and \t) and C1 controls.
         if cp < 0x20 && c != '\n' && c != '\t' {
             continue;
         }
         if (0x80..=0x9F).contains(&cp) {
             continue;
         }
-        // Collapse whitespace runs to a single space.
         if c.is_whitespace() {
             if !prev_ws {
                 out.push(' ');
@@ -267,13 +181,8 @@ fn normalized_hash(s: &str) -> u64 {
     h.finish()
 }
 
-/// Keep the last `max` characters. Prepends `…` when we actually cut so
-/// the recipient can tell the view is a tail.
+/// Last `max` chars, prepending `…` when cut.
 fn tail_chars(s: &str, max: usize) -> String {
-    // `max == 0` would collapse to just "…" which is useless content
-    // in a Telegram message. Every configured call passes `tail_chars
-    // = 3000`; a zero comes only from a buggy override. Fail loud in
-    // debug, best-effort empty in release.
     debug_assert!(max > 0, "tail_chars called with max=0");
     if max == 0 {
         return String::new();
@@ -282,7 +191,6 @@ fn tail_chars(s: &str, max: usize) -> String {
     if total <= max {
         return s.to_string();
     }
-    // Walk forward until `total - i == max` chars remain.
     let skip = total - max;
     let start = s
         .char_indices()
@@ -351,7 +259,6 @@ mod tests {
 
     #[test]
     fn extract_new_falls_back_to_full_on_missing_anchor() {
-        // Baseline scrolled off — anchor can't be found in after.
         let baseline = "old content we wont find";
         let after = "completely different new content";
         assert_eq!(extract_new(Some(baseline), after), after);
@@ -359,7 +266,6 @@ mod tests {
 
     #[test]
     fn extract_new_ignores_empty_lines_in_anchor() {
-        // Baseline ends with trailing empty lines (common in tmux capture).
         let baseline = "line 1\nline 2\nlast real line\n\n\n";
         let after = "line 1\nline 2\nlast real line\n\nthe reply";
         let new = extract_new(Some(baseline), after);
@@ -367,14 +273,10 @@ mod tests {
         assert!(!new.contains("last real line"));
     }
 
-    /// Regression: if the agent's reply echoes the anchor verbatim
-    /// (e.g. quoting the prompt back), `rfind` would land inside the
-    /// reply and truncate real content. `find` anchors to the earlier
-    /// (baseline) occurrence so all the reply is returned.
+    /// Regression: reply echoes the anchor back; `find` keeps early content.
     #[test]
     fn extract_new_survives_anchor_echoed_in_reply() {
         let baseline = "prompt> run the thing\n> ";
-        // Reply quotes the "prompt> run the thing" line back.
         let after = "prompt> run the thing\n> \
                      Sure, running the thing.\n\
                      prompt> run the thing\n\

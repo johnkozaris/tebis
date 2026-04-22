@@ -1,8 +1,4 @@
 //! Inline stylesheet for the dashboard.
-//!
-//! Tokenised with CSS custom properties so the dark-mode override is
-//! one `:root {}` block. Fixed `rem`-based type scale — predictable
-//! for a dense app UI. Tabular-nums everywhere a number should align.
 
 pub(super) const CSS: &str = r#"
 :root {

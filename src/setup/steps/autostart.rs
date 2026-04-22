@@ -57,8 +57,7 @@ pub(in crate::setup) fn step_autostart(
         .interact_text()
         .context("prompt: default-agent session")?;
 
-    // No smart default for the working directory — `$HOME/Repos` would
-    // leak the operator's username to anyone watching the wizard.
+    // No smart default for dir — `$HOME/Repos` would leak the operator's username.
     println!();
     println!(
         "    {} an absolute path like {} or {}",

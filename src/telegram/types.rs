@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-// --- Response envelope ---
-
 #[derive(Debug, Deserialize)]
 pub struct ApiResponse<T> {
     pub ok: bool,
@@ -15,8 +13,6 @@ pub struct ResponseParameters {
     pub retry_after: Option<u64>,
 }
 
-// --- getMe response ---
-
 #[derive(Debug, Deserialize)]
 pub struct BotUser {
     pub id: i64,
@@ -24,9 +20,7 @@ pub struct BotUser {
     pub username: Option<String>,
 }
 
-// --- Update types ---
-// serde ignores unknown fields by default, so new Bot API additions
-// (business_connection, reactions, stories, gifts...) pass through harmlessly.
+// serde ignores unknown fields by default, so new Bot API additions pass through harmlessly.
 
 #[derive(Debug, Deserialize)]
 pub struct Update {
@@ -41,17 +35,12 @@ pub struct Message {
     pub from: Option<User>,
     pub chat: Chat,
     pub text: Option<String>,
-    /// Voice note (from microphone). Always OGG/Opus when present.
+    /// Mic voice note — always OGG/Opus.
     pub voice: Option<Voice>,
-    /// Music-file upload — different UX in Telegram clients, different
-    /// codecs possible. Tebis treats this the same as `voice` by
-    /// default (pass through STT).
+    /// User-uploaded audio file — codec varies; only OGG/Opus survives our codec layer.
     pub audio: Option<Audio>,
 }
 
-/// Voice message (mic recording). Mime type is always `"audio/ogg"`,
-/// codec always Opus — per Telegram Bot API. We still read the field
-/// so `Debug` logs show what the bot saw.
 #[derive(Debug, Deserialize)]
 pub struct Voice {
     pub file_id: String,
@@ -60,9 +49,6 @@ pub struct Voice {
     pub file_size: Option<u32>,
 }
 
-/// Music-file attachment (user-uploaded). Codec may vary (MP3, M4A,
-/// OGG/Opus, etc.). Tebis only decodes OGG/Opus, so non-Opus audio
-/// files get rejected at the codec layer.
 #[derive(Debug, Deserialize)]
 pub struct Audio {
     pub file_id: String,
@@ -72,9 +58,7 @@ pub struct Audio {
     pub file_size: Option<u32>,
 }
 
-/// Result of `getFile`. `file_path` is `None` if the file has been
-/// garbage-collected (Telegram holds them ≥ 1 hour). Maximum cloud-bot
-/// download size is 20 MiB; we enforce that client-side in `config`.
+/// Result of `getFile`. `file_path` is `None` if the file has been GC'd (~1h retention).
 #[derive(Debug, Deserialize)]
 pub struct TelegramFile {
     pub file_id: String,
@@ -98,17 +82,13 @@ pub struct Chat {
     pub id: i64,
 }
 
-// --- Request types ---
-
 #[derive(Debug, Serialize)]
 pub struct GetUpdatesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offset: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u32>,
-    /// Borrowed slice so callers can pass a `&'static` list without
-    /// allocating a `Vec<String>` per poll. Serde serializes it as a JSON
-    /// string array identically.
+    /// Static slice — no per-poll allocation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_updates: Option<&'static [&'static str]>,
 }
@@ -134,10 +114,6 @@ pub struct DeleteWebhookRequest {
     pub drop_pending_updates: Option<bool>,
 }
 
-// --- setMessageReaction (Bot API 7.0+) ---
-// Lightweight ack — react with 👍 on success, avoiding chat clutter for
-// fire-and-forget actions. Errors still fall through to a text reply.
-
 #[derive(Debug, Serialize)]
 pub struct SetMessageReactionRequest<'a> {
     pub chat_id: i64,
@@ -152,9 +128,6 @@ pub enum ReactionType<'a> {
     Emoji { emoji: &'a str },
 }
 
-// --- sendChatAction ---
-// Shows "typing…" / "recording…" in the chat. Auto-expires after ~5s
-// on Telegram's side, so refresh every 4s for a continuous indicator.
 #[derive(Debug, Serialize)]
 pub struct SendChatActionRequest<'a> {
     pub chat_id: i64,

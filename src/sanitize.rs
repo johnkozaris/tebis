@@ -1,9 +1,6 @@
-//! Sanitizers for inbound message text and captured pane output, plus the
-//! Telegram HTML escaper. Defenses against terminal-injection (dgl.cx 2023)
-//! and bidi-spoofing rendering attacks.
+//! Sanitizers + HTML escaper. Defends against terminal injection (dgl.cx
+//! 2023) and bidi-spoofing.
 
-/// Zero-width, line-break, and bidi-override codepoints — dangerous in
-/// terminals (tmux) and in Telegram's rendered HTML.
 const fn is_bidi_or_zero_width(c: char) -> bool {
     matches!(c as u32,
         0x200B..=0x200F   // ZWSP, ZWNJ, ZWJ, LRM, RLM
@@ -14,9 +11,7 @@ const fn is_bidi_or_zero_width(c: char) -> bool {
     )
 }
 
-/// Strip control chars (C0 incl. CR, DEL, C1 incl. ESC), bidi / zero-width
-/// codepoints, and trailing `;` (tmux parser quirk — tmux #1849). Cap
-/// length at 4096 bytes.
+/// Strips C0/C1/bidi/zero-width. Trailing `;` removed (tmux #1849). 4 KiB cap.
 pub fn sanitize_tmux_input(input: &str) -> String {
     let max_len = 4096;
     let truncated = if input.len() > max_len {
@@ -36,8 +31,7 @@ pub fn sanitize_tmux_input(input: &str) -> String {
     sanitized.trim_end_matches(';').to_string()
 }
 
-/// Two layers: `strip_ansi_escapes` for CSI/OSC, then a manual pass for
-/// stray control / bidi codepoints. ANSI-stripping alone is insufficient.
+/// ANSI strip + manual pass for stray control/bidi codepoints.
 pub fn sanitize_tmux_output(output: &str, max_chars: usize) -> String {
     let stripped = strip_ansi_escapes::strip_str(output);
 
@@ -63,8 +57,8 @@ pub fn sanitize_tmux_output(output: &str, max_chars: usize) -> String {
     )
 }
 
-/// Tag-content escaper for Telegram `parse_mode=HTML` (`<pre>`, `<code>`,
-/// `<b>`). Does NOT escape quotes — we never emit attribute values.
+/// Tag-content escaper for `parse_mode=HTML`. Does NOT escape quotes —
+/// we never emit attribute values.
 pub fn escape_html(text: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(text.len() + 16);
     for &byte in text.as_bytes() {
@@ -78,9 +72,8 @@ pub fn escape_html(text: &str) -> String {
     String::from_utf8(out).expect("escape_html only substitutes ASCII — output is valid UTF-8")
 }
 
-/// Wrap an already-HTML-escaped body in tags, truncating to fit Telegram's
-/// 4096-char cap (with slack). Cut is HTML-safe: avoids landing inside
-/// `&amp;`-style entities, prefers the last newline within the window.
+/// Wrap an already-escaped body, truncating to fit Telegram's 4096 cap.
+/// Cut avoids landing inside `&amp;`-style entities and prefers the last newline.
 pub fn wrap_and_truncate(escaped_body: &str, open: &str, close: &str) -> String {
     const MAX_MSG: usize = 4000;
     const TRUNC_SUFFIX: &str = "\n... (truncated)";
@@ -92,12 +85,7 @@ pub fn wrap_and_truncate(escaped_body: &str, open: &str, close: &str) -> String 
     let target = MAX_MSG.saturating_sub(overhead + TRUNC_SUFFIX.len());
     let mut cut = escaped_body.floor_char_boundary(target);
 
-    // Don't cut inside an HTML entity. `escape_html` currently emits
-    // only `&amp;` `&lt;` `&gt;` `&quot;` `&#39;` — longest is 6 chars
-    // (`&quot;`), so a window of 6 suffices. If a future change adds a
-    // longer entity (e.g. numeric `&#x1F600;` at 9 chars), BUMP THIS
-    // BOUND. Without the bump, tail-truncate could slice mid-entity
-    // and emit malformed HTML that Telegram rejects.
+    // Longest entity `escape_html` emits is `&quot;` (6). Bump if you add a longer one.
     const MAX_ENTITY_LEN: usize = 6;
     if let Some(amp) = escaped_body[..cut].rfind('&') {
         let tail = &escaped_body[amp..cut];
@@ -140,7 +128,6 @@ mod tests {
 
     #[test]
     fn strips_rtl_override() {
-        // U+202E = RLO
         assert_eq!(sanitize_tmux_input("foo\u{202E}bar"), "foobar");
     }
 
@@ -206,7 +193,6 @@ mod tests {
     #[test]
     fn wrap_and_truncate_chops_at_newline() {
         use std::fmt::Write as _;
-        // 1000 × "line_XXXX\n" ≈ 10_000 chars — clearly over the 4000 limit.
         let mut body = String::new();
         for i in 0..1000 {
             writeln!(body, "line_{i:04}").unwrap();
@@ -220,14 +206,11 @@ mod tests {
 
     #[test]
     fn wrap_and_truncate_respects_entity_boundary() {
-        // Build a body whose naive cut would land inside `&amp;`.
         let prefix = "a".repeat(3985);
         let body = format!("{prefix}&amp;tail");
         let wrapped = wrap_and_truncate(&body, "<pre>", "</pre>");
         assert!(wrapped.len() <= 4000);
-        // Must not contain a half-entity like "&am" right before the trunc marker.
         let inside = &wrapped["<pre>".len()..wrapped.len() - "</pre>".len()];
-        // Every '&' in the output must be followed by ';' within 6 chars.
         for (idx, _) in inside.match_indices('&') {
             let window_end = (idx + 6).min(inside.len());
             assert!(

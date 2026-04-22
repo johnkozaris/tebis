@@ -1,8 +1,4 @@
-//! Interactive wizard steps.
-//!
-//! One module per step. Submodules are private; public surface is
-//! the `step_*` functions re-exported here for `super::run()` to
-//! call in sequence.
+//! One module per wizard step; `super::run()` calls the re-exports in order.
 
 mod autostart;
 mod bot_token;

@@ -1,10 +1,4 @@
-//! Top-level HTML + JSON assembly for the inspect dashboard.
-//!
-//! Per-concern helpers live in sibling modules (`rows`, `settings`,
-//! `sessions_table`, `timefmt`, `css`). This file only owns:
-//! - The HTML template string for the page layout.
-//! - The JSON serialization for `/status`.
-//! - The `RenderMeta` struct and its `build_meta` populator.
+//! HTML + JSON assembly for the inspect dashboard. Helpers live in sibling modules.
 
 mod css;
 mod rows;
@@ -197,9 +191,6 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext) -> String {
     )
 }
 
-/// All numbers + formatted strings the template needs, gathered once
-/// so `format!` doesn't have to resolve each from `snapshot` / `live`
-/// under its own named arg.
 struct RenderMeta {
     uptime: String,
     dot_class: &'static str,

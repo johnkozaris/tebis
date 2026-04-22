@@ -1,14 +1,4 @@
 //! Live tmux session table with kill buttons.
-//!
-//! Row states differ by mode:
-//!
-//! **Strict**:
-//! - live + allowlisted → kill button enabled
-//! - live + not allowlisted → no action (bridge can't touch it)
-//! - allowlisted + not running → kill disabled (nothing to kill)
-//!
-//! **Permissive**:
-//! - every live session → kill button enabled, "allowlisted" badge omitted
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -50,8 +40,7 @@ pub(super) fn build_sessions_table(
             r#"<tr><td class="col-name">{escaped}</td><td>{badges}</td><td class="col-actions">{action}</td></tr>"#
         );
     }
-    // Pre-declared-but-not-running rows only make sense in strict mode
-    // — there is no fixed allowlist in permissive mode.
+    // Not-running rows exist only in strict mode — permissive has no fixed allowlist.
     if !permissive {
         let mut not_running: Vec<_> = allowed_sessions
             .iter()

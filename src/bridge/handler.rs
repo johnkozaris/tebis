@@ -1,9 +1,5 @@
-//! Command parsing and execution.
-//!
-//! Pure parser (`parse`) + executor (`execute`) that turn a Telegram message
-//! into a tmux side effect and a reply. Stale-target recovery: on
-//! `TmuxError::NotFound` we clear the cached default and, for plain-text
-//! messages, retry once via autostart.
+//! Command parser + executor. Stale-target recovery: `NotFound` clears the
+//! cached default; plain-text retries once via autostart.
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -34,16 +30,28 @@ pub enum Command {
     Status,
     Restart,
     Help,
+    /// TTS backend selection — handled by `bridge::handle_update`, not
+    /// `execute`, because writing the env file + graceful restart needs
+    /// `HandlerContext` fields that `Deps` doesn't carry.
+    Tts(TtsVerb),
     PlainText(String),
 }
 
-/// `Text` sends a reply; `ReactSuccess` reacts 👍 — lighter UX for
-/// fire-and-forget commands. `Sent` is the "text delivered to a tmux
-/// session" response: `bridge::handle_update` turns it into a typing
-/// indicator + auto-reply when enabled, or a 👍 fallback otherwise.
-/// `baseline` is the pane capture taken *before* `send_keys`, used to
-/// extract just the new content for the auto-reply (so we don't dump
-/// the agent's whole scrollback every time).
+/// What the user asked `/tts` to do. `Unknown` carries the raw argument
+/// so the reply can point at the usage line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TtsVerb {
+    Status,
+    Off,
+    Say,
+    KokoroLocal,
+    KokoroRemote,
+    Unknown(String),
+}
+
+/// `Text`: reply body. `ReactSuccess`: 👍. `Sent`: text delivered to a
+/// session, routed to typing+autoreply or 👍 by `handle_update`.
+/// `baseline` is the pre-send pane capture for diff-based autoreply.
 pub enum Response {
     Text(String),
     ReactSuccess,
@@ -59,8 +67,7 @@ pub struct Deps<'a> {
     pub started_at: Instant,
 }
 
-/// Strip `/<cmd>` followed by a space/tab separator. Returning `None` for
-/// `/cmdmore` prevents `/newt` being mistaken for `/new t`.
+/// Returns `None` on `/cmdmore` so `/newt` isn't mistaken for `/new t`.
 fn strip_cmd<'a>(text: &'a str, cmd: &str) -> Option<&'a str> {
     let after = text.strip_prefix(cmd)?;
     let rest = after
@@ -69,8 +76,7 @@ fn strip_cmd<'a>(text: &'a str, cmd: &str) -> Option<&'a str> {
     Some(rest)
 }
 
-/// Accept `=NAME` (tmux exact-match syntax) and hand back bare `NAME` —
-/// lets users paste session names out of tmux error messages.
+/// Strip `=` so users can paste `=NAME` from tmux errors.
 fn normalize_session_arg(raw: &str) -> String {
     raw.strip_prefix('=').unwrap_or(raw).to_string()
 }
@@ -131,6 +137,24 @@ pub fn parse(text: &str) -> Command {
         }
     }
 
+    // `/tts` — backend picker. `/tts` alone (or `/tts status`) reports;
+    // `/tts {off,say,kokoro-local,kokoro-remote}` switches (via env-file
+    // write + graceful restart in `bridge::handle_update`).
+    if text.eq_ignore_ascii_case("/tts") {
+        return Command::Tts(TtsVerb::Status);
+    }
+    if let Some(rest) = strip_cmd(text, "/tts") {
+        let verb = match rest.trim().to_ascii_lowercase().as_str() {
+            "" | "status" => TtsVerb::Status,
+            "off" | "none" | "disable" | "disabled" => TtsVerb::Off,
+            "say" => TtsVerb::Say,
+            "kokoro-local" | "kokoro_local" | "local" => TtsVerb::KokoroLocal,
+            "kokoro-remote" | "kokoro_remote" | "remote" => TtsVerb::KokoroRemote,
+            other => TtsVerb::Unknown(other.to_string()),
+        };
+        return Command::Tts(verb);
+    }
+
     if text.starts_with('/') {
         return Command::Help;
     }
@@ -138,8 +162,6 @@ pub fn parse(text: &str) -> Command {
     Command::PlainText(text.to_string())
 }
 
-/// Execute a command. Errors surface as Telegram-safe `Response::Text` with
-/// HTML-escaped content so tmux stderr can't break `parse_mode=HTML`.
 pub async fn execute(cmd: Command, deps: &Deps<'_>) -> Response {
     match handle(cmd, deps).await {
         Ok(r) => r,
@@ -160,6 +182,11 @@ async fn handle(cmd: Command, deps: &Deps<'_>) -> HandleResult {
         Command::Status => Ok(Response::Text(status(deps))),
         Command::Restart => restart(deps).await,
         Command::Help => Ok(Response::Text(help_text(deps.session.autostart_session()))),
+        // `/tts` is intercepted in `bridge::handle_update` — needs env-file
+        // path + shutdown token from `HandlerContext`, not `Deps`.
+        Command::Tts(_) => Ok(Response::Text(
+            "internal: /tts should be intercepted upstream".to_string(),
+        )),
         Command::PlainText(text) => plain_text(deps, &text).await,
     }
 }
@@ -193,9 +220,7 @@ async fn list(deps: &Deps<'_>) -> HandleResult {
 }
 
 async fn send(deps: &Deps<'_>, session: &str, text: &str) -> HandleResult {
-    // Snapshot the pane BEFORE the send so the auto-reply can diff
-    // against it and only forward new content. On failure, we carry
-    // `None` and the auto-reply falls back to a plain tail.
+    // Pre-send baseline so autoreply can forward only new content.
     let baseline = match deps.tmux.capture_pane(session, 100).await {
         Ok(p) => Some(p),
         Err(e) => {
@@ -214,8 +239,6 @@ async fn send(deps: &Deps<'_>, session: &str, text: &str) -> HandleResult {
         Err(e) => {
             if e.is_not_found() {
                 deps.session.clear_target_if(session);
-                // Symmetric with /kill and /restart: if the session is
-                // gone, drop the hooked flag so next autostart reinstalls.
                 deps.session.unmark_hooked(session);
             }
             Err(e.to_string())
@@ -277,9 +300,6 @@ async fn kill(deps: &Deps<'_>, session: &str) -> HandleResult {
         .await
         .map_err(|e| e.to_string())?;
     deps.session.clear_target_if(session);
-    // Forget that this session was hooked — if the user later
-    // `/new`s a bare session with the same name, pane-settle should
-    // apply, not the stale "hooks will deliver" assumption.
     deps.session.unmark_hooked(session);
     Ok(Response::ReactSuccess)
 }
@@ -316,9 +336,6 @@ async fn restart(deps: &Deps<'_>) -> HandleResult {
         .await
         .map_err(|e| e.to_string())?;
     deps.session.clear_target_if(&name);
-    // `/restart` drops the cache so the next plain-text re-runs
-    // autostart → re-installs hooks if configured. Forget the flag
-    // so the install path runs cleanly instead of short-circuiting.
     deps.session.unmark_hooked(&name);
     Ok(Response::Text(format!(
         "Killed <code>{}</code>. Next plain-text message will re-provision.",
@@ -326,12 +343,9 @@ async fn restart(deps: &Deps<'_>) -> HandleResult {
     )))
 }
 
-/// Resolve-or-autostart, send, and on `NotFound` drain + reprovision + retry
-/// once. Explicit kill before the retry breaks zombie `has_session` states.
+/// Resolve-or-autostart + send; on `NotFound` kill + reprovision + retry once.
 async fn plain_text(deps: &Deps<'_>, text: &str) -> HandleResult {
     let session = resolve_or_autostart_str(deps).await?;
-    // Baseline for diff-based auto-reply. On retry with a fresh session
-    // the baseline is `None` (nothing was there before autostart).
     let baseline = match deps.tmux.capture_pane(&session, 100).await {
         Ok(p) => Some(p),
         Err(e) => {
@@ -406,6 +420,7 @@ const HELP_BASE: &str = concat!(
     "/new &lt;session&gt; — create an empty detached tmux session\n",
     "/kill &lt;session&gt; — kill a tmux session\n",
     "/restart — kill autostart session, re-provision on next message\n",
+    "/tts [off|say|kokoro-local|kokoro-remote|status] — pick or disable voice replies\n",
     "/help — show this help\n\n",
     "Plain text is sent to the default target session. If autostart is ",
     "configured and no target is set, the first plain-text message ",
@@ -441,6 +456,7 @@ mod tests {
             Command::Status => "status",
             Command::Restart => "restart",
             Command::Help => "help",
+            Command::Tts(_) => "tts",
             Command::PlainText(_) => "plain",
         }
     }
@@ -480,6 +496,42 @@ mod tests {
     #[test]
     fn send_without_text_falls_through_to_help() {
         assert_eq!(kind(&parse("/send mysession")), "help");
+    }
+
+    #[test]
+    fn tts_verbs_parse() {
+        fn verb(cmd: &Command) -> &TtsVerb {
+            match cmd {
+                Command::Tts(v) => v,
+                c => panic!("expected Tts, got {}", kind(c)),
+            }
+        }
+        assert_eq!(verb(&parse("/tts")), &TtsVerb::Status);
+        assert_eq!(verb(&parse("/TTS")), &TtsVerb::Status);
+        assert_eq!(verb(&parse("/tts status")), &TtsVerb::Status);
+        assert_eq!(verb(&parse("/tts off")), &TtsVerb::Off);
+        assert_eq!(verb(&parse("/tts OFF")), &TtsVerb::Off);
+        assert_eq!(verb(&parse("/tts none")), &TtsVerb::Off);
+        assert_eq!(verb(&parse("/tts disable")), &TtsVerb::Off);
+        assert_eq!(verb(&parse("/tts say")), &TtsVerb::Say);
+        assert_eq!(verb(&parse("/tts kokoro-local")), &TtsVerb::KokoroLocal);
+        assert_eq!(verb(&parse("/tts kokoro_local")), &TtsVerb::KokoroLocal);
+        assert_eq!(verb(&parse("/tts local")), &TtsVerb::KokoroLocal);
+        assert_eq!(verb(&parse("/tts kokoro-remote")), &TtsVerb::KokoroRemote);
+        assert_eq!(verb(&parse("/tts remote")), &TtsVerb::KokoroRemote);
+        // Unknown verbs round-trip their arg so the reply can cite it.
+        match verb(&parse("/tts banana")) {
+            TtsVerb::Unknown(arg) => assert_eq!(arg, "banana"),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ttsextra_suffix_is_not_tts() {
+        // `/ttsextra` must not be mistaken for `/tts` with arg `extra`.
+        // strip_cmd requires a whitespace separator; without one we hit
+        // the generic `/` fallback → Help.
+        assert_eq!(kind(&parse("/ttsextra")), "help");
     }
 
     #[test]
@@ -524,7 +576,6 @@ mod tests {
         assert_eq!(kind(&parse("/kill")), "help");
     }
 
-    /// Regression: bare-prefix matching would treat `/newt` as `/new t`.
     #[test]
     fn newt_is_not_new() {
         assert_eq!(kind(&parse("/newt")), "help");
@@ -556,7 +607,6 @@ mod tests {
         }
     }
 
-    /// Users who see `=name` in a tmux error should be able to paste it back.
     #[test]
     fn equals_prefix_stripped_from_user_args() {
         match parse("/kill =demo") {

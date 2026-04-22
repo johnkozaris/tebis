@@ -1,8 +1,4 @@
-//! `tebis hooks {install,uninstall,status}` — manual hook management.
-//!
-//! Lets users pre-install hooks in a project dir they run Claude /
-//! Copilot in without going through autostart. Also the escape hatch
-//! for cleaning up after a stale install.
+//! `tebis hooks {install,uninstall,status,list,prune}` — manual hook lifecycle.
 
 use std::path::{Path, PathBuf};
 
@@ -28,7 +24,6 @@ Usage:
 `prune` drops manifest entries whose project dir has been deleted.
 ";
 
-/// Entry point: `tebis hooks <verb> [args…]`.
 pub fn run(args: &[String]) -> Result<()> {
     let verb = args.first().map(String::as_str);
     match verb {
@@ -51,11 +46,7 @@ fn install(args: &[String]) -> Result<()> {
     let parsed = parse_args(args)?;
     let dir = resolve_dir(parsed.dir.as_deref())?;
 
-    // Typos like `tebis hooks install ~/projcts/foo` would otherwise
-    // silently create the dir (via `create_dir_all` deep inside the
-    // installer) and write hooks to a phantom project root — the
-    // manifest then lists an install that will never fire. Mirror
-    // `uninstall`'s fail-loud check.
+    // Fail loud on typos so we don't write hooks into a phantom dir.
     if !dir.is_dir() {
         anyhow::bail!(
             "directory does not exist: {} — pass a valid project path or \
@@ -72,16 +63,7 @@ fn install(args: &[String]) -> Result<()> {
         })?,
     };
 
-    // Dependency probe — the hook script shells out to `jq` and `nc`
-    // inside tmux-land, silently `|| true`'ing on failure. Warning
-    // here (install-time) is the last place we can catch "hooks fire
-    // but nothing arrives because $PATH lacks jq" before the user hits
-    // confusing silence at runtime.
     warn_if_hook_deps_missing();
-
-    // Legacy detection — users who hand-installed Phase-1 hooks (repo
-    // paths in settings.local.json) will end up with duplicate deliveries
-    // unless they migrate.
     warn_if_legacy_hooks_present(&dir);
 
     let script = agent_hooks::materialize(agent)?;
@@ -120,10 +102,6 @@ fn uninstall(args: &[String]) -> Result<()> {
     let parsed = parse_args(args)?;
     let dir = resolve_dir(parsed.dir.as_deref())?;
 
-    // Non-existent project dir → bail loudly. Otherwise the per-agent
-    // `status()` call below would return empty defaults and we'd
-    // report "no tebis hooks installed" — technically correct but
-    // misleading.
     if !dir.is_dir() {
         anyhow::bail!(
             "directory does not exist: {} — pass a valid project path or \
@@ -132,10 +110,8 @@ fn uninstall(args: &[String]) -> Result<()> {
         );
     }
 
-    // Only run an agent's uninstaller when its status reports
-    // something installed. Avoids destructive side-effects (e.g. the
-    // Copilot installer pruning an empty `.github/` that the user
-    // created for a future workflow) when tebis had nothing there.
+    // Only run per-agent uninstallers when something is actually installed —
+    // avoids pruning empty user dirs like `.github/`.
     let mut total_modified = Vec::new();
     let mut total_deleted = Vec::new();
     let mut total_events = Vec::new();
@@ -312,8 +288,6 @@ fn parse_args(args: &[String]) -> Result<Args> {
     Ok(Args { dir, agent })
 }
 
-/// If the user passed `<dir>` on the CLI, expand `~` and use it. Else
-/// fall back to the autostart dir from `~/.config/tebis/env`.
 fn resolve_dir(cli: Option<&Path>) -> Result<PathBuf> {
     if let Some(p) = cli {
         return expand_tilde(p);
@@ -353,10 +327,7 @@ fn detect_agent_from_config() -> Result<Option<AgentKind>> {
         .and_then(AgentKind::detect))
 }
 
-/// Warn when the shell tools our hook scripts need aren't on PATH.
-/// The scripts `|| true` every stage, so a missing dep manifests only
-/// as silent no-op at runtime — catching it up front saves the user a
-/// confused debugging session.
+/// Warn when `jq`/`nc` aren't on PATH — hook scripts silently no-op without them.
 fn warn_if_hook_deps_missing() {
     for tool in ["jq", "nc"] {
         if !has_on_path(tool) {
@@ -378,8 +349,6 @@ fn warn_if_hook_deps_missing() {
     }
 }
 
-/// `true` when `tool` is an executable on PATH. Uses `which`'s logic
-/// but inline to avoid pulling a dependency for one check.
 fn has_on_path(tool: &str) -> bool {
     let Ok(path_var) = std::env::var("PATH") else {
         return false;
@@ -401,11 +370,8 @@ fn has_on_path(tool: &str) -> bool {
     false
 }
 
-/// Scan `.claude/settings.local.json` for hook entries whose command
-/// path looks like a pre-Phase-2 manual install (i.e. a path under a
-/// tebis repo checkout rather than `$XDG_DATA_HOME/tebis/`). Warn the
-/// user so they can remove them before Phase-2 install adds a second
-/// entry that would double-deliver.
+/// Warn about pre-Phase-2 hooks (repo-checkout paths) so the user can
+/// remove them before install adds a duplicate entry.
 fn warn_if_legacy_hooks_present(project_dir: &Path) {
     let lines = agent_hooks::legacy::scan_claude(project_dir);
     if lines.is_empty() {

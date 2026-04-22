@@ -13,8 +13,7 @@ pub(in crate::setup) fn step_bot_token(
 ) -> Result<String> {
     ui::step_header(1, "Create a Telegram bot");
 
-    // Re-run path: mask the current token and offer Y/N to keep,
-    // rather than leaking it as a prompt default.
+    // Mask the current token; don't leak it as a prompt default.
     if let Some(token) = existing
         && validate(token).is_ok()
     {
@@ -66,9 +65,7 @@ pub(in crate::setup) fn step_bot_token(
         .context("prompt: bot token")
 }
 
-/// `<digits>:<30+ [A-Za-z0-9_-]>`. Telegram has the final say — `getMe`
-/// surfaces a bad token on first launch. This cheap check catches the
-/// common paste errors.
+/// Cheap pre-check for common paste errors — `getMe` has final say.
 fn validate(s: &str) -> std::result::Result<(), &'static str> {
     let Some((head, tail)) = s.split_once(':') else {
         return Err("expected format: <digits>:<chars>");

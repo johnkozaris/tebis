@@ -1,7 +1,4 @@
-//! Dashboard `<dl>` field rows: bot identity, autostart triple, hooks,
-//! STT + TTS voice section, notify listener. Each builder returns the
-//! `<dt>…</dt><dd>…</dd>` pairs for its own row group so the page-level
-//! template stays flat `{field_rows}` interpolation.
+//! `<dl>` row builders for the dashboard.
 
 use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
@@ -76,7 +73,6 @@ pub(super) fn build_voice_rows(
 
     let mut out = String::new();
 
-    // STT.
     if let Some(model) = &v.stt_model {
         let status = if v.stt_ready {
             "<span>ready</span>"
@@ -106,7 +102,6 @@ pub(super) fn build_voice_rows(
         out.push_str(r#"<dt>Voice input</dt><dd class="muted">disabled</dd>"#);
     }
 
-    // TTS.
     if let Some(voice_name) = &v.tts_voice {
         let tts_success = metrics.tts_success.load(Ordering::Relaxed);
         let tts_failures = metrics.tts_failures.load(Ordering::Relaxed);
@@ -120,8 +115,6 @@ pub(super) fn build_voice_rows(
                 "<code>{tts_success}</code> sent · <code>{tts_failures}</code> failed · last <code>{last_ms} ms</code>",
             )
         };
-        // Backend-specific display: detail is redacted remote host or
-        // manifest model key; empty for say.
         let backend_display = match v.tts_backend {
             "say" => "macOS <code>say</code>".to_string(),
             "kokoro-local" => v.tts_detail.as_deref().map_or_else(

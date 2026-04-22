@@ -1,8 +1,4 @@
-//! `tebis setup` — interactive first-run wizard.
-//!
-//! Walks the user through creating a bot, finding their numeric user id,
-//! picking session names, and (optionally) autostart + the inspect dashboard.
-//! Writes `~/.config/tebis/env` (mode 0600).
+//! `tebis setup` — interactive first-run wizard. Writes `~/.config/tebis/env` (0600).
 
 use std::collections::HashSet;
 use std::env;
@@ -17,22 +13,12 @@ use dialoguer::{Confirm, Select};
 use crate::env_file;
 
 mod discover;
-// `pub` so `examples/kokoro-smoke.rs` can call `probe_espeak_ng` for its
-// prerequisite check. The interactive installer bits (`ensure_or_install`)
-// require a `ColorfulTheme` so are only useful from within the wizard
-// anyway, but exposing the whole module keeps the API simple.
+/// `pub` so `examples/kokoro-smoke.rs` can call `probe_espeak_ng`.
 pub mod phonemizer;
 mod steps;
 mod ui;
 
-/// Keys the wizard actively manages — any of these present in an
-/// existing env file gets replaced by the wizard's new values. Every
-/// other key is preserved verbatim so users don't lose hand-added
-/// settings (`TELEGRAM_HOOKS_MODE`, `TELEGRAM_NOTIFY`, etc.) when they
-/// re-run `tebis setup`.
-/// Static keys the wizard always manages. TTS is now cross-platform —
-/// every host picks a backend (even if it's `none`), so the old
-/// macOS-only split is gone.
+/// Keys the wizard rewrites on every run. Everything else is preserved verbatim.
 const WIZARD_MANAGED_KEYS_ALWAYS: &[&str] = &[
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_ALLOWED_USER",
@@ -43,11 +29,9 @@ const WIZARD_MANAGED_KEYS_ALWAYS: &[&str] = &[
     "INSPECT_PORT",
     "BRIDGE_ENV_FILE",
     "TELEGRAM_HOOKS_MODE",
-    // STT is cross-platform — wizard always owns these.
     "TELEGRAM_STT",
     "TELEGRAM_STT_MODEL",
-    // TTS: new backend-picker keys. Legacy `TELEGRAM_TTS` (boolean) is
-    // also included so the parser retires it cleanly on re-run.
+    // Legacy boolean `TELEGRAM_TTS` listed so re-runs retire it cleanly.
     "TELEGRAM_TTS",
     "TELEGRAM_TTS_BACKEND",
     "TELEGRAM_TTS_VOICE",
@@ -64,46 +48,33 @@ fn wizard_managed_keys() -> impl Iterator<Item = &'static str> {
     WIZARD_MANAGED_KEYS_ALWAYS.iter().copied()
 }
 
-/// Autostart triple. Shared between the step that collects it and the
-/// discover pass that reloads it from an existing env file.
 pub(super) struct Autostart {
     pub(super) session: String,
     pub(super) dir: String,
     pub(super) command: String,
 }
 
-/// Voice / STT wizard choice. Only local whisper.cpp is offered.
 #[derive(Clone, Debug)]
 pub(super) struct VoiceChoice {
     pub(super) enabled: bool,
-    /// Key from `audio::manifest.stt_models` — only meaningful when `enabled`.
+    /// Key from `audio::manifest.stt_models`.
     pub(super) model: String,
 }
 
-/// Voice replies (TTS) wizard choice. Backend-tagged enum matching
-/// the runtime [`crate::audio::tts::BackendConfig`] shape, minus the
-/// secrecy wrapper on the API key (the wizard holds a plain `String`
-/// briefly during input capture and env-file write; the daemon re-
-/// wraps it in `SecretString` when loading the env file at startup).
+/// Wizard-side mirror of [`crate::audio::tts::BackendConfig`].
 #[derive(Clone, Debug)]
 pub(super) enum TtsChoice {
-    /// Text-only replies (TTS disabled). Written as
-    /// `TELEGRAM_TTS_BACKEND=none` so a re-run sees the explicit
-    /// choice instead of bouncing back to the default.
+    /// Written as `TELEGRAM_TTS_BACKEND=none`.
     Off,
-    /// macOS `say` shell-out.
     Say {
         voice: String,
         respond_to_all: bool,
     },
-    /// Local Kokoro ONNX via espeak-ng. Manifest key + voice.
     KokoroLocal {
         model: String,
         voice: String,
         respond_to_all: bool,
     },
-    /// Remote OpenAI-compatible TTS endpoint. See
-    /// [`crate::audio::tts::BackendConfig::Remote`] for field semantics.
     KokoroRemote {
         url: String,
         api_key: Option<String>,
@@ -116,8 +87,6 @@ pub(super) enum TtsChoice {
 }
 
 impl TtsChoice {
-    /// Whether every text reply should also be a voice reply.
-    /// `false` for `Off`.
     pub(super) const fn respond_to_all(&self) -> bool {
         match self {
             Self::Off => false,
@@ -127,8 +96,7 @@ impl TtsChoice {
         }
     }
 
-    /// User-visible voice name, or empty for `Off`. Used by
-    /// [`ui::print_summary`] and the step-default pre-fill helper.
+    /// User-visible voice name, or empty for `Off`.
     pub(super) fn voice_display(&self) -> &str {
         match self {
             Self::Off => "",
@@ -139,15 +107,10 @@ impl TtsChoice {
     }
 }
 
-/// What the caller should do after `run()` returns. Separates wizard
-/// (interactive, blocking) from service-management (needs tokio for
-/// `RunForeground`) so `fn main` can dispatch cleanly.
+/// What the caller should do after `run()` returns.
 pub enum Next {
-    /// Nothing more — the wizard printed instructions for manual start.
     Exit,
-    /// Load the env file into this process and start the foreground daemon.
     RunForeground,
-    /// Install as a background service via `crate::service::install`.
     Install,
 }
 
@@ -207,8 +170,6 @@ pub fn run() -> Result<Next> {
         return Ok(Next::Exit);
     }
 
-    // Preserve any user-managed keys (NOTIFY, AUTOREPLY, etc.) from an
-    // existing env file so re-running the wizard never silently drops them.
     let extras = extra_lines_to_preserve(&env_path);
     let mut content = build_env_file(
         &token,
@@ -231,10 +192,7 @@ pub fn run() -> Result<Next> {
 
     if env_path.exists() {
         let bak = backup_path(&env_path);
-        // `fs::copy` truncates then writes — a crash between truncate and
-        // write leaves a torn .bak the user might later restore from.
-        // Atomic-write via our shared helper so the backup inherits the
-        // same 0600 + fsync + rename guarantees as the primary file.
+        // Atomic backup via the shared helper — `fs::copy` could tear mid-write.
         let existing = fs::read_to_string(&env_path)
             .with_context(|| format!("reading {} for backup", env_path.display()))?;
         env_file::atomic_write_0600(&bak, &existing)
@@ -251,9 +209,7 @@ fn prompt_next_action(
     env_path: &Path,
     inspect_port: Option<u16>,
 ) -> Result<Next> {
-    // If a background service is already running, the env changes we
-    // just wrote won't take effect until restart. Offer a one-shot
-    // restart rather than leave the user with mysteriously stale behavior.
+    // Service already running — new env won't apply until restart.
     if crate::service::is_running() {
         ui::section_divider("Service restart");
         ui::note_warn(
@@ -433,15 +389,9 @@ fn build_env_file(
     out
 }
 
-/// Read the existing env file and return every line that sets a key
-/// NOT in the wizard-managed set (see [`wizard_managed_keys`]). These
-/// are user-added settings
-/// (`TELEGRAM_NOTIFY`, `TELEGRAM_AUTOREPLY`, `NOTIFY_CHAT_ID`, etc.) we
-/// must not silently drop when the wizard rewrites the file.
-///
-/// Comments and blank lines adjacent to preserved keys are kept in
-/// order (a blank between two preserved keys survives, but a blank
-/// inside a wizard-managed block is dropped — simplest sound policy).
+/// Lines for keys NOT in the wizard-managed set — preserved so user-added
+/// settings (`TELEGRAM_NOTIFY`, `TELEGRAM_AUTOREPLY`, …) survive re-runs.
+/// Comments and blanks are dropped; the wizard emits its own headers.
 fn extra_lines_to_preserve(env_path: &Path) -> Vec<String> {
     let Ok(content) = fs::read_to_string(env_path) else {
         return Vec::new();
@@ -452,15 +402,11 @@ fn extra_lines_to_preserve(env_path: &Path) -> Vec<String> {
         .filter_map(|line| match env_file::parse_kv_line(line) {
             Some((k, _)) if managed.contains(k) => None,
             Some(_) => Some(line.to_string()),
-            // Keep comments and blanks only if they're near a preserved
-            // key — simpler: drop them. Users who want comments can add
-            // them back. The wizard emits its own comment headers.
             None => None,
         })
         .collect()
 }
 
-/// Where the user landed on the hooks-mode question.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HooksChoice {
     Auto,
@@ -475,8 +421,7 @@ fn backup_path(env_path: &Path) -> PathBuf {
     env_path.with_file_name(format!("{name}.bak"))
 }
 
-/// Expand `~` / `~/…`, trim whitespace + trailing slashes. Tilde without
-/// `$HOME` is left as-is so the caller sees a clear error downstream.
+/// Expand `~` / `~/…`, trim whitespace + trailing slashes.
 fn normalize_dir(s: &str) -> String {
     let trimmed = s.trim().trim_end_matches('/');
     if trimmed == "~" {
@@ -512,8 +457,7 @@ mod tests {
         assert_eq!(tmp, Path::new("/tmp/tebis/env.tmp"));
     }
 
-    /// Merged into one test — `env::set_var` is process-wide and cargo
-    /// test is multi-threaded by default; two `#[test]`s would race on $HOME.
+    /// Single test because `env::set_var` is process-wide.
     #[test]
     fn normalize_dir_all_shapes() {
         let prior = env::var("HOME").ok();

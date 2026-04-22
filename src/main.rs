@@ -498,6 +498,12 @@ async fn run_bridge() -> Result<()> {
                         tracker: tracker.clone(),
                         shutdown: shutdown.clone(),
                         audio: audio.clone(),
+                        // `BRIDGE_ENV_FILE` enables `/tts` runtime
+                        // reconfig. Without it, /tts replies with an
+                        // error and no-ops.
+                        env_file_path: env::var("BRIDGE_ENV_FILE")
+                            .ok()
+                            .map(std::path::PathBuf::from),
                     };
 
                     tracker.spawn(bridge::handle_update(ctx, chat_id, message_id, payload));

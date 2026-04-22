@@ -1,13 +1,4 @@
-//! Single-instance guard via advisory `flock` on a PID file.
-//!
-//! `acquire` returns an RAII guard that holds an exclusive non-blocking
-//! lock for the lifetime of the daemon. If another tebis is already
-//! running, `acquire` returns `Locked { pid }` so the caller can print
-//! a clear "already running as pid N" message and exit cleanly.
-//!
-//! The lock is released automatically when the process exits (kernel
-//! closes the fd), so crashes / SIGKILL don't leave the lock stuck.
-//! The file itself is removed on clean drop.
+//! Single-instance guard via advisory `flock` + pidfile.
 
 #![cfg(unix)]
 
@@ -20,15 +11,12 @@ use std::path::{Path, PathBuf};
 
 pub struct LockFile {
     path: PathBuf,
-    // Kept alive so `flock` persists for the lifetime of this struct.
     _file: File,
 }
 
 #[derive(Debug)]
 pub enum AcquireError {
     Io(std::io::Error),
-    /// Another tebis already holds the lock. `pid` is what that process
-    /// wrote into the file (may be `None` if we couldn't read it).
     Locked {
         path: PathBuf,
         pid: Option<u32>,
@@ -57,9 +45,7 @@ impl std::fmt::Display for AcquireError {
 
 impl std::error::Error for AcquireError {}
 
-/// `$XDG_RUNTIME_DIR/tebis.lock` on Linux / systemd, else
-/// `/tmp/tebis-$USER.lock`. Matches the notify-socket path policy so
-/// there's one consistent runtime dir per user.
+/// `$XDG_RUNTIME_DIR/tebis.lock`, else `/tmp/tebis-$USER.lock`.
 pub fn default_path() -> PathBuf {
     if let Ok(xdg) = env::var("XDG_RUNTIME_DIR")
         && !xdg.is_empty()
@@ -70,17 +56,10 @@ pub fn default_path() -> PathBuf {
     PathBuf::from(format!("/tmp/tebis-{user}.lock"))
 }
 
-/// Acquire an exclusive non-blocking lock at `path`. On success, writes
-/// the current pid into the file for diagnostics.
-///
-/// The file is opened with `mode(0o600)` at creation so the perms are
-/// correct atomically — no TOCTOU window between `open` and `chmod`.
+/// Exclusive non-blocking `flock`, writes our pid on success. `mode(0o600)`
+/// at open avoids the open→chmod TOCTOU.
 pub fn acquire(path: &Path) -> Result<LockFile, AcquireError> {
-    // Ensure the parent dir exists — on Linux `$XDG_RUNTIME_DIR` is
-    // normally created by systemd at login, but it can be GC'd at
-    // logout. macOS falls back to `/tmp` which always exists. Without
-    // this, the caller sees an opaque ENOENT that looks like a bug in
-    // the lockfile code.
+    // `$XDG_RUNTIME_DIR` can be GC'd at logout; create it so errors are clear.
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -112,7 +91,6 @@ pub fn acquire(path: &Path) -> Result<LockFile, AcquireError> {
         return Err(AcquireError::Io(err));
     }
 
-    // Lock held — publish our pid.
     let mut handle = &file;
     handle.set_len(0).map_err(AcquireError::Io)?;
     writeln!(handle, "{}", std::process::id()).map_err(AcquireError::Io)?;
@@ -125,25 +103,12 @@ pub fn acquire(path: &Path) -> Result<LockFile, AcquireError> {
 
 impl Drop for LockFile {
     fn drop(&mut self) {
-        // Kernel releases the flock on fd close. Remove the file so the
-        // next startup finds a clean slate.
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
-/// Return the pid of a tebis **that actually holds the flock**, if any.
-/// Used by `tebis status` to report the running foreground.
-///
-/// Probes the lock directly (non-blocking exclusive request); only if
-/// that fails with `EWOULDBLOCK` do we read the pid from the file. Just
-/// checking `kill(pid, 0)` on a pid-from-file would produce false
-/// positives when the pid has been recycled to an unrelated process.
-///
-/// A stale pidfile left over from a crashed prior run is not cleaned up
-/// here — doing so would race with a concurrent `acquire` on a
-/// different inode (we hold the flock but not an exclusive-open
-/// guarantee). The next `acquire` call naturally reuses the file:
-/// `set_len(0)` + `writeln!` overwrite the stale pid.
+/// Pid of a tebis actually holding the flock. Probes the lock directly —
+/// a stale pidfile from a crashed run returns `None`.
 pub fn active_holder(path: &Path) -> Option<u32> {
     let file = OpenOptions::new().read(true).open(path).ok()?;
 
@@ -156,7 +121,6 @@ pub fn active_holder(path: &Path) -> Option<u32> {
     if errno != Some(libc::EWOULDBLOCK) {
         return None;
     }
-    // Lock is held by someone; read their pid.
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse().ok())
@@ -202,13 +166,9 @@ mod tests {
     #[test]
     fn active_holder_returns_none_for_unlocked_file() {
         let path = unique_tmp_path("stale-probe");
-        // Simulate a crashed prior run: the pidfile exists on disk but
-        // no process holds the flock.
         std::fs::write(&path, "99999\n").expect("write stale pidfile");
         assert!(path.exists());
         assert_eq!(active_holder(&path), None, "no one holds the lock");
-        // File is intentionally NOT cleaned up here — see doc on
-        // active_holder for rationale. Next `acquire` will overwrite it.
         let _ = std::fs::remove_file(&path);
     }
 

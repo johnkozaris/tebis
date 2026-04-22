@@ -1,4 +1,4 @@
-//! UDS binding, accept loop, per-connection protocol.
+//! UDS bind, accept, per-connection protocol.
 
 use anyhow::{Context, Result};
 use std::os::unix::fs::PermissionsExt;
@@ -12,7 +12,7 @@ use tokio_util::task::TaskTracker;
 
 use super::{Forwarder, Payload};
 
-/// 16 KiB is ~10× the advertised 1500-char body limit.
+/// Invariant 10: 16 KiB max, ~10× the advertised 1500-char body.
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -41,24 +41,9 @@ pub fn spawn<F: Forwarder>(
     Ok(())
 }
 
-/// Three-layer defense so the socket never exists at a looser mode:
-/// (1) tightened `umask(0177)` around `bind(2)`, (2) explicit `chmod 0600`,
-/// (3) `peer_cred` check in `handle_connection`. Layers (1)+(2) close the
-/// window between bind and the first accept; (3) is the only
-/// authenticated gate. Don't remove any in isolation.
-///
-/// Pre-bind unlink is safe on the `/tmp/tebis-$USER.sock` fallback even
-/// though `/tmp` is world-writable:
-/// - `remove_file` → `unlink(2)`, which does NOT follow symlinks. An
-///   attacker who pre-creates the path as a symlink to `/etc/passwd`
-///   only has its own symlink unlinked; the target is untouched.
-/// - The sticky bit on `/tmp` prevents attacker-owned files/symlinks
-///   from being unlinked by us (EPERM). We surface that as a non-
-///   NotFound `Err` and bail — no clobber path.
-/// - If the path is clean or ours to unlink, `bind(2)` then creates a
-///   fresh inode. A race where an attacker re-creates the path between
-///   our unlink and our bind results in `bind` failing with
-///   `EADDRINUSE` (bind refuses existing paths); still no clobber.
+/// Invariant 17: three-layer defense — umask(0177) + chmod 0600 + peer_cred.
+/// Pre-bind unlink is symlink-safe (unlink doesn't follow symlinks; /tmp
+/// sticky bit blocks clobbering attacker-owned files).
 fn bind(path: &Path) -> Result<UnixListener> {
     match std::fs::remove_file(path) {
         Ok(()) => {}
@@ -69,8 +54,7 @@ fn bind(path: &Path) -> Result<UnixListener> {
         }
     }
 
-    // SAFETY: `umask(2)` is async-signal-safe; prior mask restored
-    // unconditionally below so a bind failure doesn't leak the tightening.
+    // SAFETY: `umask(2)` is async-signal-safe; prior mask restored below.
     let prior_umask = unsafe { libc::umask(0o177) };
     let listener_result = UnixListener::bind(path);
     unsafe { libc::umask(prior_umask) };
@@ -84,11 +68,7 @@ fn bind(path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-/// RAII guard: removes the socket file on drop so the listener can't
-/// exit any path (shutdown, panic, task cancel) without cleaning up.
-/// Before this, a panic in the accept loop left a stale socket that
-/// subsequent hook firings happily `connect(2)`-ed to, only to see
-/// `ECONNREFUSED` since no one was accepting.
+/// RAII: unlink on drop so a panicking accept loop doesn't leave a stale socket.
 struct SocketCleanup(PathBuf);
 
 impl Drop for SocketCleanup {
@@ -97,10 +77,7 @@ impl Drop for SocketCleanup {
     }
 }
 
-/// Minimum sleep between consecutive failed `accept(2)` calls.
-/// Without this, a sticky error like `EMFILE` (process fd exhaustion)
-/// burns CPU and fills the journal with warnings at whatever rate the
-/// kernel hands them back.
+/// Cooldown between failed accepts — sticky EMFILE etc. would otherwise spin.
 const ACCEPT_ERROR_COOLDOWN: Duration = Duration::from_millis(100);
 
 async fn accept_loop<F: Forwarder>(
@@ -123,8 +100,6 @@ async fn accept_loop<F: Forwarder>(
         match accept {
             Ok((stream, _)) => {
                 let f = forwarder.clone();
-                // Per-connection tasks tracked so `tracker.wait()` drains
-                // in-flight deliveries on shutdown.
                 tracker.spawn(async move {
                     handle_connection(stream, f).await;
                 });
@@ -140,9 +115,6 @@ async fn accept_loop<F: Forwarder>(
     }
 }
 
-/// Per-accept peer-cred check against our euid closes the TOCTOU window
-/// between `bind` and `chmod 0600`. On shared-user systems this is the
-/// authenticated gate.
 async fn handle_connection<F: Forwarder>(mut stream: UnixStream, forwarder: Arc<F>) {
     if !peer_is_self(&stream) {
         let _ = stream
@@ -162,7 +134,7 @@ async fn handle_connection<F: Forwarder>(mut stream: UnixStream, forwarder: Arc<
         }
     };
 
-    // Metadata only — `text` may contain secrets.
+    // Invariant 5: metadata only; never the text.
     tracing::debug!(
         bytes = payload.text.len(),
         has_cwd = payload.cwd.is_some(),
@@ -184,7 +156,6 @@ async fn handle_connection<F: Forwarder>(mut stream: UnixStream, forwarder: Arc<
     }
 }
 
-/// Read up to `\n` or EOF, bounded by `CONNECT_TIMEOUT` + `MAX_PAYLOAD_BYTES`.
 async fn read_payload(stream: &mut UnixStream) -> Result<Payload> {
     let mut reader = BufReader::with_capacity(4096, stream);
     let mut buf = Vec::with_capacity(2048);
@@ -208,8 +179,7 @@ async fn read_payload(stream: &mut UnixStream) -> Result<Payload> {
     Ok(payload)
 }
 
-/// `read_until` with a hard cap — a client that never sends `\n` can't
-/// grow the buffer unbounded.
+/// `read_until` with a hard cap — bounds a client that never sends `\n`.
 async fn read_until_bounded<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     delim: u8,
@@ -240,11 +210,10 @@ fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
     haystack.iter().position(|&b| b == needle)
 }
 
-/// Kernel-authenticated peer check. `peer_cred`'s pid is racy (the peer
-/// can fork/exec), so we only trust `uid`. `peer_cred` failure → reject,
-/// so a misbehaving stack can't bypass the check.
+/// Kernel-auth peer check. `peer_cred`'s pid is racy, so only trust `uid`.
+/// `peer_cred` failure rejects — don't let a misbehaving stack bypass the gate.
 fn peer_is_self(stream: &UnixStream) -> bool {
-    // SAFETY: `geteuid` is async-signal-safe with no failure modes.
+    // SAFETY: `geteuid` is async-signal-safe, infallible.
     let our_euid = unsafe { libc::geteuid() };
     match stream.peer_cred() {
         Ok(cred) if cred.uid() == our_euid => true,
@@ -273,7 +242,6 @@ mod tests {
     use std::sync::Mutex;
     use tokio::io::AsyncReadExt;
 
-    /// Records every payload it's handed so tests can assert on them.
     struct Recorder {
         calls: Mutex<Vec<Payload>>,
         fail: bool,
@@ -313,9 +281,7 @@ mod tests {
         let handle = tokio::spawn(handle_connection(server, forwarder));
 
         client.write_all(write).await.unwrap();
-        // Half-close write side so the server hits EOF when a newline is
-        // absent — otherwise `read_until_bounded` blocks until the 5 s
-        // CONNECT_TIMEOUT and we'd measure timeout behavior, not parsing.
+        // Half-close so the server hits EOF without waiting CONNECT_TIMEOUT.
         client.shutdown().await.unwrap();
 
         let mut response = Vec::new();
@@ -326,11 +292,6 @@ mod tests {
 
     #[tokio::test]
     async fn peer_is_self_accepts_same_process_socketpair() {
-        // `UnixStream::pair` creates a connected pair inside the current
-        // process, so the peer uid is the same as our euid — the "allowed"
-        // path in `peer_is_self`. The reject path (different uid) can't be
-        // exercised in a single-process test; it's defensively coded
-        // (log-and-return).
         let (a, _b) = UnixStream::pair().expect("UnixStream::pair");
         assert!(peer_is_self(&a));
     }
@@ -364,7 +325,6 @@ mod tests {
 
     #[tokio::test]
     async fn missing_newline_but_eof_still_parses() {
-        // read_until_bounded returns at EOF with whatever's buffered.
         let rec = Recorder::new();
         let resp = drive(rec.clone(), b"{\"text\":\"no-newline\"}").await;
         assert_eq!(resp, b"{\"ok\":true}\n");

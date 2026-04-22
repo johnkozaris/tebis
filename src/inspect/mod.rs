@@ -1,9 +1,4 @@
-//! Opt-in local-only control dashboard. `INSPECT_PORT=<n>` binds
-//! `127.0.0.1:n`. Loopback-only, CSRF-checked, zero JS.
-//!
-//! - `mod.rs` — public types + `spawn` + system helpers
-//! - `server.rs` — HTTP accept + routing + actions + env-file write
-//! - `render.rs` — HTML + JSON + inline CSS
+//! Opt-in local-only control dashboard (`INSPECT_PORT`). Loopback, CSRF-checked, zero JS.
 
 mod render;
 mod server;
@@ -22,8 +17,7 @@ use crate::bridge::session::SessionState;
 use crate::metrics::Metrics;
 use crate::tmux::Tmux;
 
-/// Immutable snapshot of non-secret config + identity. `bot_token` is
-/// deliberately absent — no path from env → dashboard.
+/// Immutable non-secret config snapshot. `bot_token` is deliberately absent.
 pub struct Snapshot {
     pub bridge: BridgeInfo,
     pub bot: Option<BotInfo>,
@@ -35,40 +29,26 @@ pub struct Snapshot {
     pub autostart: Option<AutostartInfo>,
     pub notify: Option<NotifyInfo>,
     pub hooks: HooksInfo,
-    /// `None` when no audio features are enabled. `Some(VoiceInfo)`
-    /// when at least one provider (STT, eventually TTS) was configured
-    /// at startup.
+    /// `Some` if any audio provider was configured at startup.
     pub voice: Option<VoiceInfo>,
-    /// `Some` → Settings panel becomes editable and writes here.
+    /// `Some` → Settings panel is editable and writes here.
     pub env_file: Option<String>,
 }
 
-/// Snapshot of STT + TTS state for the dashboard Voice section. Built
-/// once at startup — config can't change without restart anyway. Live
-/// counters (transcribe/synthesize metrics) come from `LiveContext::metrics`.
+/// Voice state for dashboard. Built once at startup — config needs a restart.
 pub struct VoiceInfo {
-    /// Manifest key — `"base.en"`, `"small.en"`, etc. `None` when STT off.
     pub stt_model: Option<String>,
-    /// Whether STT initialized successfully.
     pub stt_ready: bool,
-    /// Backend kind: `"none"`, `"say"`, `"kokoro-local"`, `"kokoro-remote"`.
-    /// `"none"` covers both "not configured" and "failed to init".
+    /// `"none"`, `"say"`, `"kokoro-local"`, or `"kokoro-remote"`.
     pub tts_backend: &'static str,
-    /// `Some` when TTS initialized — the resolved voice name.
     pub tts_voice: Option<String>,
-    /// Backend-specific detail — the redacted host for `kokoro-remote`,
-    /// the manifest model key for `kokoro-local`, empty for `say` /
-    /// `none`. The dashboard renderer composes these into a single
-    /// display line so front-end layout stays simple.
+    /// Redacted host for remote, model key for local, empty otherwise.
     pub tts_detail: Option<String>,
-    /// "all" if `TELEGRAM_TTS_RESPOND_TO_ALL=on`, else "voice-only".
-    /// Only meaningful when `tts_voice.is_some()`.
+    /// `"all"` or `"voice-only"`. Only meaningful when `tts_voice.is_some()`.
     pub tts_scope: &'static str,
 }
 
-/// Hooks-mode policy + snapshot of installed project dirs. `entries`
-/// is sampled from the manifest at render time so the dashboard
-/// reflects the real state, not a startup freeze.
+/// `entries` is re-read from the manifest on each render.
 pub struct HooksInfo {
     pub mode: &'static str,
     pub entries: Vec<HooksEntryInfo>,
@@ -104,8 +84,7 @@ pub struct NotifyInfo {
     pub chat_id: i64,
 }
 
-/// Live state sampled per-request. `shutdown` is the process-wide
-/// cancellation token the Restart action fires.
+/// Live state sampled per-request. Restart action fires `shutdown`.
 pub struct LiveContext {
     pub tmux: Arc<Tmux>,
     pub session: Arc<SessionState>,
@@ -137,8 +116,7 @@ impl LiveContext {
         }
     }
 
-    /// ~2 s cache in front of `tmux list-sessions`. Dashboard auto-refreshes
-    /// every 5 s; without the cache that's one subprocess per viewer-refresh.
+    /// ~2s cache in front of `tmux list-sessions` — dashboard refreshes every 5s.
     pub async fn cached_live_sessions(&self) -> Arc<Vec<String>> {
         const TTL: std::time::Duration = std::time::Duration::from_millis(1_800);
         {
@@ -149,7 +127,7 @@ impl LiveContext {
                 return cached.clone();
             }
         }
-        // Fetch without the mutex so a slow tmux doesn't block concurrent loads.
+        // Release lock before the subprocess so slow tmux doesn't block concurrent loads.
         let fresh = Arc::new(self.tmux.list_sessions().await.unwrap_or_default());
         let mut guard = self.live_sessions_cache.lock().await;
         *guard = Some((Instant::now(), fresh.clone()));
@@ -157,12 +135,7 @@ impl LiveContext {
     }
 }
 
-/// Binds `127.0.0.1:port` only — non-loopback would leak the dashboard.
-///
-/// If the port is already in use **by another tebis process** (typically
-/// a previous run that didn't exit cleanly), the stale process is killed
-/// and the bind is retried. Any other holder surfaces as a normal
-/// `AddrInUse` error so we don't clobber unrelated services.
+/// Binds `127.0.0.1:port`. Reclaims the port from a stale tebis process on `AddrInUse`.
 pub fn spawn(
     tracker: &TaskTracker,
     shutdown: CancellationToken,
@@ -194,7 +167,6 @@ pub fn spawn(
     Ok(())
 }
 
-/// Bind, and on `AddrInUse` take over from a stale tebis process.
 fn bind_with_takeover(addr: SocketAddr) -> Result<std::net::TcpListener> {
     match std::net::TcpListener::bind(addr) {
         Ok(l) => Ok(l),
@@ -232,12 +204,10 @@ struct PortHolder {
     cmd: String,
 }
 
-/// Discover which process is holding a local TCP port via `lsof`. Returns
-/// `None` if `lsof` isn't installed or no holder is found — callers should
-/// fall back to the generic `AddrInUse` error in that case.
+/// Find port holder via `lsof`. `None` if `lsof` missing or no holder found.
 fn find_port_holder(port: u16) -> Option<PortHolder> {
     use std::process::Command;
-    // `-F pc` prints one field per line: `p<pid>` and `c<command>`.
+    // `-F pc` → one field per line: `p<pid>` / `c<command>`.
     let out = Command::new("lsof")
         .args(["-nP", "-sTCP:LISTEN", "-F", "pc"])
         .arg(format!("-iTCP:{port}"))
@@ -264,14 +234,8 @@ fn find_port_holder(port: u16) -> Option<PortHolder> {
     })
 }
 
-/// True when the process at `pid` looks like one of ours — a `tebis` or
-/// `inspect-demo` binary. We're deliberately lenient here (substring
-/// match on the command) rather than hashing the executable: the purpose
-/// is "don't kill your IDE by mistake", not cryptographic identity.
-///
-/// Caveat: `ps -o comm=` truncates at `TASK_COMM_LEN-1 = 15` chars on
-/// macOS / Linux. If the binary is ever renamed to something longer than
-/// `inspect-demo` (12 chars), update the match here.
+/// Lenient check for our own binary name — purpose is "don't kill your IDE",
+/// not cryptographic identity. `ps -o comm=` truncates at 15 chars.
 fn is_tebis_process(pid: u32) -> bool {
     use std::process::Command;
     let Ok(out) = Command::new("ps")
@@ -288,17 +252,11 @@ fn is_tebis_process(pid: u32) -> bool {
     base == "tebis" || base == "inspect-demo"
 }
 
-/// Tunables for `kill_and_wait`. Named so we don't have magic numbers
-/// threading through the body.
 const TERM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const TERM_POLL_ATTEMPTS: usize = 30;
 const POST_SIGKILL_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// SIGTERM + wait + SIGKILL fallback. Synchronous — uses
-/// `std::thread::sleep`, which would block a tokio worker if called from
-/// async code. Safe here because `bind_with_takeover` runs at startup
-/// before the poll loop begins; if a future caller invokes this from
-/// async, convert to `tokio::time::sleep`.
+/// SIGTERM + wait + SIGKILL. Synchronous — caller is startup-time only.
 fn kill_and_wait(pid: u32) {
     // SAFETY: `kill(2)` with a valid pid is sound. `pid` as i32 can only
     // misbehave for pids ≥ 2^31, which no real system emits.

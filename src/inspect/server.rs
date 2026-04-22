@@ -19,7 +19,7 @@ use tokio_util::task::TaskTracker;
 use super::{LiveContext, Snapshot, render};
 use crate::env_file;
 
-/// Origins a legitimate same-host browser POST could carry.
+/// Trusted `Origin` values for same-host browser POSTs.
 pub(super) fn expected_origins_for(port: u16) -> Vec<String> {
     vec![
         format!("http://127.0.0.1:{port}"),
@@ -27,11 +27,8 @@ pub(super) fn expected_origins_for(port: u16) -> Vec<String> {
     ]
 }
 
-/// Host-header values a legitimate same-host request could carry.
-/// Used to defeat DNS rebinding: the dashboard binds to 127.0.0.1,
-/// but an attacker site (`evil.example`) that rebinds to 127.0.0.1
-/// still arrives with `Host: evil.example`. Rejecting any Host not in
-/// this list confines the dashboard to direct-loopback access.
+/// Trusted `Host` values — DNS-rebinding defense. A rebound attacker
+/// domain still arrives with its own name in `Host`, so gate on it.
 pub(super) fn expected_hosts_for(port: u16) -> Vec<String> {
     vec![
         format!("127.0.0.1:{port}"),
@@ -68,12 +65,8 @@ pub(super) async fn accept_loop(
         let expected_origins = expected_origins.clone();
         let expected_hosts = expected_hosts.clone();
         let conn_shutdown = shutdown.clone();
-        // Per-connection tasks are NOT tracked: a browser with the
-        // dashboard open holds a keep-alive connection that would stall
-        // the shutdown drain for its full timeout. These tasks serve
-        // non-critical HTML — fine to drop on Ctrl-C. On shutdown we
-        // also race serve_connection against the cancel token so the
-        // handler stops accepting new requests on the same connection.
+        // Not tracked: a keep-alive browser would stall shutdown drain otherwise.
+        // Non-critical HTML; fine to drop on Ctrl-C.
         tokio::spawn(async move {
             let service = service_fn(move |req| {
                 let snapshot = snapshot.clone();
@@ -113,13 +106,7 @@ async fn handle(
     expected_origins: Arc<Vec<String>>,
     expected_hosts: Arc<Vec<String>>,
 ) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
-    // DNS-rebinding defense, applied to EVERY request (GET and POST).
-    // An attacker domain that rebinds to 127.0.0.1 still arrives with
-    // its own name in the Host header; our bind is loopback-only, but
-    // a browser tricked by rebinding would happily send `GET /status`
-    // with `Host: evil.example`. Refusing any Host not in the allowed
-    // set confines the dashboard to direct-loopback use. The Origin
-    // check below stays — CSRF and DNS-rebinding are distinct attacks.
+    // Host check on every request — DNS-rebinding defense. Origin check below is for CSRF.
     if !host_is_trusted(&req, &expected_hosts) {
         return Ok(text_response(StatusCode::FORBIDDEN, "forbidden\n"));
     }
@@ -160,9 +147,7 @@ async fn handle(
                 return Ok(text_response(StatusCode::FORBIDDEN, "forbidden\n"));
             }
             let name = p.strip_prefix("/actions/kill/").unwrap_or("");
-            // Strict mode: must be in the allowlist. Permissive mode: any
-            // valid-name live session is fair game — `kill_session` itself
-            // enforces the name regex, so we just fall through.
+            // Strict mode: allowlist-gated. Permissive: `kill_session` enforces invariant 2.
             if !live.tmux.is_permissive()
                 && !live.tmux.allowlisted_sessions().iter().any(|s| s == name)
             {
@@ -171,9 +156,6 @@ async fn handle(
                     "session not in allowlist\n",
                 ));
             }
-            // `kill_session` is idempotent (NotFound → Ok) and validates
-            // the name regex itself, so a bogus URL suffix like
-            // `/actions/kill/../etc` is rejected at the tmux layer.
             let _ = live.tmux.kill_session(name).await;
             live.session.clear_target_if(name);
             tracing::warn!(session = name, "Inspect: killed session");
@@ -188,11 +170,6 @@ async fn handle(
 }
 
 async fn kill_all(live: &LiveContext) -> usize {
-    // In strict mode, only the pre-declared allowlist is touchable. In
-    // permissive mode, every live session is touchable, so we iterate
-    // `list_sessions` instead. Either way `kill_session` enforces the
-    // name regex, so malformed names from a weird tmux output don't
-    // reach argv.
     let targets: Vec<String> = if live.tmux.is_permissive() {
         live.tmux.list_sessions().await.unwrap_or_default()
     } else {
@@ -254,8 +231,7 @@ async fn handle_config_post(
     Ok(redirect_to("/"))
 }
 
-/// Cancel the shared shutdown token after a short delay so the in-flight
-/// HTTP response flushes to the browser before the socket closes.
+/// Delay before cancelling so the in-flight redirect flushes.
 fn schedule_graceful_restart(shutdown: &CancellationToken) {
     let shutdown = shutdown.clone();
     tokio::spawn(async move {
@@ -264,11 +240,7 @@ fn schedule_graceful_restart(shutdown: &CancellationToken) {
     });
 }
 
-/// Parse `application/x-www-form-urlencoded` into validated env-file
-/// updates. Whitelist-only (unknown keys silently ignored) and range-
-/// validated server-side so a tampering client can't write `=0`. Values
-/// are numeric for the fields we currently accept, so no URL decoding
-/// is needed — non-numeric fails `parse::<u32>()` and gets rejected.
+/// Parse form-urlencoded into validated env updates. Whitelist-only, range-checked.
 fn parse_config_form(
     body: &[u8],
 ) -> std::result::Result<Vec<(&'static str, String)>, &'static str> {
@@ -305,11 +277,7 @@ fn parse_config_form(
                 if decoded.chars().any(char::is_control) {
                     return Err("autostart_dir must not contain control characters\n");
                 }
-                // Canonicalize so `.` / `..` / trailing `/` normalize to
-                // a single shape. Without this, an operator paste like
-                // `~/project/.` writes a literal unresolved path that
-                // survives restart and reads differently than the wizard
-                // would write it.
+                // Canonicalize — operator pastes like `~/project/.` otherwise survive restart unresolved.
                 let canon = std::fs::canonicalize(&decoded)
                     .map_err(|_| "autostart_dir must be an existing directory\n")?;
                 if !canon.is_dir() {
@@ -336,10 +304,7 @@ fn parse_config_form(
     Ok(out)
 }
 
-/// Minimal `application/x-www-form-urlencoded` decoder. Covers `+`
-/// (space) and `%NN` (byte-hex) sequences. Broken encodings fall through
-/// verbatim — the caller re-validates semantically so leftover `%`
-/// characters just cause a `is_dir` rejection.
+/// Minimal form-urlencoded decoder — `+` → space and `%NN` → byte.
 fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -370,35 +335,16 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Rewrite the env file atomically, mode 0600. Preserves comments and
-/// existing line order. Keys not already in the file are appended.
-///
-/// The 0600 guarantee comes from [`env_file::atomic_write_0600`]; a
-/// previous implementation used `fs::write` which creates under the
-/// process umask (0644 on macOS by default) and silently demoted the
-/// file's perms through the rename, exposing the bot token.
+/// Thin wrapper around [`env_file::upsert_keys`] that accepts the
+/// `&'static str` keys that `parse_config_form` returns, without
+/// forcing the shared helper to fix its key lifetime.
 fn write_env_file(path: &Path, updates: &[(&'static str, String)]) -> anyhow::Result<()> {
-    let current = std::fs::read_to_string(path).unwrap_or_default();
-    let mut lines: Vec<String> = current.lines().map(str::to_string).collect();
-
-    for (key, value) in updates {
-        let replaced = lines
-            .iter_mut()
-            .find(|line| env_file::parse_kv_line(line).is_some_and(|(k, _)| k == *key));
-        if let Some(line) = replaced {
-            *line = format!("{key}={value}");
-        } else {
-            lines.push(format!("{key}={value}"));
-        }
-    }
-
-    let mut body = lines.join("\n");
-    body.push('\n');
-    env_file::atomic_write_0600(path, &body)
+    let borrowed: Vec<(&str, String)> =
+        updates.iter().map(|(k, v)| (*k, v.clone())).collect();
+    env_file::upsert_keys(path, &borrowed)
 }
 
-/// Origin-header CSRF check. Missing `Origin` = same-origin form POST
-/// (accepted). Present but mismatched = reject.
+/// Origin CSRF check. Missing = same-origin (accept); mismatched = reject.
 fn origin_is_trusted(req: &Request<Incoming>, expected: &[String]) -> bool {
     let Some(origin) = req.headers().get(hyper::header::ORIGIN) else {
         return true;
@@ -409,14 +355,7 @@ fn origin_is_trusted(req: &Request<Incoming>, expected: &[String]) -> bool {
     expected.iter().any(|e| e == origin_str)
 }
 
-/// Host-header check for DNS-rebinding defense. Unlike Origin (which
-/// is absent on many GETs), Host is required by HTTP/1.1 and set by
-/// every browser to the name the user typed. A rebind-to-127.0.0.1
-/// attack still carries the attacker's hostname in `Host:`, so
-/// rejecting any Host not in the expected set blocks the attack.
-///
-/// Missing Host = malformed HTTP/1.1 → reject; attackers have no
-/// reason to omit it, and legit clients always send it.
+/// Host check for DNS-rebinding defense. Missing Host → reject.
 fn host_is_trusted(req: &Request<Incoming>, expected: &[String]) -> bool {
     let Some(host) = req.headers().get(hyper::header::HOST) else {
         return false;
@@ -426,8 +365,6 @@ fn host_is_trusted(req: &Request<Incoming>, expected: &[String]) -> bool {
     };
     expected.iter().any(|e| e == host_str)
 }
-
-// ---------- response constructors ----------
 
 fn html_response(body: String) -> Response<Full<Bytes>> {
     Response::builder()
@@ -482,15 +419,10 @@ mod tests {
         let hosts = expected_hosts_for(8080);
         assert!(hosts.contains(&"127.0.0.1:8080".to_string()));
         assert!(hosts.contains(&"localhost:8080".to_string()));
-        // Explicit negative: the Host header shape must not carry scheme.
         assert!(!hosts.iter().any(|h| h.starts_with("http")));
     }
 
-    // `host_is_trusted` takes `Request<Incoming>`, which stable hyper
-    // doesn't let us construct in unit tests (Incoming is crate-private).
-    // Exercise the set-membership predicate via `expected_hosts_for`
-    // directly — the function's real logic is "header string ∈ list";
-    // that's what these two tests cover.
+    // `host_is_trusted` takes `Request<Incoming>` which stable hyper can't build in tests.
     #[test]
     fn host_trusted_accepts_exact_loopback_and_localhost() {
         let hosts = expected_hosts_for(8080);
@@ -505,9 +437,9 @@ mod tests {
         for bad in [
             "evil.example",
             "evil.example:8080",
-            "127.0.0.1:8081",    // wrong port
-            "127.0.0.2:8080",    // wrong octet
-            "localhost",         // port omitted
+            "127.0.0.1:8081",
+            "127.0.0.2:8080",
+            "localhost",
             "",
         ] {
             assert!(

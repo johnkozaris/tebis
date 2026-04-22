@@ -1,9 +1,4 @@
-//! Step 8 — voice replies (TTS) with Simple/Advanced picker.
-//!
-//! The three backends tebis supports — `say` (macOS), `kokoro-local`
-//! (offline neural), `kokoro-remote` (HTTP) — each have their own
-//! configure function so this file stays a flat list of concerns.
-//! The top-level `step_tts` just dispatches to Simple vs Advanced.
+//! Step 8 — voice replies (TTS). Simple vs Advanced picker; one configure_* fn per backend.
 
 use anyhow::{Context, Result};
 use console::style;
@@ -62,9 +57,7 @@ pub(in crate::setup) fn step_tts(
     }
 }
 
-/// Simple = lightest backend that works out of the box on this host.
-/// macOS → `say`, Linux → Kokoro local after auto-installing
-/// `espeak-ng`. Any install failure falls through to `Off`.
+/// macOS → `say`; Linux → Kokoro local (auto-installs espeak-ng). Falls through to `Off` on failure.
 fn simple_tts(
     theme: &ColorfulTheme,
     existing: Option<&TtsChoice>,
@@ -123,7 +116,6 @@ fn simple_tts(
     }
 }
 
-/// Advanced = 4-way backend picker + per-backend config.
 fn advanced_tts(
     theme: &ColorfulTheme,
     existing: Option<&TtsChoice>,
@@ -136,8 +128,6 @@ fn advanced_tts(
         None,
     }
 
-    // `Say` is cfg-gated — a flat `vec![]` would need two separate
-    // macro calls with the same trailing `None` entry.
     #[allow(
         clippy::vec_init_then_push,
         reason = "cfg-gated middle entry rules out a flat vec![] literal"
@@ -216,10 +206,7 @@ fn configure_say(
     _existing: Option<&TtsChoice>,
     _respond_to_all_default: bool,
 ) -> Result<Option<TtsChoice>> {
-    // The Advanced UI hides `Say` on non-macOS, so this branch should
-    // never be hit from a user flow. Degrade gracefully rather than
-    // panicking in case future refactors change the UI — a wizard
-    // panic is exactly the kind of failure mode to avoid.
+    // Dead branch — UI hides `Say` on non-macOS. Degrade instead of panicking.
     tracing::warn!(
         "configure_say invoked on non-macOS; falling back to TTS off"
     );
@@ -305,10 +292,7 @@ fn configure_kokoro_remote(
         .allow_empty(true)
         .interact_text()
         .context("prompt: remote api key")?;
-    // Trim surrounding whitespace before the empty check and before
-    // persisting. A trailing space in the env file would otherwise be
-    // carried into the Bearer header and silently break auth; surrounded
-    // whitespace from paste is an easy mistake to miss.
+    // Trim — a trailing space would break the Bearer header silently.
     let api_key_trimmed = api_key_raw.trim();
     let api_key = if api_key_trimmed.is_empty() {
         None
@@ -401,11 +385,7 @@ fn existing_voice_or(existing: Option<&TtsChoice>, default: &str) -> String {
     }
 }
 
-/// Current manifest's default TTS model key, with a literal fallback
-/// so a wizard run in a repo where the manifest was temporarily
-/// cleared still returns a sensible value — the daemon validates
-/// properly at startup and surfaces a clear error if the key doesn't
-/// resolve.
+/// Manifest default with a literal fallback; daemon re-validates at startup.
 fn default_tts_model() -> String {
     crate::audio::manifest::get()
         .default_tts_model()

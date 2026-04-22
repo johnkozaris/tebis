@@ -1,13 +1,4 @@
 //! Per-message behavior: rate-limit → permit → parse → execute → reply.
-//!
-//! `main.rs` owns the lifecycle; everything that turns an inbound update
-//! into a tmux side effect and a reply lives here.
-//!
-//! The auto-reply path is the "generic reply-back-to-Telegram" mechanism
-//! we control via tmux (no per-project hooks needed). After a successful
-//! send, we poll `capture-pane` until the normalized content stops
-//! changing ("settle"), then forward the tail. Works for Claude, Aider,
-//! Copilot CLI, any TUI — the only input is the pane buffer.
 
 pub mod autoreply;
 pub mod handler;
@@ -32,10 +23,6 @@ use crate::security::RateLimiter;
 use crate::telegram::TelegramClient;
 use crate::tmux::Tmux;
 
-/// What kind of content tebis received in one Telegram update. Text
-/// arrives already decoded; voice/audio messages arrive as an opaque
-/// `file_id` that needs `getFile` + `downloadFile` + OGG/Opus decode
-/// + STT before they can drive the handler.
 pub enum Payload {
     Text(String),
     Voice {
@@ -45,43 +32,29 @@ pub enum Payload {
     },
 }
 
-/// Global cap on concurrent handler tasks. Single-user workload:
-/// realistic concurrency is 1–2. 8 bounds subprocess fan-out when
-/// Telegram delivers a burst (e.g. queued messages after a phone
-/// reconnect). Lives in the consumer module so the policy sits with
-/// `HandlerContext::handler_sem`.
+/// Cap on concurrent handlers — bounds subprocess fan-out on bursts.
 pub const MAX_CONCURRENT_HANDLERS: usize = 8;
 
-/// Per-handler dependencies. Fresh per inbound update, moved into the task.
 pub struct HandlerContext {
     pub tg: Arc<TelegramClient>,
     pub tmux: Arc<Tmux>,
     pub session: Arc<SessionState>,
     pub rate_limiter: Arc<RateLimiter>,
-    /// Global cap on concurrent handlers. Bounds tmux subprocess fan-out
-    /// when Telegram delivers a burst.
     pub handler_sem: Arc<Semaphore>,
     pub started_at: Instant,
     pub metrics: Arc<Metrics>,
-    /// Pane-settle auto-reply config. `None` disables the feature.
     pub autoreply: Option<Arc<AutoreplyConfig>>,
-    /// Shared task tracker. Every background task we spawn (typing
-    /// indicator, pane-settle watcher) goes here so `tracker.wait()`
-    /// at shutdown drains them deterministically. Violating this was
-    /// CLAUDE.md invariant 12.
+    /// Invariant 12: every spawn uses this so shutdown drains them.
     pub tracker: TaskTracker,
-    /// Daemon's root cancel token. Threaded into typing guards + pane
-    /// watcher so shutdown drain doesn't wait up to `HOOK_TYPING_CAP`
-    /// or the next `REFRESH` for their timers to fire naturally.
     pub shutdown: CancellationToken,
-    /// `None` when the user has `TELEGRAM_STT=off` (default). When
-    /// present, voice/audio payloads get transcribed in-process and
-    /// fed through the text handler.
     pub audio: Option<Arc<AudioSubsystem>>,
+    /// `BRIDGE_ENV_FILE` — required for runtime config writes
+    /// (`/tts`, inspect Settings). `None` → mutative commands reply
+    /// with a "set BRIDGE_ENV_FILE" error instead of silently
+    /// accepting a no-op.
+    pub env_file_path: Option<std::path::PathBuf>,
 }
 
-/// Entry point for one inbound message. Never propagates errors — the
-/// spawned task is the terminal of the failure channel.
 pub async fn handle_update(
     ctx: HandlerContext,
     chat_id: i64,
@@ -94,28 +67,17 @@ pub async fn handle_update(
     if let Err(retry_after) = ctx.rate_limiter.check(chat_id) {
         ctx.metrics.record_rate_limited();
         let secs = retry_after.as_secs().max(1);
-        // Literal text is safe, but `send_message` sets parse_mode=HTML,
-        // so every body should route through escape_html defensively
-        // — if a future change drops in a formatted variable, it won't
-        // accidentally enable HTML injection on the rate-limit path.
         let reply = sanitize::escape_html(&format!("Rate limited. Try again in {secs}s."));
         let _ = ctx.tg.send_message(chat_id, &reply).await;
         return;
     }
 
-    // Acquire the work-permit AFTER rate-limit so spam doesn't starve
-    // real work. Permit releases on drop at end-of-function.
+    // Acquire after rate-limit so spam doesn't starve real work.
     let Ok(_permit) = ctx.handler_sem.acquire().await else {
         tracing::warn!("handler semaphore closed; dropping update");
         return;
     };
 
-    // Payload dispatch. Voice/audio goes through STT first and then
-    // re-enters the text path with the transcribed string — all
-    // downstream code is unchanged from the text-only era.
-    //
-    // `inbound_was_voice` drives whether the outbound `Response::Text`
-    // also gets synthesized + sent as a voice reply.
     let inbound_was_voice = matches!(payload, Payload::Voice { .. });
     let text = match payload {
         Payload::Text(t) => t,
@@ -129,9 +91,6 @@ pub async fn handle_update(
                 Ok(t) => t,
                 Err(reply) => {
                     ctx.metrics.record_stt_failure();
-                    // Error bodies go through escape_html (parse_mode=HTML).
-                    // Transcript text itself, when we do send something, is
-                    // handed to `handler::parse` below — same path as typed.
                     let body = sanitize::escape_html(&reply);
                     if let Err(e) = ctx.tg.send_message(chat_id, &body).await {
                         ctx.metrics.record_handler_error();
@@ -147,12 +106,18 @@ pub async fn handle_update(
     };
 
     let cmd = handler::parse(&text);
-    let deps = handler::Deps {
-        tmux: &ctx.tmux,
-        session: &ctx.session,
-        started_at: ctx.started_at,
+    // `/tts` reaches into HandlerContext (env-file path + shutdown
+    // token) which Deps doesn't carry — intercept before dispatch.
+    let response = if let handler::Command::Tts(verb) = cmd {
+        handle_tts_command(&ctx, &verb)
+    } else {
+        let deps = handler::Deps {
+            tmux: &ctx.tmux,
+            session: &ctx.session,
+            started_at: ctx.started_at,
+        };
+        handler::execute(cmd, &deps).await
     };
-    let response = handler::execute(cmd, &deps).await;
 
     match response {
         Response::Text(body) => {
@@ -164,11 +129,8 @@ pub async fn handle_update(
                     false
                 }
             };
-            // TTS only fires when the text reply actually landed —
-            // otherwise the user sees "voice succeeded but text failed"
-            // which is confusing. Also detached on the tracker so the
-            // handler releases its permit immediately (synth + sendVoice
-            // can take seconds).
+            // TTS fires only on text-send success; detached so the handler
+            // releases its permit while synth+sendVoice run.
             if send_ok
                 && let Some(audio) = ctx.audio.as_ref()
                 && audio.should_tts_reply(inbound_was_voice)
@@ -189,16 +151,7 @@ pub async fn handle_update(
         }
         Response::Sent { session, baseline } => {
             if ctx.session.is_hooked(&session) {
-                // Reply arrives via the agent's Stop hook → UDS →
-                // notify listener. Show "typing…" with a deadline so
-                // the user sees feedback until the real message lands.
-                //
-                // No 👍 fallback here. In hook mode the user expects
-                // prose back, so a thumbs-up reaction is the wrong
-                // signal — it implies "delivered successfully" when
-                // the actual state is "delivered but the hook never
-                // replied." If the typing indicator stops without a
-                // message, the user investigates via /read or /status.
+                // Hook-path: reply arrives via UDS; show typing until cap or message.
                 typing::spawn_with_cap(
                     &ctx.tracker,
                     ctx.tg.clone(),
@@ -207,11 +160,6 @@ pub async fn handle_update(
                     &ctx.shutdown,
                 );
             } else if let Some(cfg) = ctx.autoreply.clone() {
-                // Auto-reply IS the ack when it produces content —
-                // skip the 👍 up front. If the pane has nothing new,
-                // `watch_and_forward` falls back to the 👍 on
-                // `message_id` itself, so the user always gets one
-                // of: reply / reaction / failure log.
                 ctx.tracker.spawn(autoreply::watch_and_forward(
                     ctx.tracker.clone(),
                     ctx.tg.clone(),
@@ -224,8 +172,6 @@ pub async fn handle_update(
                     ctx.shutdown.clone(),
                 ));
             } else {
-                // No auto-reply configured → the 👍 is the only signal
-                // that we delivered. Keep it.
                 react_ok(&ctx, chat_id, message_id).await;
             }
         }
@@ -242,26 +188,105 @@ async fn react_ok(ctx: &HandlerContext, chat_id: i64, message_id: i64) {
     }
 }
 
-/// Maximum transcript **bytes** (not chars) we'll feed into
-/// `handler::parse`. Matches `TELEGRAM_MAX_OUTPUT_CHARS`'s upper
-/// bound — a noisy long recording should not be able to paste 100+
-/// KiB of text into tmux and bypass the existing plumbing limits
-/// (CLAUDE.md invariant 19). Named "BYTES" because `text.len()` is
-/// bytes; the config key uses "CHARS" for historical reasons.
+/// Handle `/tts` verbs. `Status` reports; the mutative verbs write
+/// `TELEGRAM_TTS_BACKEND=<value>` to the env file and schedule a
+/// graceful restart (mirrors the inspect dashboard's Settings-Save
+/// flow). `Unknown` replies with the usage line.
+///
+/// `Say` on non-macOS is rejected at this layer so a user on Linux
+/// doesn't brick their config by writing a value `build_tts` will
+/// refuse on restart.
+fn handle_tts_command(ctx: &HandlerContext, v: &handler::TtsVerb) -> Response {
+    use handler::TtsVerb;
+    use sanitize::escape_html;
+
+    // Status report uses the live subsystem state when present.
+    // `tts_backend_kind()` returns `"none"` when TTS init failed or was
+    // disabled at startup — surface that as "off" to the user so the
+    // terminology matches what they'd type (`/tts off`).
+    let current_label = match ctx.audio.as_ref().map(|a| a.tts_backend_kind()) {
+        None | Some("none") => "off",
+        Some(other) => other,
+    };
+
+    match v {
+        TtsVerb::Status => {
+            let msg = format!(
+                "TTS: <code>{}</code>\n\nPick one with:\n  /tts off\n  /tts say\n  /tts kokoro-local\n  /tts kokoro-remote",
+                escape_html(current_label),
+            );
+            Response::Text(msg)
+        }
+        TtsVerb::Unknown(got) => {
+            let msg = format!(
+                "Unknown /tts argument: <code>{}</code>\n\nValid: off, say, kokoro-local, kokoro-remote, status.",
+                escape_html(got),
+            );
+            Response::Text(msg)
+        }
+        #[cfg(not(target_os = "macos"))]
+        TtsVerb::Say => Response::Text(
+            "/tts say is macOS-only — try kokoro-local or kokoro-remote.".to_string(),
+        ),
+        #[cfg(target_os = "macos")]
+        TtsVerb::Say => switch_tts_backend(ctx, "say"),
+        TtsVerb::Off => switch_tts_backend(ctx, "none"),
+        TtsVerb::KokoroLocal => switch_tts_backend(ctx, "kokoro-local"),
+        TtsVerb::KokoroRemote => switch_tts_backend(ctx, "kokoro-remote"),
+    }
+}
+
+/// Persist `TELEGRAM_TTS_BACKEND=<value>` and trigger a graceful
+/// restart so the next boot picks it up. Returns a `Response::Text`
+/// for the user.
+fn switch_tts_backend(ctx: &HandlerContext, value: &str) -> Response {
+    let Some(env_path) = ctx.env_file_path.as_ref() else {
+        return Response::Text(
+            "Can't switch TTS at runtime: BRIDGE_ENV_FILE isn't set. \
+             Set it in the systemd unit / launchd plist and restart tebis."
+                .to_string(),
+        );
+    };
+    let updates = [("TELEGRAM_TTS_BACKEND", value.to_string())];
+    if let Err(e) = crate::env_file::upsert_keys(env_path, &updates) {
+        ctx.metrics.record_handler_error();
+        tracing::error!(err = %e, "/tts: env-file write failed");
+        return Response::Text(
+            "Failed to write env file — see server logs. TTS unchanged.".to_string(),
+        );
+    }
+    tracing::warn!(
+        new_backend = %value,
+        path = %env_path.display(),
+        "/tts: env updated, scheduling graceful restart"
+    );
+    schedule_graceful_restart(&ctx.shutdown);
+    let msg = format!(
+        "TTS → <code>{}</code>. Restarting in ~300 ms to apply.",
+        sanitize::escape_html(value),
+    );
+    Response::Text(msg)
+}
+
+/// Cancel the root shutdown token after a short delay so the in-flight
+/// reply has time to flush to Telegram before the process exits. The
+/// service manager (launchd / systemd) respawns per its keep-alive
+/// policy. Mirrors `inspect::server::schedule_graceful_restart`.
+fn schedule_graceful_restart(shutdown: &CancellationToken) {
+    let shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        shutdown.cancel();
+    });
+}
+
+/// Invariant 19: cap transcript bytes fed into `parse` so long voice
+/// notes can't bypass text-size limits.
 const MAX_TRANSCRIPT_BYTES: usize = 4000;
 
-/// Samples per second the Opus decoder emits (we configure it at 16 kHz
-/// to match whisper-rs input). Used for the post-decode duration sanity
-/// check below.
 const PCM_SAMPLE_RATE: usize = 16_000;
 
-/// Voice/audio dispatch: downloads the file from Telegram, decodes
-/// OGG/Opus → PCM, runs whisper-rs, returns either the transcript (to
-/// feed into the text path) or an already-user-facing error message
-/// (caller escapes HTML and sends).
-///
-/// Never logs the transcript text — [CLAUDE.md invariant 5] applies to
-/// voice-derived text exactly as it does to `message.text`.
+/// Invariant 5: never log transcript text (secrets can land there too).
 async fn transcribe_voice(
     ctx: &HandlerContext,
     chat_id: i64,
@@ -277,9 +302,6 @@ async fn transcribe_voice(
         );
     };
     let Some(limits) = audio.stt_limits() else {
-        // AudioSubsystem present but STT off inside — shouldn't happen
-        // given we only construct the subsystem when enabled, but be
-        // defensive: any None here is a misconfiguration, not user error.
         return Err("Voice transcription is unavailable right now.".to_string());
     };
 
@@ -317,12 +339,7 @@ async fn transcribe_voice(
         .await
         .map_err(|e| format!("Voice download failed: {e}"))?;
 
-    // Post-download size check. The pre-download guard above uses
-    // `size_bytes` from the `Voice`/`Audio` Bot API field — which is
-    // `Option<u32>` and can be absent entirely. When absent we still
-    // get the actual bytes from `download_file` (bounded at
-    // MAX_FILE_DOWNLOAD_BYTES=50 MiB) but a user who tightened
-    // TELEGRAM_STT_MAX_BYTES expects THEIR cap to apply. Enforce here.
+    // Bot API `size_bytes` is optional; enforce `TELEGRAM_STT_MAX_BYTES` post-download.
     let actual_bytes = u32::try_from(oga_bytes.len()).unwrap_or(u32::MAX);
     if actual_bytes > limits.max_bytes {
         return Err(format!(
@@ -332,7 +349,6 @@ async fn transcribe_voice(
         ));
     }
 
-    // Metadata-only log. Never the transcript.
     tracing::debug!(
         chat_id,
         oga_bytes = oga_bytes.len(),
@@ -340,20 +356,13 @@ async fn transcribe_voice(
         "Voice downloaded"
     );
 
-    // × 2 on the sample budget covers Opus preskip + trailing silence
-    // that whisper ignores. Beyond that we assume adversarial input.
+    // ×2 sample budget covers Opus preskip + trailing silence whisper ignores.
     let max_samples = (limits.max_duration_sec as usize).saturating_mul(16_000).saturating_mul(2);
     let pcm = codec::decode_opus_to_pcm16k(&oga_bytes, max_samples).map_err(|e| {
         format!("Voice decode failed: {e}. Tebis only accepts OGG/Opus voice notes — music files in other formats aren't supported.")
     })?;
 
-    // Defense-in-depth: `duration_sec` above is sender-supplied per the
-    // Telegram Bot API (not server-verified). A malicious client can
-    // lie about duration to bypass the pre-download cap. After we have
-    // real PCM samples, compute actual duration from sample count and
-    // re-check. Opus decode is cheap (~20x real-time), so this adds
-    // negligible latency for honest clients and immediately bails on
-    // exploit attempts before we pay for whisper inference.
+    // `duration_sec` is sender-supplied; re-check against decoded sample count.
     let actual_duration_sec = u32::try_from(pcm.len() / PCM_SAMPLE_RATE).unwrap_or(u32::MAX);
     if actual_duration_sec > limits.max_duration_sec {
         return Err(format!(
@@ -370,10 +379,7 @@ async fn transcribe_voice(
         .map_err(|e| format!("Transcription failed: {e}"))?;
 
     let mut text = transcription.text;
-    // whisper.cpp emits special tokens like `[BLANK_AUDIO]`,
-    // `[Music]`, `(silence)`, `[AUDIO OUT]` when it can't find speech.
-    // Treat them all as empty so the user gets a clean "no speech"
-    // error instead of the internal token string.
+    // whisper.cpp emits `[BLANK_AUDIO]`/`[Music]`/`(silence)` when no speech.
     let trimmed = text.trim();
     let is_silence_token = trimmed.is_empty()
         || trimmed.starts_with('[')
@@ -383,8 +389,6 @@ async fn transcribe_voice(
         return Err("Could not transcribe voice message (no speech detected).".to_string());
     }
     if text.len() > MAX_TRANSCRIPT_BYTES {
-        // Char-boundary-safe truncation — `text.truncate` panics on
-        // multi-byte boundaries. At most 3 iterations (UTF-8 max 4 bytes).
         let mut end = MAX_TRANSCRIPT_BYTES;
         while !text.is_char_boundary(end) {
             end -= 1;
@@ -402,18 +406,7 @@ async fn transcribe_voice(
     Ok(text)
 }
 
-/// Synthesize `body` → OGG/Opus → `sendVoice`. Best-effort; logs and
-/// records a metric on failure but never retries (user already has the
-/// text reply). HTML in the body (from `escape_html`) is stripped to
-/// plain text before synthesis so the TTS engine doesn't read `&lt;`
-/// and friends aloud. Tebis's outbound text is simple — wrapping in
-/// `<pre>`/`<code>` for the /read path is the main offender — so a
-/// straightforward "drop angle-bracket tags" pass suffices.
-///
-/// Takes primitive shared handles rather than `&HandlerContext` because
-/// it runs on the task tracker after the parent handler has already
-/// returned and released its concurrency permit — by design. See the
-/// spawn-site in `handle_update`.
+/// Best-effort TTS + sendVoice. HTML-stripped so TTS doesn't say "ampersand lt".
 async fn synthesize_and_send_voice_detached(
     tg: &crate::telegram::TelegramClient,
     metrics: &crate::metrics::Metrics,
@@ -443,26 +436,15 @@ async fn synthesize_and_send_voice_detached(
     metrics.record_tts_success(synth_ms);
 }
 
-/// Minimal HTML-strip for TTS input. The bodies we send go through
-/// `sanitize::escape_html` (invariant 4) so `<` becomes `&lt;`, but we
-/// also wrap tmux output in `<pre>` / `<code>` tags on some paths.
-/// For synthesis we want the inner text verbatim and no entity names.
+/// Strip the `<pre>`/`<code>` wrappers we produce and decode the
+/// entities `escape_html` emits. Sentinel-swap `&amp;` so we don't
+/// double-decode inputs like `&amp;lt;` (should stay as `&lt;`, not become `<`).
 fn strip_html_for_tts(body: &str) -> String {
-    // Drop obvious tags; decode common entities. This isn't a general
-    // HTML parser — the only tags we produce are `<pre>` and `<code>`
-    // (both single-word, no attributes) and we escape everything else.
     let no_tags = body
         .replace("<pre>", "")
         .replace("</pre>", "")
         .replace("<code>", "")
         .replace("</code>", "");
-    // Decode entities. `&amp;` MUST come last: consider input
-    // "&amp;lt;" (which should decode to literal "&lt;"). If we
-    // decoded `&lt;` first we'd double-decode to "&<". Sentinel
-    // approach: swap `&amp;` for U+0001 first, do the others, then
-    // swap the sentinel back to `&`. U+0001 Start-of-Heading is a C0
-    // control char already stripped by `sanitize::escape_html` on
-    // inbound data, so there's no risk of collision with user text.
     let step1 = no_tags.replace("&amp;", &AMP_SENTINEL.to_string());
     let step2 = step1
         .replace("&lt;", "<")
@@ -472,24 +454,10 @@ fn strip_html_for_tts(body: &str) -> String {
     step2.replace(AMP_SENTINEL, "&")
 }
 
-/// Placeholder used by `strip_html_for_tts` to protect `&amp;` from
-/// double-decoding (see function-level comment).
+/// Sentinel that protects `&amp;` from double-decode.
 const AMP_SENTINEL: char = '\u{0001}';
 
-/// Maximum wall-clock the typing indicator will refresh on the
-/// hook-driven reply path. Once the real reply arrives (via the
-/// notify listener → `send_message`), Telegram clients auto-clear
-/// the indicator. If the hook never delivers, we stop pinging after
-/// this cap so the chat doesn't show typing-dots indefinitely.
-///
-/// 20 s balances:
-/// - **Typing-on-phone patience**: 45 s of no-content typing-dots
-///   reads as "hung". 20 s is long enough for most Claude turns,
-///   short enough that silent failures surface fast.
-/// - **Slow tool loops**: if Claude takes longer than 20 s, the
-///   typing indicator stops but the real reply still lands when the
-///   hook fires — we just don't drive typing past the cap. A user
-///   who wants confirmation can `/read` the pane or `/status`.
+/// Typing-indicator cap on the hook reply path. 20 s balances patience with "looks hung".
 const HOOK_TYPING_CAP: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[cfg(test)]
@@ -518,9 +486,6 @@ mod strip_html_tests {
 
     #[test]
     fn amp_decoded_last_avoids_double_decode() {
-        // "&amp;lt;" represents the literal text `&lt;`, not `<`. If we
-        // decoded &amp; before &lt; we'd get `<` (wrong). The sentinel
-        // pass preserves the correct literal.
         assert_eq!(strip_html_for_tts("&amp;lt;"), "&lt;");
         assert_eq!(strip_html_for_tts("&amp;amp;"), "&amp;");
     }
@@ -534,11 +499,7 @@ mod strip_html_tests {
         );
     }
 
-    /// Contract test: every text that goes through `escape_html` (for
-    /// Telegram HTML mode) must come back out of `strip_html_for_tts`
-    /// as the original string. If someone adds a new entity to
-    /// `escape_html` without updating the decoder here, Kokoro will
-    /// read the raw `&newent;` tokens aloud — catches that early.
+    /// Contract: `strip_html_for_tts` must undo everything `escape_html` adds.
     #[test]
     fn escape_then_strip_is_identity() {
         for input in [
@@ -556,12 +517,6 @@ mod strip_html_tests {
         }
     }
 
-    /// Real-body roundtrip: simulate the path used by error / code
-    /// responses where the escaped payload is wrapped in `<pre>...</pre>`
-    /// before send. The stripper must drop the wrapper tags and decode
-    /// entities so TTS speaks the original text, not `"less-than pre
-    /// greater-than"`. If someone adds a new wrapper tag (e.g. `<b>`)
-    /// without updating `strip_html_for_tts`, this test flags it.
     #[test]
     fn wrapped_body_roundtrips_to_original() {
         for raw in [

@@ -1,10 +1,4 @@
-//! Shared env-file utilities — atomic 0600 write + `KEY=VALUE` parse.
-//!
-//! Every site that touches the env file (`setup`, `inspect` dashboard
-//! editor, `hooks_cli`, `config::load_env_file`, `setup::discover`)
-//! goes through here so parsing + permissions stay consistent. Before
-//! this existed the inspect dashboard's `fs::write` silently dropped
-//! the 0600 mode, exposing the bot token.
+//! Env-file I/O: atomic 0600 write + `KEY=VAL` parse + toggle parser.
 
 use std::fs;
 use std::io;
@@ -13,10 +7,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-/// Atomic write with mode 0600. Creates the tmp file with the right
-/// perms from the start (no umask window), fsyncs, then `rename`s over
-/// the target. A crash at any point leaves either the old file or the
-/// new file intact — never partial, never world-readable.
+/// Atomic write with mode 0600: tmp file opened 0600 (no umask window), fsync,
+/// rename, fsync parent.
 pub fn atomic_write_0600(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -26,10 +18,8 @@ pub fn atomic_write_0600(path: &Path, content: &str) -> Result<()> {
         path.file_name().and_then(|n| n.to_str()).unwrap_or("env")
     ));
 
-    // `mode(0o600)` on `OpenOptions` is honored by `open(2)` before the
-    // first byte is written — umask cannot widen this. We still chmod
-    // after write as belt-and-suspenders against filesystems that lose
-    // the creation mode through e.g. an ACL layer.
+    // `mode(0o600)` on open bypasses umask. chmod after write guards
+    // against ACL layers that lose creation mode.
     {
         use std::io::Write as _;
         let mut f = fs::OpenOptions::new()
@@ -48,13 +38,8 @@ pub fn atomic_write_0600(path: &Path, content: &str) -> Result<()> {
         .with_context(|| format!("chmod 0600 {}", tmp.display()))?;
     fs::rename(&tmp, path)
         .with_context(|| format!("renaming {} → {}", tmp.display(), path.display()))?;
-    // POSIX: `rename(2)` durability requires fsync on the containing
-    // directory. Without this, a crash between the rename and the
-    // implicit dir-inode flush can leave the new filename unresolvable
-    // (target unlinked, tmp renamed but the dir entry hasn't hit disk).
-    // Best-effort — log on failure but don't bail, because on some
-    // filesystems (e.g. NFS, some tmpfs) opening a directory for
-    // reading + fsync isn't permitted.
+    // POSIX: rename durability needs fsync on the containing dir.
+    // Best-effort — NFS/tmpfs may reject dir-fsync.
     if let Some(parent) = path.parent()
         && let Ok(dir) = fs::File::open(parent)
         && let Err(e) = dir.sync_all()
@@ -64,13 +49,7 @@ pub fn atomic_write_0600(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Parse one `KEY=VALUE` line from an env file. Returns `None` for
-/// blanks, comments, or malformed lines. Strips a leading `export `
-/// prefix and surrounding single or double quotes on the value.
-///
-/// We do NOT do full shell expansion — `$FOO` / `${FOO}` / `\n` pass
-/// through verbatim. The env file is expected to contain literal
-/// values; that's how `systemd`'s `EnvironmentFile=` reads them too.
+/// `KEY=VALUE`. No shell expansion; matches systemd's `EnvironmentFile=`.
 pub fn parse_kv_line(raw: &str) -> Option<(&str, &str)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -87,8 +66,6 @@ pub fn parse_kv_line(raw: &str) -> Option<(&str, &str)> {
     Some((key, value))
 }
 
-/// If `s` is wrapped in matching single or double quotes, return the
-/// interior. Otherwise return `s` unchanged.
 fn strip_matched_quotes(s: &str) -> &str {
     if s.len() >= 2 {
         let bytes = s.as_bytes();
@@ -100,14 +77,8 @@ fn strip_matched_quotes(s: &str) -> &str {
     s
 }
 
-/// Parse a feature-flag env-var value. Accepts common on/off synonyms
-/// case-insensitive. Empty string → `None` (use default). Anything
-/// else is an error — we'd rather bail at startup than silently run
-/// with the wrong behavior because the user typo'd `yes` vs `on`.
-///
-/// Every `TELEGRAM_*` toggle goes through here so users can use the
-/// same synonyms everywhere and typos never silently collapse to
-/// a default.
+/// On/off synonym parser. Empty → `None` (use default); unknown → error
+/// so typos fail loudly.
 pub fn parse_toggle(value: &str) -> Result<Option<bool>> {
     match value.trim().to_ascii_lowercase().as_str() {
         "" => Ok(None),
@@ -120,9 +91,30 @@ pub fn parse_toggle(value: &str) -> Result<Option<bool>> {
     }
 }
 
-/// Look up a single key's value without loading every pair. Returns
-/// the first occurrence (env files don't have a documented last-wins
-/// rule, and callers usually set each key once).
+/// Upsert `KEY=value` pairs in `path`, preserving comments + line order.
+/// Missing file is treated as empty. Keys not already present are appended.
+/// Atomic 0600 write via [`atomic_write_0600`].
+pub fn upsert_keys(path: &Path, updates: &[(&str, String)]) -> Result<()> {
+    let current = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines: Vec<String> = current.lines().map(str::to_string).collect();
+
+    for (key, value) in updates {
+        let replaced = lines
+            .iter_mut()
+            .find(|line| parse_kv_line(line).is_some_and(|(k, _)| k == *key));
+        if let Some(line) = replaced {
+            *line = format!("{key}={value}");
+        } else {
+            lines.push(format!("{key}={value}"));
+        }
+    }
+
+    let mut body = lines.join("\n");
+    body.push('\n');
+    atomic_write_0600(path, &body)
+}
+
+/// First occurrence of `key`, or `None` if file/key is missing.
 pub fn read_key(path: &Path, key: &str) -> io::Result<Option<String>> {
     let content = match fs::read_to_string(path) {
         Ok(s) => s,
@@ -190,7 +182,6 @@ mod tests {
         let _ = fs::remove_file(&p);
         atomic_write_0600(&p, "FOO=bar\n").unwrap();
         let meta = fs::metadata(&p).unwrap();
-        // Mask to perm bits; higher bits are file type.
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         assert_eq!(fs::read_to_string(&p).unwrap(), "FOO=bar\n");
         let _ = fs::remove_file(&p);

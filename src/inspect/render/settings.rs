@@ -1,6 +1,4 @@
-//! Inline editor form for the non-secret env vars that make sense to
-//! tune live. Only renders when `BRIDGE_ENV_FILE` is set — otherwise
-//! the user sees a disabled-state notice.
+//! Inline env editor — renders only when `BRIDGE_ENV_FILE` is set.
 
 use crate::inspect::Snapshot;
 use crate::sanitize;
@@ -9,9 +7,7 @@ pub(super) fn build_settings_section(snapshot: &Snapshot) -> String {
     let Some(path) = snapshot.env_file.as_ref() else {
         return r#"<div class="panel"><div class="danger-row"><div class="label"><div class="title">Config editing disabled</div><div class="desc">Set <code>BRIDGE_ENV_FILE</code> to the env file path to enable in-place editing.</div></div></div></div>"#.to_string();
     };
-    // Only offer the autostart-dir field when autostart is actually
-    // configured; editing the path of a non-existent autostart is
-    // pointless.
+    // Only offer the autostart-dir field when autostart is configured.
     let autostart_dir_row = snapshot.autostart.as_ref().map_or_else(String::new, |a| {
         format!(
             r#"<div class="settings-row">

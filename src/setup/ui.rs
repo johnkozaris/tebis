@@ -1,9 +1,4 @@
-//! Terminal rendering primitives for the wizard: headers, dividers, rows,
-//! notices, token masking, end-of-flow summary.
-//!
-//! Idiom: treat the terminal as a document. Body prose at column 0,
-//! examples indented 4 spaces, step dividers as horizontal rules. No frames
-//! or pills — they compete with the prose the user is here to read.
+//! Terminal rendering primitives for the wizard.
 
 use std::path::Path;
 
@@ -29,9 +24,6 @@ pub(super) fn print_welcome() {
     println!();
 }
 
-/// Total wizard steps. Update when steps are added/removed so the
-/// "Step N of TOTAL" banner stays accurate. On non-macOS the TTS step
-/// (step 8) is a no-op; we print the banner anyway for consistency.
 const WIZARD_STEP_COUNT: u8 = 8;
 
 pub(super) fn step_header(n: u8, title: &str) {
@@ -221,8 +213,6 @@ pub(super) fn print_summary(
     println!();
 }
 
-/// Confirmation that the env file was written. Follow-up prompt (run
-/// now / install / exit) is driven by `setup::prompt_next_action`.
 pub(super) fn print_wrote(env_path: &Path) {
     divider_rule("Saved");
     println!(
@@ -234,8 +224,6 @@ pub(super) fn print_wrote(env_path: &Path) {
     print_security_tips();
 }
 
-/// Shown when the user picks "exit" at the end of setup — so they know
-/// exactly how to start tebis later.
 pub(super) fn print_manual_start(env_path: &Path, inspect_port: Option<u16>) {
     println!();
     println!("{} Start tebis later with:", style("›").dim());
