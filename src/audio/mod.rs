@@ -5,6 +5,7 @@ pub mod codec;
 pub mod espeak;
 pub mod fetch;
 pub mod manifest;
+mod progress;
 pub mod stt;
 pub mod tts;
 
@@ -77,16 +78,7 @@ pub struct SttLimits {
 }
 
 impl AudioSubsystem {
-    /// Lazy init. If neither STT nor TTS is enabled in `cfg`, returns a
-    /// subsystem that answers every call with `NotEnabled`. If local STT
-    /// is enabled and the model isn't cached yet, downloads it
-    /// synchronously before returning (blocks startup for ~53 s on a
-    /// fresh install with the default `base.en` model).
-    ///
-    /// `_tracker` and `_shutdown` are carried for future cancellation
-    /// plumbing during the model download — Phase 1 doesn't split
-    /// startup-download into a background task, so they're unused here
-    /// but the signature stays future-compatible.
+    /// Downloads models synchronously on first use (~53s for base.en on fresh install).
     pub async fn new(
         cfg: &AudioConfig,
         _tracker: &TaskTracker,
@@ -109,11 +101,7 @@ impl AudioSubsystem {
             }
         };
 
-        // TTS init is decoupled from STT: a TTS failure must NOT take
-        // STT down with it. A backend that doesn't fit the host platform
-        // (e.g. `say` on Linux, or `kokoro-local` in a build without the
-        // `kokoro` feature) downgrades to `tts = None` so STT stays fully
-        // usable for those users instead of killing both branches.
+        // TTS init failure must not take STT down.
         let (tts, tts_voice, tts_respond_to_all, tts_backend_kind, tts_detail) = match &cfg.tts {
             None => (None, None, false, "none", None),
             Some(tcfg) => match build_tts(tcfg, &shutdown).await {
@@ -161,50 +149,34 @@ impl AudioSubsystem {
         }))
     }
 
-    /// Transcribe 16 kHz mono `f32` PCM samples. Returns
-    /// [`AudioError::NotEnabled`] if STT was not initialized.
+    /// Transcribe 16 kHz mono `f32` PCM.
     pub async fn transcribe(&self, pcm: &[f32], lang: &str) -> Result<Transcription, AudioError> {
         let stt = self.stt.as_ref().ok_or(AudioError::NotEnabled { feature: "stt" })?;
         Ok(stt.transcribe(pcm, lang).await?)
     }
 
-    /// Which STT model is loaded (for dashboard display). `None` if
-    /// STT is disabled.
     pub fn stt_model_name(&self) -> Option<&str> {
         self.stt_model_name.as_deref()
     }
 
-    /// STT duration + byte caps for the bridge to enforce BEFORE
-    /// downloading a voice file. `None` when STT is disabled.
     pub const fn stt_limits(&self) -> Option<SttLimits> {
         self.stt_limits
     }
 
-    /// ISO-639-1 language hint to pass to whisper. `""` (empty) means
-    /// auto-detect. Returns `None` when STT is disabled.
     pub fn stt_language(&self) -> Option<&str> {
         self.stt_language.as_deref()
     }
 
-    /// Name of the TTS voice currently loaded (e.g. `"Samantha"` for
-    /// the `say` backend). `None` when TTS is disabled OR initialization
-    /// failed (e.g. unsupported platform). The dashboard reads this to
-    /// show real runtime state instead of what the user configured.
+    /// Returns the real runtime voice — `None` if TTS init failed.
     pub fn tts_voice(&self) -> Option<&str> {
         self.tts.as_ref()?;
         self.tts_voice.as_deref()
     }
 
-    /// Whether every outbound reply also triggers a voice reply, or
-    /// only replies to inbound voice messages. Honors the subsystem's
-    /// actual initialized state — returns `false` when TTS init failed.
     pub const fn tts_respond_to_all(&self) -> bool {
         self.tts.is_some() && self.tts_respond_to_all
     }
 
-    /// Backend kind string for the dashboard. `"none"` when TTS is off
-    /// or init failed; otherwise `"say"` / `"kokoro-local"` /
-    /// `"kokoro-remote"`.
     pub const fn tts_backend_kind(&self) -> &'static str {
         if self.tts.is_none() {
             "none"
@@ -213,25 +185,12 @@ impl AudioSubsystem {
         }
     }
 
-    /// Backend-specific display detail for the dashboard. For
-    /// `kokoro-remote` this is the redacted host; for `kokoro-local`
-    /// it's the model key. `None` when `say` / `none`.
     pub fn tts_detail(&self) -> Option<&str> {
         self.tts.as_ref()?;
         self.tts_detail.as_deref()
     }
 
-    /// Synthesize `text` to an OGG/Opus byte blob ready for `sendVoice`.
-    /// Returns the encoded bytes **and** the accurate audio duration in
-    /// seconds.
-    ///
-    /// Backend dispatch:
-    /// - `Say` (macOS): PCM from `say` → encode to OGG/Opus via codec.
-    /// - `Remote`: the server returns OGG/Opus already, pass through
-    ///   verbatim; duration is extracted by decoding to PCM and counting
-    ///   samples (cheap, reuses the inbound STT decode path).
-    ///
-    /// Returns [`AudioError::NotEnabled`] when TTS is off.
+    /// Synthesize `text` → OGG/Opus + duration in seconds for `sendVoice`.
     pub async fn synthesize(&self, text: &str) -> Result<(Bytes, u32), AudioError> {
         let backend = self
             .tts
@@ -258,25 +217,12 @@ impl AudioSubsystem {
         }
     }
 
-    /// Whether the caller should voice-reply to a given inbound payload.
-    /// `is_voice_reply` is true when the originating user message was a
-    /// voice/audio payload; when false we only voice-reply if the
-    /// `respond_to_all` config flag is set.
+    /// `is_voice_reply=true` when the inbound was voice. `respond_to_all` else.
     pub const fn should_tts_reply(&self, is_voice_reply: bool) -> bool {
         self.tts.is_some() && (is_voice_reply || self.tts_respond_to_all)
     }
 }
 
-/// Construct the concrete TTS backend from the configured variant.
-///
-/// - `Say` on macOS → probe `say` + wrap in `SayTts`.
-/// - `Say` on non-macOS → `UnsupportedPlatform` (validated at config
-///   load, but the check here makes the type-system branching
-///   exhaustive).
-/// - `KokoroLocal` → `Init` error until the feature-gated backend lands
-///   (task #46). The subsystem handles the error by falling back to
-///   text-only replies (see [`AudioSubsystem::new`]).
-/// - `Remote` → construct the HTTP client; no network I/O here.
 #[cfg_attr(not(feature = "kokoro"), allow(unused_variables))]
 async fn build_tts(
     cfg: &TtsConfig,
@@ -297,9 +243,7 @@ async fn build_tts(
         tts::BackendConfig::KokoroLocal { model, voice } => {
             #[cfg(feature = "kokoro")]
             {
-                // Thread the parent shutdown so Ctrl-C during the 346 MB
-                // Kokoro model download cancels promptly instead of
-                // running to completion then exiting.
+                // Thread shutdown so Ctrl-C cancels the 346 MB download promptly.
                 build_kokoro_local(model, voice, shutdown.clone()).await
             }
             #[cfg(not(feature = "kokoro"))]
@@ -332,9 +276,7 @@ async fn build_tts(
     }
 }
 
-/// Returns `(LocalStt, model_name_for_display)`. The only backend tebis
-/// ships — if the model download or whisper-rs load fails, the caller
-/// logs a warn and the bridge continues text-only.
+/// Returns `(LocalStt, model_name_for_display)`.
 async fn build_local_stt(
     cfg: &SttConfig,
     shutdown: CancellationToken,
@@ -352,10 +294,6 @@ async fn build_local_stt(
     let model_path = cache::model_path(&file_name)
         .context("resolving model cache path")?;
 
-    // `model_path` is always `<base>/models/<file>`, so `.parent()` is
-    // always `Some` — but fall back to the models dir explicitly rather
-    // than trusting `unwrap_or(&model_path)` which would feed a file
-    // path to `read_dir` and surface a confusing `NotADirectory` error.
     let models_dir = cache::models_dir()?;
     cache::reap_stale_tmps(&models_dir)
         .context("reaping stale .tmp files in models dir")?;
@@ -370,10 +308,7 @@ async fn build_local_stt(
     match stt::local::LocalStt::load(&model_path, cfg.threads, &cfg.language) {
         Ok(backend) => Ok((backend, cfg.model.clone())),
         Err(load_err) if was_cached => {
-            // Cached file exists but whisper refuses it — most likely
-            // truncated by disk-full / power-loss / user tampering.
-            // Delete and refetch once; if the fresh download still
-            // fails to load, bubble up.
+            // Corrupt cache (truncation, tampering) — refetch once.
             tracing::warn!(
                 err = %load_err,
                 path = %model_path.display(),
@@ -389,9 +324,7 @@ async fn build_local_stt(
     }
 }
 
-/// Download an STT model asset with SHA verification + progress log.
-/// Extracted so the corrupt-cache-recovery path in `build_local_stt`
-/// can reuse the exact same fetch without duplicating the closure.
+/// SHA-verified download with progress log. Shared between happy path and corrupt-cache retry.
 async fn download_stt_model(
     model_key: &str,
     asset: &manifest::SttModel,
@@ -407,50 +340,38 @@ async fn download_stt_model(
         asset.display_name
     );
 
-    let mut last_logged = 0u64;
-    client
+    let mut reporter = progress::Reporter::new(
+        &format!("Whisper {model_key}"),
+        Some(asset.size_bytes),
+    );
+    let result = client
         .download_verified(
             &asset.url,
             &asset.sha256,
             &tmp,
             model_path,
-            |bytes, total| {
-                const LOG_EVERY: u64 = 8 * 1024 * 1024;
-                if bytes.saturating_sub(last_logged) >= LOG_EVERY {
-                    last_logged = bytes;
-                    if let Some(t) = total {
-                        tracing::info!(
-                            "  …downloaded {} / {} MB",
-                            bytes / (1024 * 1024),
-                            t / (1024 * 1024),
-                        );
-                    } else {
-                        tracing::info!("  …downloaded {} MB", bytes / (1024 * 1024));
-                    }
-                }
-            },
+            |bytes, total| reporter.update(bytes, total),
             shutdown,
         )
         .await
-        .context("downloading local STT model")?;
+        .context("downloading local STT model");
+    match &result {
+        Ok(()) => reporter.finish("done"),
+        Err(_) => reporter.finish("failed"),
+    }
+    result?;
     tracing::info!(model = %model_key, "Model download + verification complete");
     Ok(())
 }
 
-/// Build the local Kokoro backend end-to-end: probe espeak-ng,
-/// SHA-verified download of model + voice, ort session load.
-///
-/// espeak-ng is probed early so users see a clear install message at
-/// startup instead of a cryptic process-spawn failure at first synth.
+/// Probe espeak-ng early; SHA-verified model + voice download; ort load.
 #[cfg(feature = "kokoro")]
 async fn build_kokoro_local(
     model_key: &str,
     voice: &str,
     shutdown: CancellationToken,
 ) -> Result<tts::Backend, TtsError> {
-    // Early espeak-ng probe. espeak-ng is a runtime requirement for
-    // every synth call; no point loading a 346 MB ONNX if it'll never
-    // produce a single sample.
+    // Early probe — no point loading 346 MB ONNX if we can't phonemize.
     if espeak::probe().is_none() {
         return Err(TtsError::Init(
             "espeak-ng not found on PATH — local Kokoro requires it. \
@@ -461,7 +382,6 @@ async fn build_kokoro_local(
         ));
     }
 
-    // Validate + look up manifest entry.
     let manifest = manifest::get();
     manifest
         .validate_tts_usable(model_key)
@@ -473,9 +393,7 @@ async fn build_kokoro_local(
         .validate_voice(model_key, voice)
         .map_err(|e| TtsError::Init(format!("TTS voice: {e}")))?;
 
-    // Resolve cache paths. Voice files go into `models/` alongside the
-    // ONNX — same dir simplifies `KokoroTts::load`, which just
-    // concatenates `<voices_dir>/<voice_name>.bin` at synth time.
+    // Voices colocate with ONNX in `models/` — `KokoroTts::load` just concatenates.
     let models_dir = cache::models_dir()
         .map_err(|e| TtsError::Init(format!("models dir: {e}")))?;
     cache::reap_stale_tmps(&models_dir)
@@ -503,11 +421,7 @@ async fn build_kokoro_local(
     )
     .await?;
 
-    // Load ONNX — blocking, ~500 ms cold start. Spawn_blocking to
-    // avoid stalling the startup event loop for the other init paths.
-    // On a corrupt cached file (truncated by disk-full, user tampering,
-    // etc.) delete both files and refetch once. Without this, the
-    // daemon loops on load-fail forever.
+    // ~500ms cold start → spawn_blocking. Refetch-once on corrupt cache.
     let load_attempt = {
         let model_path_c = model_path.clone();
         let voices_dir_c = models_dir.clone();
@@ -556,11 +470,7 @@ async fn build_kokoro_local(
     Ok(tts::Backend::Kokoro(Box::new(backend)))
 }
 
-/// Download ONNX model + voice file if either is absent on disk. No-op
-/// when both are already cached (the caller has verified this for the
-/// happy path; used on the corrupt-cache retry path to re-fetch after
-/// deletion). Extracted so the happy-path and retry-path share one
-/// definition — drift between them once broke SHA verification.
+/// No-op when both assets cached. Shared between first-run + corrupt-cache retry.
 #[cfg(feature = "kokoro")]
 #[allow(
     clippy::too_many_arguments,
@@ -584,56 +494,59 @@ async fn download_kokoro_if_missing(
             model_entry.onnx_size_bytes / (1024 * 1024),
         );
         let tmp = cache::tmp_path_for(model_path);
-        let mut last_logged = 0u64;
-        client
+        let mut reporter = progress::Reporter::new(
+            &format!("Kokoro {model_key}"),
+            Some(model_entry.onnx_size_bytes),
+        );
+        let result = client
             .download_verified(
                 &model_entry.onnx_url,
                 &model_entry.onnx_sha256,
                 &tmp,
                 model_path,
-                |bytes, total| {
-                    const LOG_EVERY: u64 = 32 * 1024 * 1024;
-                    if bytes.saturating_sub(last_logged) >= LOG_EVERY {
-                        last_logged = bytes;
-                        if let Some(t) = total {
-                            tracing::info!(
-                                "  …{} / {} MB",
-                                bytes / (1024 * 1024),
-                                t / (1024 * 1024),
-                            );
-                        }
-                    }
-                },
+                |bytes, total| reporter.update(bytes, total),
                 shutdown.clone(),
             )
             .await
-            .map_err(|e| TtsError::Init(format!("download Kokoro model: {e}")))?;
+            .map_err(|e| TtsError::Init(format!("download Kokoro model: {e}")));
+        match &result {
+            Ok(()) => reporter.finish("done"),
+            Err(_) => reporter.finish("failed"),
+        }
+        result?;
         tracing::info!("Kokoro model downloaded + SHA-verified");
     }
 
     if !voice_path.exists() {
         tracing::info!(voice = %voice, "Downloading Kokoro voice (~510 KB)…");
         let tmp = cache::tmp_path_for(voice_path);
-        client
+        // Voice files are tiny (~510 KB); still show a bar on TTY for
+        // consistency, but total is the manifest's declared size.
+        let mut reporter = progress::Reporter::new(
+            &format!("Voice {voice}"),
+            Some(voice_asset.size_bytes),
+        );
+        let result = client
             .download_verified(
                 &voice_asset.url,
                 &voice_asset.sha256,
                 &tmp,
                 voice_path,
-                |_, _| {},
+                |bytes, total| reporter.update(bytes, total),
                 shutdown,
             )
             .await
-            .map_err(|e| TtsError::Init(format!("download voice `{voice}`: {e}")))?;
+            .map_err(|e| TtsError::Init(format!("download voice `{voice}`: {e}")));
+        match &result {
+            Ok(()) => reporter.finish("done"),
+            Err(_) => reporter.finish("failed"),
+        }
+        result?;
     }
     Ok(())
 }
 
-/// Return a dashboard-ready detail string for the configured TTS
-/// backend. For `kokoro-remote` we extract only the host portion of
-/// the URL — the path and query could theoretically contain secrets
-/// (someone embedding an auth token in the path on a `*.hf.space`
-/// endpoint), so we clip before any `/` after the scheme.
+/// Dashboard detail — remote URLs are host-only (path could carry secrets).
 fn display_detail_for(cfg: &tts::BackendConfig) -> Option<String> {
     match cfg {
         tts::BackendConfig::Say { .. } => None,
@@ -642,9 +555,7 @@ fn display_detail_for(cfg: &tts::BackendConfig) -> Option<String> {
     }
 }
 
-/// Extract `host[:port]` from `https://host[:port]/path?query`. Falls
-/// back to the input string if no `://` is present — defensive rather
-/// than an error, since config parsing already enforces the scheme.
+/// Extract `host[:port]` from a URL. Falls through on missing scheme.
 fn redacted_host_from_url(url: &str) -> String {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let host_end = after_scheme
@@ -653,14 +564,9 @@ fn redacted_host_from_url(url: &str) -> String {
     after_scheme[..host_end].to_string()
 }
 
-/// Extract the filename from an HF download URL (the basename of the
-/// path). HF uses `https://.../resolve/main/<filename>` with no query
-/// string, so `rsplit('/').next()` is sufficient.
+/// Basename of an HF download URL.
 fn filename_from_url(url: &str) -> String {
-    // Strip optional query string defensively, in case an upstream URL
-    // ever grows one. `rsplit('/').next()` on a URL ending with `/`
-    // returns `""` — fall back to a generic name so we never cache a
-    // file with an empty stem.
+    // Strip query string defensively — falls back to a generic name on a trailing `/`.
     let no_query = url.split('?').next().unwrap_or(url);
     no_query
         .rsplit('/')
@@ -721,8 +627,6 @@ mod tests {
 
     #[test]
     fn redacted_host_handles_missing_scheme() {
-        // Defensive — config validation enforces https/http, but a
-        // user hand-editing the env file could produce anything.
         assert_eq!(redacted_host_from_url("bare-host"), "bare-host");
     }
 }

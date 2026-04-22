@@ -1,9 +1,4 @@
-//! Runtime `espeak-ng` probe for the audio subsystem.
-//!
-//! Non-interactive, dependency-free. The wizard's interactive
-//! install flow (`setup::phonemizer`) re-uses [`probe`] to check
-//! whether an install is needed; from the audio side we only care
-//! whether the binary exists right now.
+//! Runtime `espeak-ng` probe.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -13,8 +8,7 @@ pub struct EspeakInfo {
     pub path: PathBuf,
 }
 
-/// `espeak-ng --version` exit-0 + resolve the binary on `$PATH`.
-/// Returns `None` if the binary is missing or doesn't run.
+/// `espeak-ng --version` exit-0 + resolve on `$PATH`.
 pub fn probe() -> Option<EspeakInfo> {
     let out = Command::new("espeak-ng").arg("--version").output().ok()?;
     if !out.status.success() {
@@ -23,8 +17,7 @@ pub fn probe() -> Option<EspeakInfo> {
     which_in_path("espeak-ng").map(|path| EspeakInfo { path })
 }
 
-/// Minimal `which` — walk `$PATH` for `name`, return first file-existing
-/// hit. Avoids pulling in the `which` crate for one call site.
+/// Walk `$PATH`, return first file-existing hit.
 pub(crate) fn which_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -42,7 +35,6 @@ mod tests {
 
     #[test]
     fn which_finds_sh() {
-        // `/bin/sh` exists on every POSIX host the tests run on.
         assert!(which_in_path("sh").is_some());
     }
 

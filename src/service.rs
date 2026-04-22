@@ -175,7 +175,7 @@ fn install_linux() -> Result<()> {
     Ok(())
 }
 
-pub fn uninstall(purge: bool) -> Result<()> {
+pub fn uninstall(purge_flag: bool) -> Result<()> {
     println!();
     println!(
         "{}  Removing tebis background service…",
@@ -191,32 +191,63 @@ pub fn uninstall(purge: bool) -> Result<()> {
     let env_dir = home_dir()?.join(".config/tebis");
     let data_dir = crate::agent_hooks::data_dir().ok();
 
-    if purge {
-        purge_user_state(&bin, &env_dir, data_dir.as_deref())?;
-    } else {
-        println!();
-        println!("{}  Service removed.", style("✓").green().bold());
-        println!();
-        println!(
-            "    {}",
-            style("Left in place (remove manually if desired):").dim()
-        );
+    println!();
+    println!("{}  Service removed.", style("✓").green().bold());
+
+    // Show what's eligible for purge (binary, env, data cache). If
+    // nothing, skip the prompt entirely.
+    let purge_candidates: Vec<&Path> = {
+        let mut v: Vec<&Path> = Vec::new();
         if bin.exists() {
-            println!("    {}", short(&bin));
+            v.push(&bin);
         }
         if env_dir.exists() {
-            println!("    {}", short(&env_dir));
+            v.push(&env_dir);
         }
         if let Some(d) = data_dir.as_deref()
             && d.exists()
         {
-            println!("    {}", short(d));
+            v.push(d);
         }
+        v
+    };
+
+    if purge_candidates.is_empty() {
+        println!();
+        return Ok(());
+    }
+
+    println!();
+    println!("    {}", style("User-state paths still on disk:").dim());
+    for p in &purge_candidates {
+        println!("    {}", short(p));
+    }
+
+    // CLI flag wins. Otherwise prompt on a TTY; non-interactive
+    // invocations (scripts, CI) default to no-purge — same as the old
+    // conservative behavior before `--purge` existed.
+    let should_purge = if purge_flag {
+        true
+    } else if console::Term::stdout().is_term() {
+        // Stdout-is-tty is a reliable-enough proxy for "user at a terminal".
+        // A pipe (scripts, CI) takes the else-branch and leaves state alone.
+        println!();
+        dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt("Also purge these (env, models, hook manifest)?")
+            .default(false)
+            .interact()
+            .unwrap_or(false)
+    } else {
         println!();
         println!(
             "    {}",
-            style("  (pass `--purge` to remove everything above in one go.)").dim()
+            style("(non-interactive — left in place. Pass `--purge` to remove.)").dim()
         );
+        false
+    };
+
+    if should_purge {
+        purge_user_state(&bin, &env_dir, data_dir.as_deref())?;
     }
     println!();
     Ok(())

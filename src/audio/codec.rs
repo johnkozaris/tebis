@@ -1,18 +1,4 @@
-//! OGG/Opus ⇄ PCM codec for Telegram voice messages.
-//!
-//! Tebis inbound path: Telegram voice notes arrive as OGG containers
-//! holding Opus-encoded 16 kHz mono audio. `whisper-rs` wants `Vec<f32>`
-//! at 16 kHz mono in `[-1.0, 1.0]`. This module bridges that.
-//!
-//! Implementation uses:
-//! - [`ogg`] (pure-Rust OGG container demux) to split the stream into
-//!   packets.
-//! - [`opus`] (safe bindings to `libopus`) to decode each audio packet
-//!   into PCM `f32`. The decoder is configured at 16 kHz so Opus's
-//!   own resampler handles any 48→16 kHz conversion internally — we
-//!   never touch resampling ourselves.
-//!
-//! The outbound (TTS) encode path lives as a stub — Phase 4 work.
+//! OGG/Opus ⇄ PCM for Telegram voice via [`ogg`] + [`opus`].
 
 use std::io::Cursor;
 
@@ -47,31 +33,14 @@ pub enum CodecError {
     DecodedTooLarge { max_samples: usize, max_sec: u32 },
 }
 
-/// Maximum PCM samples a single Opus packet can decode to, per channel.
-/// Opus's hard limit is 120 ms; at 16 kHz that's 1920 samples. We use
-/// double that (5760) as headroom — cheap slack against future Opus
-/// quirks, and whisper-rs ignores unused trailing samples anyway.
+/// Headroom over Opus's 120 ms × 16 kHz = 1920 per-packet limit.
 const MAX_SAMPLES_PER_PACKET: usize = 5760;
 
-/// Expected sample rate for whisper-rs input.
 const OUTPUT_RATE: u32 = 16_000;
 
-/// Decode an OGG/Opus byte blob (e.g. a Telegram `voice` download) into
-/// 16 kHz mono PCM `f32` samples in `[-1.0, 1.0]`. The first two OGG
-/// packets (`OpusHead` + `OpusTags`) are metadata and skipped.
-///
-/// `max_samples` caps the output. The byte-input cap is not sufficient
-/// alone — Opus compresses aggressively, so a malicious input with many
-/// 1-byte packets can decode to tens of GB of PCM from a modestly-sized
-/// input. Pass `max_duration_sec * 16_000 * 2` (the × 2 is slack for
-/// stream preskip / trailing silence that whisper ignores).
-///
-/// Rejects multi-channel input outright — Telegram voice is always
-/// mono, and silently downmixing stereo would be a footgun. If you hit
-/// [`CodecError::UnsupportedChannels`] in practice, it means Telegram
-/// shipped a music file via `sendAudio`, not a voice note; the bridge
-/// should either re-mux to mono before calling this or reject the
-/// attachment upstream.
+/// OGG/Opus → 16 kHz mono `f32` in `[-1.0, 1.0]`. `max_samples` caps
+/// output — byte-input cap alone isn't enough (Opus compresses hard).
+/// Rejects multi-channel; downmixing silently would be a footgun.
 pub fn decode_opus_to_pcm16k(
     oga_bytes: &[u8],
     max_samples: usize,
@@ -82,21 +51,13 @@ pub fn decode_opus_to_pcm16k(
 
     let mut reader = PacketReader::new(Cursor::new(oga_bytes));
 
-    // First packet: OpusHead. Magic `b"OpusHead"` at offset 0, channel
-    // count at offset 9. We parse just enough to reject stereo up-front
-    // — the rest of the header (preskip, input_sample_rate, output_gain,
-    // channel_mapping) doesn't matter because we ask libopus to emit
-    // 16 kHz mono regardless of source rate.
+    // OpusHead: magic at 0, channel count at 9. libopus handles preskip/rate/mapping.
     let head = reader
         .read_packet()
         .map_err(|e| CodecError::OggRead(e.to_string()))?
         .ok_or_else(|| CodecError::Decode("no packets in OGG stream".to_string()))?;
 
-    // A valid OpusHead is at least 19 bytes: 8-byte magic + 11 bytes of
-    // fixed fields (version, channels, preskip, input_sample_rate,
-    // output_gain, channel_mapping_family). Checking `< 19` catches
-    // truncated / maliciously short headers up front; libopus would fail
-    // later anyway but with a less useful error.
+    // OpusHead ≥ 19 bytes (magic + fixed fields); shorter = truncated/malformed.
     if head.data.len() < 19 || &head.data[..8] != b"OpusHead" {
         return Err(CodecError::NotOpus);
     }
@@ -105,7 +66,6 @@ pub fn decode_opus_to_pcm16k(
         return Err(CodecError::UnsupportedChannels(channel_count));
     }
 
-    // Second packet: OpusTags (metadata). Ignored.
     let _tags = reader
         .read_packet()
         .map_err(|e| CodecError::OggRead(e.to_string()))?
@@ -133,9 +93,6 @@ pub fn decode_opus_to_pcm16k(
         if out.len().saturating_add(n) > max_samples {
             return Err(CodecError::DecodedTooLarge {
                 max_samples,
-                // Truncating cast: u32::from(usize) isn't infallible on 64-bit.
-                // max_samples is a user-supplied budget; if it overflows u32
-                // the error message is informational, not load-bearing.
                 #[allow(
                     clippy::cast_possible_truncation,
                     reason = "max_samples is a budget; the error message is informational"
@@ -155,10 +112,8 @@ pub fn decode_opus_to_pcm16k(
     Ok(out)
 }
 
-/// Encode mono `f32` PCM to OGG/Opus for `sendVoice`. 20 ms frames,
-/// VoIP complexity. `sample_rate` must be a native Opus rate: 8k,
-/// 12k, 16k, 24k, or 48k Hz. Encoding at the source rate dodges the
-/// aliasing we hit when we downsampled in-house.
+/// Mono `f32` PCM → OGG/Opus for `sendVoice`. 20 ms frames, VoIP.
+/// `sample_rate` ∈ {8k, 12k, 16k, 24k, 48k} Hz.
 pub fn encode_pcm_to_opus(pcm: &[f32], sample_rate: u32) -> Result<Bytes, CodecError> {
     use opus::{Application, Encoder as OpusEncoder};
 
@@ -174,23 +129,18 @@ pub fn encode_pcm_to_opus(pcm: &[f32], sample_rate: u32) -> Result<Bytes, CodecE
 
     let mut encoder = OpusEncoder::new(sample_rate, Channels::Mono, Application::Voip)
         .map_err(|e| CodecError::Encode(format!("encoder init: {e}")))?;
-    // Per RFC 7845 §5.1, OpusHead preskip should be the encoder's
-    // lookahead so decoders trim the warmup pop at the start of the
-    // first frame. libopus reports this via opus_encoder_ctl;
-    // `get_lookahead` is the opus crate's safe wrapper. Fallback to 0
-    // if the call fails (no ambient audio issue — just a small click).
+    // Per RFC 7845 §5.1 — preskip = encoder lookahead trims warmup pop.
     let preskip: u16 = encoder
         .get_lookahead()
         .ok()
         .and_then(|n| u16::try_from(n).ok())
         .unwrap_or(0);
 
-    // Pad the input to a whole number of frames. Telegram tolerates the
-    // ~20 ms of trailing silence, and Opus needs fixed-size input.
+    // Pad to whole frames; Opus needs fixed-size input.
     let total_samples = pcm.len().div_ceil(frame_samples) * frame_samples;
 
     let mut packets: Vec<Vec<u8>> = Vec::with_capacity(total_samples / frame_samples);
-    let mut buf = vec![0u8; 4000]; // Opus packets typically < 500 B, but headroom is cheap.
+    let mut buf = vec![0u8; 4000];
     let mut frame_buf = vec![0.0_f32; frame_samples];
     let mut offset = 0;
     while offset < total_samples {
@@ -209,12 +159,7 @@ pub fn encode_pcm_to_opus(pcm: &[f32], sample_rate: u32) -> Result<Bytes, CodecE
         offset += frame_samples;
     }
 
-    // Mux into an OGG container. Serial number is arbitrary (Telegram
-    // ignores it but the OGG spec requires a unique stream-serial in
-    // the page header); low 32 bits of the current micros work.
-    // Casting after the `& 0xFFFF_FFFF` mask is infallible — we use
-    // `as u32` rather than `try_from` so the dead `unwrap_or` fallback
-    // goes away.
+    // OGG serial is arbitrary but required to be unique — use clock micros.
     #[allow(clippy::cast_possible_truncation, reason = "masked to 32 bits explicitly")]
     let serial: u32 = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -224,13 +169,11 @@ pub fn encode_pcm_to_opus(pcm: &[f32], sample_rate: u32) -> Result<Bytes, CodecE
     {
         let mut writer = ogg::writing::PacketWriter::new(std::io::Cursor::new(&mut out));
 
-        // OpusHead (19 bytes): magic + version(1) + channels(1) +
-        // preskip(0) + input_rate(16000) + output_gain(0) +
-        // channel_mapping_family(0).
+        // OpusHead 19B: magic + ver + channels + preskip + rate + gain + mapping_family.
         let mut head = Vec::with_capacity(19);
         head.extend_from_slice(b"OpusHead");
-        head.push(1); // version
-        head.push(1); // channel count: mono
+        head.push(1);
+        head.push(1);
         head.extend_from_slice(&preskip.to_le_bytes());
         head.extend_from_slice(&sample_rate.to_le_bytes());
         head.extend_from_slice(&0i16.to_le_bytes());
@@ -239,7 +182,6 @@ pub fn encode_pcm_to_opus(pcm: &[f32], sample_rate: u32) -> Result<Bytes, CodecE
             .write_packet(head, serial, ogg::PacketWriteEndInfo::EndPage, 0)
             .map_err(|e| CodecError::Encode(format!("ogg OpusHead: {e}")))?;
 
-        // OpusTags: magic + empty vendor + empty user-comments.
         let mut tags = Vec::with_capacity(16);
         tags.extend_from_slice(b"OpusTags");
         tags.extend_from_slice(&0u32.to_le_bytes());
@@ -248,16 +190,9 @@ pub fn encode_pcm_to_opus(pcm: &[f32], sample_rate: u32) -> Result<Bytes, CodecE
             .write_packet(tags, serial, ogg::PacketWriteEndInfo::EndPage, 0)
             .map_err(|e| CodecError::Encode(format!("ogg OpusTags: {e}")))?;
 
-        // Audio packets. OGG Opus granule positions are counted at
-        // 48 kHz regardless of encoded rate. For 16 kHz input: × 3 =
-        // 960 per 20 ms frame. For 24 kHz: × 2 = 960. For 48 kHz: ×1
-        // = 960. All 20 ms frames resolve to 960 at 48 kHz. (The prior
-        // formula was off by a factor of 1000; fixed here.)
+        // OGG Opus granule = 48 kHz ticks regardless of encode rate.
         let granule_per_frame = (frame_samples as u64) * 48_000 / u64::from(sample_rate);
         let mut granule: u64 = 0;
-        // Use Peekable to identify the final packet without `len() - 1`
-        // arithmetic (which would panic on empty `packets`, even though
-        // the `pcm.is_empty()` check above already guarantees non-empty).
         let mut iter = packets.into_iter().peekable();
         while let Some(pkt) = iter.next() {
             granule += granule_per_frame;
@@ -275,10 +210,7 @@ pub fn encode_pcm_to_opus(pcm: &[f32], sample_rate: u32) -> Result<Bytes, CodecE
     Ok(Bytes::from(out))
 }
 
-/// 20 ms frame size. Opus natively supports 2.5/5/10/20/40/60 ms;
-/// 20 ms is Telegram voice's de-facto frame size. The actual sample
-/// count per frame depends on the encoder's sample rate and is
-/// computed inline in `encode_pcm_to_opus`.
+/// Telegram voice's de-facto frame size.
 const FRAME_MS: usize = 20;
 
 #[cfg(test)]
@@ -305,9 +237,6 @@ mod tests {
         assert!(CodecError::NotOpus.to_string().contains("OpusHead"));
     }
 
-    /// Sample budget that comfortably exceeds any test case here —
-    /// 10 minutes at 16 kHz. Keeps call sites readable without
-    /// hardcoding the literal in every test.
     const TEST_SAMPLE_BUDGET: usize = 600 * 16_000;
 
     #[test]
@@ -318,14 +247,8 @@ mod tests {
 
     #[test]
     fn decode_rejects_non_opus() {
-        // 16 bytes of garbage — not OpusHead, not even a valid OGG page,
-        // so the ogg reader should error out before we get to the magic
-        // check. Either error is fine; we just need a clean error path.
         let garbage = vec![0xffu8; 16];
         let err = decode_opus_to_pcm16k(&garbage, TEST_SAMPLE_BUDGET).unwrap_err();
-        // Don't assert on the specific variant — ogg-crate's parser
-        // may report it as an OggRead or the downstream packet reader
-        // may surface it differently across versions.
         let msg = err.to_string();
         assert!(
             msg.contains("ogg") || msg.contains("OpusHead") || msg.contains("no packets"),
@@ -333,20 +256,15 @@ mod tests {
         );
     }
 
-    /// Round-trip exercise using both public codec fns: encode 1 s of
-    /// silence, decode it back, assert sample count + amplitude.
-    /// Replaces the old inline-encoder test now that `encode_pcm_to_opus`
-    /// is a real public API.
     #[test]
     fn encode_decode_round_trip_silence() {
-        let silence = vec![0.0_f32; OUTPUT_RATE as usize]; // 1 s
+        let silence = vec![0.0_f32; OUTPUT_RATE as usize];
         let oga_bytes = encode_pcm_to_opus(&silence, OUTPUT_RATE).expect("encode");
         assert!(!oga_bytes.is_empty());
-        // OGG pages always start with "OggS".
         assert_eq!(&oga_bytes[..4], b"OggS");
 
         let pcm = decode_opus_to_pcm16k(&oga_bytes, TEST_SAMPLE_BUDGET).expect("decode");
-        // Opus has a small internal preskip + latency; allow tolerance.
+        // Opus preskip + latency — allow tolerance.
         assert!(
             pcm.len() > 14_000 && pcm.len() < 18_000,
             "unexpected sample count: {}",
@@ -356,16 +274,10 @@ mod tests {
         assert!(peak < 0.05, "silence decoded with peak {peak}");
     }
 
-    /// A byte-input cap alone is insufficient: low-bitrate Opus can
-    /// decode to far more output than input. This test encodes 2 s of
-    /// silence, then decodes with a sample budget that's too small
-    /// by ~2× and asserts we bail with the specific variant (rather
-    /// than allocating unbounded PCM).
     #[test]
     fn decode_rejects_output_over_budget() {
         let two_sec = vec![0.0_f32; (OUTPUT_RATE as usize) * 2];
         let oga_bytes = encode_pcm_to_opus(&two_sec, OUTPUT_RATE).expect("encode");
-        // Budget of 1 s < 2 s of actual audio.
         let budget = OUTPUT_RATE as usize;
         let err = decode_opus_to_pcm16k(&oga_bytes, budget).unwrap_err();
         assert!(

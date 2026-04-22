@@ -15,6 +15,7 @@ pub use crate::audio::espeak::{EspeakInfo, probe as probe_espeak_ng};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageManager {
     Brew,
+    MacPorts,
     Apt,
     Dnf,
     Pacman,
@@ -27,6 +28,7 @@ impl PackageManager {
     pub const fn install_command(self) -> &'static str {
         match self {
             Self::Brew => "brew install espeak-ng",
+            Self::MacPorts => "sudo port install espeak-ng",
             Self::Apt => "sudo apt install -y espeak-ng",
             Self::Dnf => "sudo dnf install -y espeak-ng",
             Self::Pacman => "sudo pacman -S --noconfirm espeak-ng",
@@ -38,6 +40,7 @@ impl PackageManager {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Brew => "brew",
+            Self::MacPorts => "port",
             Self::Apt => "apt",
             Self::Dnf => "dnf",
             Self::Pacman => "pacman",
@@ -50,6 +53,7 @@ impl PackageManager {
     const fn install_argv(self) -> &'static [&'static str] {
         match self {
             Self::Brew => &["brew", "install", "espeak-ng"],
+            Self::MacPorts => &["sudo", "port", "install", "espeak-ng"],
             Self::Apt => &["sudo", "apt", "install", "-y", "espeak-ng"],
             Self::Dnf => &["sudo", "dnf", "install", "-y", "espeak-ng"],
             Self::Pacman => &["sudo", "pacman", "-S", "--noconfirm", "espeak-ng"],
@@ -63,8 +67,13 @@ impl PackageManager {
 pub fn detect_package_manager() -> Option<PackageManager> {
     #[cfg(target_os = "macos")]
     {
+        // Prefer Homebrew — more common. MacPorts fallback covers the
+        // niche user who has `port` but not `brew`.
         if binary_on_path("brew") {
             return Some(PackageManager::Brew);
+        }
+        if binary_on_path("port") {
+            return Some(PackageManager::MacPorts);
         }
         None
     }
@@ -121,11 +130,30 @@ pub fn ensure_or_install(theme: &ColorfulTheme) -> Result<EnsureOutcome> {
         );
         println!("   detect a supported package manager on this system.");
         println!();
-        println!("   Install espeak-ng manually, then re-run {}:", style("tebis setup").bold());
-        println!(
-            "     {}",
-            style("https://github.com/espeak-ng/espeak-ng#installation").dim(),
-        );
+        #[cfg(target_os = "macos")]
+        {
+            println!(
+                "   {} macOS has no built-in package manager. Install Homebrew first:",
+                style("→").dim()
+            );
+            println!(
+                "     {}",
+                style(r#"/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)""#)
+                    .dim(),
+            );
+            println!("   Then re-run {}.", style("tebis setup").bold());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            println!(
+                "   Install espeak-ng manually, then re-run {}:",
+                style("tebis setup").bold()
+            );
+            println!(
+                "     {}",
+                style("https://github.com/espeak-ng/espeak-ng#installation").dim(),
+            );
+        }
         return Ok(EnsureOutcome::NoPackageManager);
     };
 

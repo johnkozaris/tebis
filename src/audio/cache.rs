@@ -1,26 +1,4 @@
-//! Filesystem layout for downloaded models.
-//!
-//! Everything lives under `$XDG_DATA_HOME/tebis/` (or
-//! `$HOME/.local/share/tebis/` as fallback) — same base dir as
-//! `agent_hooks::data_dir` so we don't scatter tebis-owned files.
-//!
-//! ```text
-//! $XDG_DATA_HOME/tebis/
-//! ├── models/
-//! │   └── ggml-small.en-q5_1.bin  (0644, only present if STT enabled)
-//! ├── installed.json              (existing — agent_hooks)
-//! └── ...
-//! ```
-//!
-//! TTS models (Kokoro ONNX + tokenizer + per-voice files) have schema
-//! entries in the manifest but are not yet downloaded — Phase 4b is
-//! blocked on Rust ecosystem maturity. See `PLAN.md` and the comment
-//! block in `Cargo.toml`.
-//!
-//! Dirs are created 0700, files 0644. Mirrors the dual-enforcement
-//! pattern from `env_file::atomic_write_0600`: set the mode via
-//! `OpenOptions::mode()` at creation AND `set_permissions` afterwards,
-//! in case an ACL / umask / network filesystem widens the bits later.
+//! `$XDG_DATA_HOME/tebis/models/` — dirs 0700, files 0644. Set mode at create + after.
 
 use std::fs;
 use std::io;
@@ -31,13 +9,9 @@ use anyhow::{Context, Result};
 
 const MODELS_SUBDIR: &str = "models";
 
-/// Tmp-file suffix used during verified downloads.
-/// Mirrors `agent_hooks/jsonfile.rs`'s `.tebis.tmp` convention.
 pub(crate) const TMP_SUFFIX: &str = ".tebis.tmp";
 
-/// Base directory for tebis-owned data — same as `agent_hooks` uses.
-/// Re-exports the existing function so we have exactly one XDG-lookup
-/// implementation in the crate.
+/// Same dir as `agent_hooks::data_dir` — single XDG lookup.
 pub fn base_dir() -> Result<PathBuf> {
     crate::agent_hooks::data_dir()
 }
@@ -49,15 +23,11 @@ pub fn models_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Final on-disk path for a named model file (e.g. `ggml-base.en.bin`).
-/// Caller is responsible for ensuring the parent `models_dir` exists —
-/// `install_atomic` does this for you.
 pub fn model_path(file_name: &str) -> Result<PathBuf> {
     Ok(base_dir()?.join(MODELS_SUBDIR).join(file_name))
 }
 
-/// Tmp path used during download — same dir as the final file so `rename`
-/// stays within a single filesystem (hard requirement for atomicity).
+/// Same-dir tmp path for atomic rename.
 pub fn tmp_path_for(final_path: &Path) -> PathBuf {
     let name = final_path
         .file_name()
@@ -66,17 +36,13 @@ pub fn tmp_path_for(final_path: &Path) -> PathBuf {
     final_path.with_file_name(format!("{name}{TMP_SUFFIX}"))
 }
 
-/// Create `dir` (and parents) with mode 0700. Idempotent — existing dir
-/// is tightened to 0700 too.
+/// Create with mode 0700; tightens an existing looser dir too.
 pub fn ensure_dir_0700(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
 }
 
-/// Open a file at `path` for writing, mode 0644 from creation, truncating
-/// any existing content. Mirrors the pattern in `env_file::atomic_write_0600`
-/// but for read-world-readable model files (they're public artifacts —
-/// no privacy value in tightening models to 0600).
+/// Create 0644 (truncating). Models are public artifacts — no 0600 required.
 pub fn open_model_tmp(path: &Path) -> io::Result<fs::File> {
     fs::OpenOptions::new()
         .write(true)
@@ -86,22 +52,14 @@ pub fn open_model_tmp(path: &Path) -> io::Result<fs::File> {
         .open(path)
 }
 
-/// Move a completed `.tebis.tmp` into place as `dst`, re-chmodding to 0644
-/// post-rename. Renames within-dir, so atomic on any POSIX filesystem.
-///
-/// `tmp` and `dst` must be on the same filesystem — which they are if
-/// `tmp` was `tmp_path_for(dst)`.
+/// Atomic install. `tmp` and `dst` must be on the same FS (`tmp_path_for` ensures this).
 pub fn install_model_atomic(tmp: &Path, dst: &Path) -> Result<()> {
     fs::set_permissions(tmp, fs::Permissions::from_mode(0o644))
         .with_context(|| format!("chmod 0644 {}", tmp.display()))?;
     fs::rename(tmp, dst).with_context(|| format!("renaming {} → {}", tmp.display(), dst.display()))
 }
 
-/// Walk `dir` and remove any file ending in `.tebis.tmp`. Best-effort —
-/// logs warnings but never errors out, because a stuck `.tmp` from a
-/// crashed download should not block startup.
-///
-/// Call at `AudioSubsystem::new` time, before any fetch runs.
+/// Best-effort cleanup of `.tebis.tmp` leftovers. Must not block startup.
 pub fn reap_stale_tmps(dir: &Path) -> io::Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(it) => it,
@@ -197,7 +155,7 @@ mod tests {
         fs::write(tmp.join("a.bin.tebis.tmp"), b"B").unwrap();
         fs::write(tmp.join("b.onnx.tebis.tmp"), b"C").unwrap();
         reap_stale_tmps(&tmp).unwrap();
-        assert!(tmp.join("keep.bin").exists(), "real file should survive");
+        assert!(tmp.join("keep.bin").exists());
         assert!(!tmp.join("a.bin.tebis.tmp").exists());
         assert!(!tmp.join("b.onnx.tebis.tmp").exists());
         fs::remove_dir_all(&tmp).ok();
