@@ -28,6 +28,10 @@ allow = [
   "Unicode-3.0",
   "CC0-1.0",
   "CDLA-Permissive-2.0",
+  # Unlicense is a public-domain-equivalent license (explicit copyright
+  # disclaimer). OSI-approved and FSF-Free. Pulled in transitively by
+  # `whisper-rs-sys` — the actual whisper.cpp C source it wraps is MIT.
+  "Unlicense",
 ]
 confidence-threshold = 0.93
 version = 2

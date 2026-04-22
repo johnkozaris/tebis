@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 
-use super::{Autostart, HooksChoice};
+use super::{Autostart, HooksChoice, TtsChoice, VoiceChoice};
 use crate::env_file;
 
 /// Previously-saved values extracted from the env file. Every field is
@@ -16,6 +16,8 @@ pub(super) struct Discovered {
     pub(super) autostart: Option<Autostart>,
     pub(super) inspect_port: Option<u16>,
     pub(super) hooks_mode: Option<HooksChoice>,
+    pub(super) voice: Option<VoiceChoice>,
+    pub(super) tts: Option<TtsChoice>,
 }
 
 /// Parse `KEY=VALUE` lines. Comments (`#`) and blank lines skipped;
@@ -30,6 +32,23 @@ pub(super) fn discover(env_path: &Path) -> Discovered {
     let mut auto_session: Option<String> = None;
     let mut auto_dir: Option<String> = None;
     let mut auto_command: Option<String> = None;
+    let mut stt_enabled: Option<bool> = None;
+    let mut stt_model: Option<String> = None;
+
+    // TTS parsing — new env layout. We collect raw values and build the
+    // TtsChoice variant at the end so ordering in the file doesn't
+    // matter.
+    let mut tts_backend: Option<String> = None;
+    let mut legacy_tts_on: Option<bool> = None;
+    let mut tts_voice: Option<String> = None;
+    let mut tts_model: Option<String> = None;
+    let mut tts_respond_to_all: Option<bool> = None;
+    let mut tts_remote_url: Option<String> = None;
+    let mut tts_remote_api_key: Option<String> = None;
+    let mut tts_remote_model: Option<String> = None;
+    let mut tts_remote_timeout_sec: Option<u32> = None;
+    let mut tts_remote_allow_http: Option<bool> = None;
+
     for line in content.lines() {
         let Some((key, value)) = env_file::parse_kv_line(line) else {
             continue;
@@ -70,6 +89,42 @@ pub(super) fn discover(env_path: &Path) -> Discovered {
                     _ => None, // unknown → let the wizard prompt fresh
                 };
             }
+            "TELEGRAM_STT" => {
+                stt_enabled = crate::env_file::parse_toggle(value).ok().flatten();
+            }
+            "TELEGRAM_STT_MODEL" if !value.is_empty() => {
+                stt_model = Some(value.to_string());
+            }
+            "TELEGRAM_TTS" => {
+                legacy_tts_on = crate::env_file::parse_toggle(value).ok().flatten();
+            }
+            "TELEGRAM_TTS_BACKEND" if !value.is_empty() => {
+                tts_backend = Some(value.trim().to_ascii_lowercase());
+            }
+            "TELEGRAM_TTS_VOICE" if !value.is_empty() => {
+                tts_voice = Some(value.to_string());
+            }
+            "TELEGRAM_TTS_MODEL" if !value.is_empty() => {
+                tts_model = Some(value.to_string());
+            }
+            "TELEGRAM_TTS_RESPOND_TO_ALL" => {
+                tts_respond_to_all = crate::env_file::parse_toggle(value).ok().flatten();
+            }
+            "TELEGRAM_TTS_REMOTE_URL" if !value.is_empty() => {
+                tts_remote_url = Some(value.trim().to_string());
+            }
+            "TELEGRAM_TTS_REMOTE_API_KEY" if !value.is_empty() => {
+                tts_remote_api_key = Some(value.to_string());
+            }
+            "TELEGRAM_TTS_REMOTE_MODEL" if !value.is_empty() => {
+                tts_remote_model = Some(value.to_string());
+            }
+            "TELEGRAM_TTS_REMOTE_TIMEOUT_SEC" => {
+                tts_remote_timeout_sec = value.parse().ok().filter(|&n: &u32| (1..=300).contains(&n));
+            }
+            "TELEGRAM_TTS_REMOTE_ALLOW_HTTP" => {
+                tts_remote_allow_http = crate::env_file::parse_toggle(value).ok().flatten();
+            }
             _ => {}
         }
     }
@@ -80,7 +135,95 @@ pub(super) fn discover(env_path: &Path) -> Discovered {
             command,
         });
     }
+    if let Some(enabled) = stt_enabled {
+        d.voice = Some(VoiceChoice {
+            enabled,
+            // Honor the existing model if the user picked one; otherwise
+            // leave it empty and let `step_voice` fall through to the
+            // manifest default.
+            model: stt_model.unwrap_or_default(),
+        });
+    }
+
+    // Resolve TTS choice. Priority:
+    //   1. Explicit TELEGRAM_TTS_BACKEND → use that.
+    //   2. Legacy `TELEGRAM_TTS=on` (pre-v2 env files) → interpret as
+    //      Say (macOS) / unknown (Linux falls through to None).
+    //   3. Nothing set → None (wizard starts fresh on the TTS step).
+    d.tts = resolve_tts_choice(
+        tts_backend.as_deref(),
+        legacy_tts_on,
+        tts_voice,
+        tts_model,
+        tts_respond_to_all.unwrap_or(false),
+        tts_remote_url,
+        tts_remote_api_key,
+        tts_remote_model,
+        tts_remote_timeout_sec,
+        tts_remote_allow_http.unwrap_or(false),
+    );
     d
+}
+
+#[allow(clippy::too_many_arguments, reason = "wizard-internal helper; grouping adds nothing")]
+fn resolve_tts_choice(
+    backend: Option<&str>,
+    legacy_on: Option<bool>,
+    voice: Option<String>,
+    model: Option<String>,
+    respond_to_all: bool,
+    remote_url: Option<String>,
+    remote_api_key: Option<String>,
+    remote_model: Option<String>,
+    remote_timeout_sec: Option<u32>,
+    remote_allow_http: bool,
+) -> Option<TtsChoice> {
+    let backend_kind = match backend {
+        Some(s) => s,
+        None => {
+            // Legacy path — if the old TELEGRAM_TTS toggle was set,
+            // interpret it: `on` → Say (the only backend that existed
+            // in Phase 4a), `off` → TtsChoice::Off. Unset → no
+            // discovery (wizard prompts fresh).
+            return match legacy_on {
+                Some(true) => Some(TtsChoice::Say {
+                    voice: voice.unwrap_or_else(|| "Samantha".to_string()),
+                    respond_to_all,
+                }),
+                Some(false) => Some(TtsChoice::Off),
+                None => None,
+            };
+        }
+    };
+
+    match backend_kind {
+        "none" | "off" | "false" | "0" => Some(TtsChoice::Off),
+        "say" => Some(TtsChoice::Say {
+            voice: voice.unwrap_or_else(|| "Samantha".to_string()),
+            respond_to_all,
+        }),
+        "kokoro-local" | "kokoro_local" | "local" => Some(TtsChoice::KokoroLocal {
+            model: model.unwrap_or_default(),
+            voice: voice.unwrap_or_else(|| "af_sarah".to_string()),
+            respond_to_all,
+        }),
+        "kokoro-remote" | "kokoro_remote" | "remote" => {
+            // URL is the only hard requirement; without it, fall back
+            // to None so the wizard surfaces a fresh prompt instead of
+            // pre-filling a broken config.
+            let url = remote_url?;
+            Some(TtsChoice::KokoroRemote {
+                url,
+                api_key: remote_api_key,
+                model: remote_model.unwrap_or_else(|| "kokoro".to_string()),
+                voice: voice.unwrap_or_else(|| "af_sarah".to_string()),
+                timeout_sec: remote_timeout_sec.unwrap_or(10),
+                allow_http: remote_allow_http,
+                respond_to_all,
+            })
+        }
+        _ => None, // unknown backend — let wizard prompt fresh
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +321,108 @@ INSPECT_PORT=51624
         assert!(matches!(discover(&tmp).hooks_mode, Some(HooksChoice::Off)));
         fs::write(&tmp, "TELEGRAM_HOOKS_MODE=garbage\n").unwrap();
         assert!(discover(&tmp).hooks_mode.is_none());
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn discover_reads_tts_backend_say() {
+        let tmp =
+            std::env::temp_dir().join(format!("tebis-discover-tts-say-{}.env", std::process::id()));
+        fs::write(
+            &tmp,
+            "TELEGRAM_TTS_BACKEND=say\n\
+             TELEGRAM_TTS_VOICE=Alex\n\
+             TELEGRAM_TTS_RESPOND_TO_ALL=on\n",
+        )
+        .unwrap();
+        let d = discover(&tmp);
+        match d.tts.expect("tts choice") {
+            TtsChoice::Say { voice, respond_to_all } => {
+                assert_eq!(voice, "Alex");
+                assert!(respond_to_all);
+            }
+            other => panic!("expected Say, got {other:?}"),
+        }
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn discover_reads_tts_backend_remote() {
+        let tmp = std::env::temp_dir()
+            .join(format!("tebis-discover-tts-remote-{}.env", std::process::id()));
+        fs::write(
+            &tmp,
+            "TELEGRAM_TTS_BACKEND=kokoro-remote\n\
+             TELEGRAM_TTS_REMOTE_URL=https://kokoro.example.com\n\
+             TELEGRAM_TTS_REMOTE_API_KEY=secret123\n\
+             TELEGRAM_TTS_REMOTE_MODEL=kokoro-v2\n\
+             TELEGRAM_TTS_VOICE=af_sarah\n\
+             TELEGRAM_TTS_REMOTE_TIMEOUT_SEC=20\n",
+        )
+        .unwrap();
+        let d = discover(&tmp);
+        match d.tts.expect("tts choice") {
+            TtsChoice::KokoroRemote {
+                url,
+                api_key,
+                model,
+                voice,
+                timeout_sec,
+                allow_http,
+                ..
+            } => {
+                assert_eq!(url, "https://kokoro.example.com");
+                assert_eq!(api_key.as_deref(), Some("secret123"));
+                assert_eq!(model, "kokoro-v2");
+                assert_eq!(voice, "af_sarah");
+                assert_eq!(timeout_sec, 20);
+                assert!(!allow_http);
+            }
+            other => panic!("expected KokoroRemote, got {other:?}"),
+        }
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn discover_remote_without_url_returns_none() {
+        // Explicit kokoro-remote backend but missing URL — we refuse
+        // to pre-fill a broken config. Wizard falls through to a fresh
+        // prompt on the TTS step.
+        let tmp = std::env::temp_dir()
+            .join(format!("tebis-discover-tts-noremote-{}.env", std::process::id()));
+        fs::write(&tmp, "TELEGRAM_TTS_BACKEND=kokoro-remote\n").unwrap();
+        let d = discover(&tmp);
+        assert!(d.tts.is_none());
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn discover_legacy_tts_on_interpreted_as_say() {
+        // Pre-v2 env files used `TELEGRAM_TTS=on` (no backend selector).
+        // Re-running the wizard must recognize this and offer Say as
+        // the prefilled default instead of treating it as "nothing set."
+        let tmp = std::env::temp_dir()
+            .join(format!("tebis-discover-legacy-{}.env", std::process::id()));
+        fs::write(
+            &tmp,
+            "TELEGRAM_TTS=on\nTELEGRAM_TTS_VOICE=Samantha\n",
+        )
+        .unwrap();
+        let d = discover(&tmp);
+        match d.tts.expect("legacy tts on") {
+            TtsChoice::Say { voice, .. } => assert_eq!(voice, "Samantha"),
+            other => panic!("expected Say, got {other:?}"),
+        }
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn discover_tts_backend_none_is_off() {
+        let tmp = std::env::temp_dir()
+            .join(format!("tebis-discover-ttsnone-{}.env", std::process::id()));
+        fs::write(&tmp, "TELEGRAM_TTS_BACKEND=none\n").unwrap();
+        let d = discover(&tmp);
+        assert!(matches!(d.tts, Some(TtsChoice::Off)));
         let _ = fs::remove_file(&tmp);
     }
 

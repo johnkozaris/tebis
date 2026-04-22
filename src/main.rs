@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 
 use tebis::bridge::session;
 use tebis::{
-    bridge, config, hooks_cli, inspect, lockfile, metrics, notify, security, service, setup,
+    audio, bridge, config, hooks_cli, inspect, lockfile, metrics, notify, security, service, setup,
     telegram, tmux,
 };
 
@@ -284,8 +284,68 @@ async fn run_bridge() -> Result<()> {
         ),
         Err(_) => None,
     };
+
+    let autoreply_cfg = config.autoreply.take().map(Arc::new);
+
+    // Audio subsystem: constructed lazily. With STT off (the
+    // public-release default) `new` touches nothing — no download, no
+    // memory. When STT is on, this is the blocking model-download path
+    // (~53 s on first run for `base.en`); we run it on the current
+    // task so startup waits for a cached-and-ready subsystem before
+    // the bridge accepts messages.
+    //
+    // Fail-open: if model download or whisper-rs load fails we log a
+    // warn and continue text-only. Bot token problems are different
+    // (handled by `unauthorized_dead_end` above); audio problems are
+    // recoverable by unsetting TELEGRAM_STT or fixing the underlying
+    // cause, so we shouldn't crash.
+    let audio = if config.audio.any_enabled() {
+        match audio::AudioSubsystem::new(&config.audio, &tracker, shutdown.clone()).await {
+            Ok(a) => {
+                if let Some(m) = a.stt_model_name() {
+                    tracing::info!(model = %m, "Audio: local STT ready");
+                }
+                Some(a)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "Audio subsystem failed to initialize; continuing text-only. \
+                     Set TELEGRAM_STT=off or fix the cause above to silence this."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Snapshot is built AFTER the audio subsystem so the dashboard's
+    // Voice section can reflect real initialization state (model loaded
+    // vs download failed) rather than guessing from config alone.
     let inspect_snapshot = if inspect_port.is_some() {
         let tmux_ver = inspect::tmux_version().await;
+        // Voice section reflects ACTUAL runtime state, not config
+        // intent. On Linux with TELEGRAM_TTS=on, TTS init fails with
+        // UnsupportedPlatform and the subsystem continues STT-only —
+        // the dashboard should say "TTS disabled" for that user, not
+        // dangle a voice name that isn't actually synthesizing.
+        let voice_info = if config.audio.any_enabled() {
+            Some(inspect::VoiceInfo {
+                stt_model: config.audio.stt.as_ref().map(|s| s.model.clone()),
+                stt_ready: audio
+                    .as_ref()
+                    .is_some_and(|a| a.stt_model_name().is_some()),
+                tts_backend: audio.as_ref().map_or("none", |a| a.tts_backend_kind()),
+                tts_voice: audio.as_ref().and_then(|a| a.tts_voice().map(String::from)),
+                tts_detail: audio.as_ref().and_then(|a| a.tts_detail().map(String::from)),
+                tts_scope: audio
+                    .as_ref()
+                    .map_or("", |a| if a.tts_respond_to_all() { "all" } else { "voice-only" }),
+            })
+        } else {
+            None
+        };
         Some(Arc::new(inspect::Snapshot {
             bridge: inspect::BridgeInfo {
                 version: env!("CARGO_PKG_VERSION"),
@@ -323,13 +383,12 @@ async fn run_bridge() -> Result<()> {
                     })
                     .collect(),
             },
+            voice: voice_info,
             env_file: env::var("BRIDGE_ENV_FILE").ok(),
         }))
     } else {
         None
     };
-
-    let autoreply_cfg = config.autoreply.take().map(Arc::new);
 
     let tmux = Arc::new(tmux::Tmux::new(
         config.allowed_sessions.clone(),
@@ -427,11 +486,46 @@ async fn run_bridge() -> Result<()> {
                     let Some(message) = update.message else {
                         continue;
                     };
-                    let Some(text) = message.text else { continue };
                     let chat_id = message.chat.id;
                     let message_id = message.message_id;
 
-                    tracing::debug!(chat_id, bytes = text.len(), "Received message");
+                    let payload = if let Some(text) = message.text {
+                        tracing::debug!(chat_id, bytes = text.len(), "Received text message");
+                        bridge::Payload::Text(text)
+                    } else if let Some(v) = message.voice {
+                        tracing::debug!(
+                            chat_id,
+                            duration_sec = v.duration,
+                            size = ?v.file_size,
+                            "Received voice message"
+                        );
+                        bridge::Payload::Voice {
+                            file_id: v.file_id,
+                            duration_sec: v.duration,
+                            size_bytes: v.file_size,
+                        }
+                    } else if let Some(a) = message.audio {
+                        // Music-file upload, same code path as voice.
+                        // The codec only accepts OGG/Opus; MP3/M4A uploads
+                        // will be rejected downstream with a clear error.
+                        tracing::debug!(
+                            chat_id,
+                            duration_sec = a.duration,
+                            size = ?a.file_size,
+                            mime = ?a.mime_type,
+                            "Received audio file"
+                        );
+                        bridge::Payload::Voice {
+                            file_id: a.file_id,
+                            duration_sec: a.duration,
+                            size_bytes: a.file_size,
+                        }
+                    } else {
+                        // No handled content (sticker, photo, …). Drop
+                        // silently — different from voice-with-STT-off
+                        // which gets a user-facing reply.
+                        continue;
+                    };
 
                     let ctx = bridge::HandlerContext {
                         tg: tg.clone(),
@@ -443,9 +537,10 @@ async fn run_bridge() -> Result<()> {
                         metrics: metrics.clone(),
                         autoreply: autoreply_cfg.clone(),
                         tracker: tracker.clone(),
+                        audio: audio.clone(),
                     };
 
-                    tracker.spawn(bridge::handle_update(ctx, chat_id, message_id, text));
+                    tracker.spawn(bridge::handle_update(ctx, chat_id, message_id, payload));
                 }
             }
             Err(e) if e.is_conflict() => {

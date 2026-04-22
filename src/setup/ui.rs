@@ -29,9 +29,14 @@ pub(super) fn print_welcome() {
     println!();
 }
 
+/// Total wizard steps. Update when steps are added/removed so the
+/// "Step N of TOTAL" banner stays accurate. On non-macOS the TTS step
+/// (step 8) is a no-op; we print the banner anyway for consistency.
+const WIZARD_STEP_COUNT: u8 = 8;
+
 pub(super) fn step_header(n: u8, title: &str) {
     let width = text_width();
-    let prefix = format!("───── Step {n} of 6 · ");
+    let prefix = format!("───── Step {n} of {WIZARD_STEP_COUNT} · ");
     let suffix = " ";
     let prefix_w = measure_text_width(&prefix);
     let title_w = measure_text_width(title);
@@ -119,6 +124,10 @@ pub(super) fn mask_token(token: &str) -> String {
     format!("{head}:{prefix}{}{suffix}", style("…").dim())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "wizard-only helper; flat args map to flat output"
+)]
 pub(super) fn print_summary(
     token: &str,
     user_id: i64,
@@ -126,6 +135,8 @@ pub(super) fn print_summary(
     autostart: Option<&Autostart>,
     hooks_mode: HooksChoice,
     inspect_port: Option<u16>,
+    voice: Option<&super::VoiceChoice>,
+    tts: Option<&super::TtsChoice>,
 ) {
     divider_rule("Review");
     let masked_token = mask_token(token);
@@ -158,12 +169,55 @@ pub(super) fn print_summary(
             )
         },
     );
+    let voice_row = voice.map_or_else(
+        || style("(not configured)").dim().to_string(),
+        |v| {
+            if v.enabled {
+                format!("local whisper.cpp · model: {}", style(&v.model).bold())
+            } else {
+                style("(disabled)").dim().to_string()
+            }
+        },
+    );
+    let tts_row = tts.map_or_else(
+        || style("(not configured)").dim().to_string(),
+        |t| {
+            use super::TtsChoice;
+            let scope = if t.respond_to_all() {
+                "all replies"
+            } else {
+                "voice replies only"
+            };
+            match t {
+                TtsChoice::Off => style("(disabled)").dim().to_string(),
+                TtsChoice::Say { voice, .. } => {
+                    format!("macOS `say` · voice: {} · {scope}", style(voice).bold())
+                }
+                TtsChoice::KokoroLocal { model, voice, .. } => {
+                    format!(
+                        "Kokoro local · model: {} · voice: {} · {scope}",
+                        style(model).bold(),
+                        style(voice).bold(),
+                    )
+                }
+                TtsChoice::KokoroRemote { voice, model, .. } => {
+                    format!(
+                        "Kokoro remote · model: {} · voice: {} · {scope}",
+                        style(model).bold(),
+                        style(voice).bold(),
+                    )
+                }
+            }
+        },
+    );
     row("Bot token", &masked_token);
     row("User id", &user_id.to_string());
     row("Sessions", &sessions_row);
     row("Agent", &autostart_row);
     row("Hooks", &hooks_row);
     row("Dashboard", &dashboard_row);
+    row("Voice in", &voice_row);
+    row("Voice out", &tts_row);
     println!();
 }
 

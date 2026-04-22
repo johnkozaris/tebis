@@ -53,6 +53,21 @@ your numeric user id is the only entry point.
 - **Opt-in outbound.** A local Unix-domain socket lets a Claude Code hook
   push `Stop` / `SubagentStop` / permission / idle events to Telegram.
   No TCP, `chmod 0600`, peer-cred check on every connection.
+- **Opt-in voice input.** Set `TELEGRAM_STT=on` and voice notes from
+  your phone become typed commands via in-process `whisper.cpp`. No
+  cloud STT, no extra service — the model (default `base.en`, 148 MB)
+  downloads on first run to `$XDG_DATA_HOME/tebis/models/` with SHA-256
+  verification, then loads into the daemon. Metal on Apple Silicon;
+  OpenBLAS optional on Linux.
+- **Opt-in voice replies, cross-platform.** Three backends, picked via
+  `TELEGRAM_TTS_BACKEND`: (a) `say` on macOS — zero install, built-in;
+  (b) `kokoro-local` — neural ONNX via `ort` + espeak-ng (cross-platform,
+  needs `--features kokoro` at build time plus `brew/apt install
+  espeak-ng onnxruntime` at runtime); (c) `kokoro-remote` — HTTP POST
+  to any OpenAI-compatible TTS endpoint you've deployed. Defaults to
+  "voice-in → voice-out only"; flip `TELEGRAM_TTS_RESPOND_TO_ALL=on`
+  for every reply. See [`PLAN-TTS-V2.md`](PLAN-TTS-V2.md) for the
+  platform matrix.
 - **Auto-wired hooks.** Set `TELEGRAM_HOOKS_MODE=auto` and tebis writes
   Claude Code / Copilot CLI hook configs into your project dir at
   autostart time so replies arrive via the agent's native `Stop` event
@@ -99,8 +114,11 @@ cd tebis
 cargo build --release
 ```
 
-**Requirements:** Rust 1.95+ (edition 2024), `tmux` 3.x. No OpenSSL, no
-native TLS — rustls/ring is bundled. Release binary ~4 MB (LTO + strip).
+**Requirements:** Rust 1.95+ (edition 2024), `tmux` 3.x, a C++ toolchain
+for whisper.cpp (Xcode CLT on macOS, `build-essential cmake` on Linux
+— standard on any dev box). No OpenSSL, no native TLS — rustls/ring is
+bundled. Release binary ~5 MB (LTO + strip; 4.25 MB without voice input,
+4.98 MB with).
 
 ## How it works
 
@@ -125,6 +143,12 @@ block.
 
 Outbound: Claude Code's `Stop` hook writes a JSON line to the local UDS;
 tebis forwards the tail of the agent's final message to your chat.
+
+Voice input (opt-in, `TELEGRAM_STT=on`): a Telegram voice note → OGG/Opus
+download via `getFile` → in-process decode (`ogg` + `opus` crates) →
+16 kHz mono PCM → `whisper-rs` (linked `whisper.cpp`, Metal-accelerated
+on Apple Silicon) → transcript fed into the same command path as typed
+text. No subprocess, no external server, no round-trip to a cloud STT.
 
 ## CLI
 

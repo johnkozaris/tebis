@@ -1,0 +1,10 @@
+# Fix for `audiopus_sys` (pulled in by `opus`) vendoring a copy of
+# libopus whose CMakeLists declares `cmake_minimum_required(VERSION 3.0)`.
+# Modern CMake (>= 4.0) refuses to configure anything below 3.5 unless we
+# explicitly set this policy shim. This env applies to every `cargo build`
+# in this workspace so users don't have to remember it.
+#
+# Remove when `audiopus_sys` upstream bumps its vendored libopus to a
+# newer cmake minimum (tracked in the opus crate release notes).
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

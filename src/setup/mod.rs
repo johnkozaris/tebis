@@ -17,6 +17,11 @@ use dialoguer::{Confirm, Select};
 use crate::env_file;
 
 mod discover;
+// `pub` so `examples/kokoro-smoke.rs` can call `probe_espeak_ng` for its
+// prerequisite check. The interactive installer bits (`ensure_or_install`)
+// require a `ColorfulTheme` so are only useful from within the wizard
+// anyway, but exposing the whole module keeps the API simple.
+pub mod phonemizer;
 mod steps;
 mod ui;
 
@@ -25,7 +30,10 @@ mod ui;
 /// other key is preserved verbatim so users don't lose hand-added
 /// settings (`TELEGRAM_HOOKS_MODE`, `TELEGRAM_NOTIFY`, etc.) when they
 /// re-run `tebis setup`.
-const WIZARD_MANAGED_KEYS: &[&str] = &[
+/// Static keys the wizard always manages. TTS is now cross-platform —
+/// every host picks a backend (even if it's `none`), so the old
+/// macOS-only split is gone.
+const WIZARD_MANAGED_KEYS_ALWAYS: &[&str] = &[
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_ALLOWED_USER",
     "TELEGRAM_ALLOWED_SESSIONS",
@@ -35,7 +43,26 @@ const WIZARD_MANAGED_KEYS: &[&str] = &[
     "INSPECT_PORT",
     "BRIDGE_ENV_FILE",
     "TELEGRAM_HOOKS_MODE",
+    // STT is cross-platform — wizard always owns these.
+    "TELEGRAM_STT",
+    "TELEGRAM_STT_MODEL",
+    // TTS: new backend-picker keys. Legacy `TELEGRAM_TTS` (boolean) is
+    // also included so the parser retires it cleanly on re-run.
+    "TELEGRAM_TTS",
+    "TELEGRAM_TTS_BACKEND",
+    "TELEGRAM_TTS_VOICE",
+    "TELEGRAM_TTS_MODEL",
+    "TELEGRAM_TTS_RESPOND_TO_ALL",
+    "TELEGRAM_TTS_REMOTE_URL",
+    "TELEGRAM_TTS_REMOTE_API_KEY",
+    "TELEGRAM_TTS_REMOTE_MODEL",
+    "TELEGRAM_TTS_REMOTE_TIMEOUT_SEC",
+    "TELEGRAM_TTS_REMOTE_ALLOW_HTTP",
 ];
+
+fn wizard_managed_keys() -> impl Iterator<Item = &'static str> {
+    WIZARD_MANAGED_KEYS_ALWAYS.iter().copied()
+}
 
 /// Autostart triple. Shared between the step that collects it and the
 /// discover pass that reloads it from an existing env file.
@@ -43,6 +70,73 @@ pub(super) struct Autostart {
     pub(super) session: String,
     pub(super) dir: String,
     pub(super) command: String,
+}
+
+/// Voice / STT wizard choice. Only local whisper.cpp is offered.
+#[derive(Clone, Debug)]
+pub(super) struct VoiceChoice {
+    pub(super) enabled: bool,
+    /// Key from `audio::manifest.stt_models` — only meaningful when `enabled`.
+    pub(super) model: String,
+}
+
+/// Voice replies (TTS) wizard choice. Backend-tagged enum matching
+/// the runtime [`crate::audio::tts::BackendConfig`] shape, minus the
+/// secrecy wrapper on the API key (the wizard holds a plain `String`
+/// briefly during input capture and env-file write; the daemon re-
+/// wraps it in `SecretString` when loading the env file at startup).
+#[derive(Clone, Debug)]
+pub(super) enum TtsChoice {
+    /// Text-only replies (TTS disabled). Written as
+    /// `TELEGRAM_TTS_BACKEND=none` so a re-run sees the explicit
+    /// choice instead of bouncing back to the default.
+    Off,
+    /// macOS `say` shell-out.
+    Say {
+        voice: String,
+        respond_to_all: bool,
+    },
+    /// Local Kokoro ONNX via espeak-ng. Manifest key + voice.
+    KokoroLocal {
+        model: String,
+        voice: String,
+        respond_to_all: bool,
+    },
+    /// Remote OpenAI-compatible TTS endpoint. See
+    /// [`crate::audio::tts::BackendConfig::Remote`] for field semantics.
+    KokoroRemote {
+        url: String,
+        api_key: Option<String>,
+        model: String,
+        voice: String,
+        timeout_sec: u32,
+        allow_http: bool,
+        respond_to_all: bool,
+    },
+}
+
+impl TtsChoice {
+    /// Whether every text reply should also be a voice reply.
+    /// `false` for `Off`.
+    pub(super) const fn respond_to_all(&self) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Say { respond_to_all, .. }
+            | Self::KokoroLocal { respond_to_all, .. }
+            | Self::KokoroRemote { respond_to_all, .. } => *respond_to_all,
+        }
+    }
+
+    /// User-visible voice name, or empty for `Off`. Used by
+    /// [`ui::print_summary`] and the step-default pre-fill helper.
+    pub(super) fn voice_display(&self) -> &str {
+        match self {
+            Self::Off => "",
+            Self::Say { voice, .. }
+            | Self::KokoroLocal { voice, .. }
+            | Self::KokoroRemote { voice, .. } => voice,
+        }
+    }
 }
 
 /// What the caller should do after `run()` returns. Separates wizard
@@ -85,6 +179,8 @@ pub fn run() -> Result<Next> {
     let autostart = steps::step_autostart(&theme, &sessions, discovered.autostart.as_ref())?;
     let hooks_mode = steps::step_hooks_mode(&theme, autostart.as_ref(), discovered.hooks_mode)?;
     let inspect_port = steps::step_inspect_port(&theme, discovered.inspect_port)?;
+    let voice = steps::step_voice(&theme, discovered.voice.as_ref())?;
+    let tts = steps::step_tts(&theme, discovered.tts.as_ref())?;
 
     ui::print_summary(
         &token,
@@ -93,6 +189,8 @@ pub fn run() -> Result<Next> {
         autostart.as_ref(),
         hooks_mode,
         inspect_port,
+        voice.as_ref(),
+        tts.as_ref(),
     );
     if !Confirm::with_theme(&theme)
         .with_prompt("Save this config?")
@@ -119,6 +217,8 @@ pub fn run() -> Result<Next> {
         autostart.as_ref(),
         inspect_port,
         hooks_mode,
+        voice.as_ref(),
+        tts.as_ref(),
         &env_path,
     );
     if !extras.is_empty() {
@@ -203,6 +303,10 @@ pub fn env_file_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config/tebis/env"))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "grouping wizard outputs into a struct just for fn-arity hurts readability"
+)]
 fn build_env_file(
     token: &str,
     user_id: i64,
@@ -210,6 +314,8 @@ fn build_env_file(
     autostart: Option<&Autostart>,
     inspect_port: Option<u16>,
     hooks_mode: HooksChoice,
+    voice: Option<&VoiceChoice>,
+    tts: Option<&TtsChoice>,
     env_path: &Path,
 ) -> String {
     use std::fmt::Write as _;
@@ -252,11 +358,84 @@ fn build_env_file(
         let _ = writeln!(out, "BRIDGE_ENV_FILE={}", env_path.display());
     }
 
+    if let Some(v) = voice {
+        out.push_str("\n# Voice input (STT). Transcribes Telegram voice notes in-process\n");
+        out.push_str("# via whisper-rs. Model downloads on first run to\n");
+        out.push_str("# $XDG_DATA_HOME/tebis/models/ (about 148 MB for base.en).\n");
+        if v.enabled {
+            let _ = writeln!(out, "TELEGRAM_STT=on");
+            let _ = writeln!(out, "TELEGRAM_STT_MODEL={}", v.model);
+        } else {
+            out.push_str("TELEGRAM_STT=off\n");
+        }
+    }
+
+    if let Some(t) = tts {
+        out.push_str(
+            "\n# Voice replies (TTS). See PLAN-TTS-V2.md for the backend story.\n",
+        );
+        match t {
+            TtsChoice::Off => {
+                let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=none");
+            }
+            TtsChoice::Say { voice, respond_to_all } => {
+                out.push_str("# macOS `say` shell-out.\n");
+                let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=say");
+                let _ = writeln!(out, "TELEGRAM_TTS_VOICE={voice}");
+                if *respond_to_all {
+                    out.push_str("TELEGRAM_TTS_RESPOND_TO_ALL=on\n");
+                }
+            }
+            TtsChoice::KokoroLocal { model, voice, respond_to_all } => {
+                out.push_str(
+                    "# Local Kokoro ONNX via espeak-ng phonemizer. Requires\n",
+                );
+                out.push_str("# the `kokoro` cargo feature at build time.\n");
+                let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=kokoro-local");
+                let _ = writeln!(out, "TELEGRAM_TTS_MODEL={model}");
+                let _ = writeln!(out, "TELEGRAM_TTS_VOICE={voice}");
+                if *respond_to_all {
+                    out.push_str("TELEGRAM_TTS_RESPOND_TO_ALL=on\n");
+                }
+            }
+            TtsChoice::KokoroRemote {
+                url,
+                api_key,
+                model,
+                voice,
+                timeout_sec,
+                allow_http,
+                respond_to_all,
+            } => {
+                out.push_str(
+                    "# Remote OpenAI-compatible TTS endpoint (e.g. Kokoro-FastAPI).\n",
+                );
+                let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=kokoro-remote");
+                let _ = writeln!(out, "TELEGRAM_TTS_REMOTE_URL={url}");
+                if let Some(k) = api_key
+                    && !k.is_empty()
+                {
+                    let _ = writeln!(out, "TELEGRAM_TTS_REMOTE_API_KEY={k}");
+                }
+                let _ = writeln!(out, "TELEGRAM_TTS_REMOTE_MODEL={model}");
+                let _ = writeln!(out, "TELEGRAM_TTS_VOICE={voice}");
+                let _ = writeln!(out, "TELEGRAM_TTS_REMOTE_TIMEOUT_SEC={timeout_sec}");
+                if *allow_http {
+                    out.push_str("TELEGRAM_TTS_REMOTE_ALLOW_HTTP=on\n");
+                }
+                if *respond_to_all {
+                    out.push_str("TELEGRAM_TTS_RESPOND_TO_ALL=on\n");
+                }
+            }
+        }
+    }
+
     out
 }
 
 /// Read the existing env file and return every line that sets a key
-/// NOT in `WIZARD_MANAGED_KEYS`. These are user-added settings
+/// NOT in the wizard-managed set (see [`wizard_managed_keys`]). These
+/// are user-added settings
 /// (`TELEGRAM_NOTIFY`, `TELEGRAM_AUTOREPLY`, `NOTIFY_CHAT_ID`, etc.) we
 /// must not silently drop when the wizard rewrites the file.
 ///
@@ -267,7 +446,7 @@ fn extra_lines_to_preserve(env_path: &Path) -> Vec<String> {
     let Ok(content) = fs::read_to_string(env_path) else {
         return Vec::new();
     };
-    let managed: HashSet<&str> = WIZARD_MANAGED_KEYS.iter().copied().collect();
+    let managed: HashSet<&str> = wizard_managed_keys().collect();
     content
         .lines()
         .filter_map(|line| match env_file::parse_kv_line(line) {

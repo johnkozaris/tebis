@@ -1,0 +1,27 @@
+[package]
+name = "tebis-tts-kokoro"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Kokoro v1.0 TTS via ONNX Runtime + espeak-ng phonemizer"
+publish = false
+rust-version = "1.95"
+
+# Given paths to a Kokoro ONNX model and a voices directory, runs
+# text → 24 kHz mono f32 PCM. No network, no SHA pinning, no caller
+# coupling. Runtime prereqs (not linked): `espeak-ng` on PATH,
+# `libonnxruntime` on the dynamic-lib search path.
+
+[dependencies]
+ndarray = {version = "0.16", default-features = false, features = ["std"]}
+num2words = {version = "1", default-features = false}
+# rc.11 has a broken ureq TLS config; rc.12 references a VitisAI sys
+# field its own bindings don't expose. rc.10 is known-good.
+ort = {version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"]}
+regex = {version = "1", default-features = false, features = ["std", "unicode-perl"]}
+thiserror = "2"
+tokio = {version = "1", features = ["process", "rt", "time"]}
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = {version = "1", features = ["macros", "rt"]}

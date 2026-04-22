@@ -9,6 +9,7 @@
 )]
 
 pub mod agent_hooks;
+pub mod audio;
 pub mod bridge;
 pub mod config;
 pub mod env_file;

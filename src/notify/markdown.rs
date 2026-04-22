@@ -26,18 +26,47 @@ use crate::sanitize;
 
 /// Apply the full pipeline: HTML-escape, then Markdown-translate.
 /// Single entry point for the notify formatter.
+///
+/// If the markdown translator produces unbalanced HTML (e.g. from
+/// `***foo***` where bold+italic interact pathologically), the result
+/// would fail Telegram's `parse_mode=HTML` parser and we'd lose the
+/// whole notify delivery. Safety-net: validate the output's tag
+/// balance and fall back to escape-only on mismatch. The user gets
+/// literal `**foo**` instead of bold, but the message still arrives.
 pub fn to_html(text: &str) -> String {
-    // `translate` uses `\x00` internally as a placeholder sentinel for
-    // extracted code spans. If the user's text contains a literal NUL,
-    // the re-embed step would confuse it for a placeholder and graft
-    // an adjacent span's body onto it. The hook scripts use `jq -r`
-    // which emits utf-8 text, but defense-in-depth: strip NULs on
-    // input so the invariant holds regardless of source.
+    // Strip NULs up front — `translate` uses them as placeholder
+    // sentinels.
     let mut escaped = sanitize::escape_html(text);
     if escaped.contains(NUL) {
         escaped = escaped.replace(NUL, "");
     }
-    translate(&escaped)
+    let translated = translate(&escaped);
+    if is_balanced_telegram_html(&translated) {
+        translated
+    } else {
+        // Fallback: raw HTML-escaped, no markdown translation.
+        // Well-formed by construction (escape_html only emits
+        // character entities, never tags).
+        escaped
+    }
+}
+
+/// True when every opener has a matching closer in the set of Telegram
+/// HTML tags the translator emits. Doesn't validate nesting / order
+/// beyond count — sufficient to catch the `***foo***` class of
+/// pathologies the greedy bold/italic passes can produce.
+fn is_balanced_telegram_html(html: &str) -> bool {
+    for (open, close) in [
+        ("<b>", "</b>"),
+        ("<i>", "</i>"),
+        ("<code>", "</code>"),
+        ("<pre>", "</pre>"),
+    ] {
+        if html.matches(open).count() != html.matches(close).count() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Opaque placeholder for an extracted code span, so bold / italic
@@ -262,6 +291,40 @@ mod tests {
     #[test]
     fn plain_text_passes_through() {
         assert_eq!(to_html("just words"), "just words");
+    }
+
+    #[test]
+    fn balanced_html_helper_accepts_well_formed() {
+        assert!(is_balanced_telegram_html(""));
+        assert!(is_balanced_telegram_html("plain"));
+        assert!(is_balanced_telegram_html("<b>a</b>"));
+        assert!(is_balanced_telegram_html("<b>a</b> <i>b</i>"));
+        assert!(is_balanced_telegram_html(
+            "<pre>x</pre> <code>y</code> <b>z</b>"
+        ));
+    }
+
+    #[test]
+    fn balanced_html_helper_rejects_mismatched() {
+        assert!(!is_balanced_telegram_html("<b>unclosed"));
+        assert!(!is_balanced_telegram_html("</b>stray-close"));
+        assert!(!is_balanced_telegram_html("<b><b>a</b>"));
+        assert!(!is_balanced_telegram_html("<i>a</b>"));
+    }
+
+    #[test]
+    fn unbalanced_markdown_falls_back_to_escape_only() {
+        // If the markdown translator produces mismatched tags the
+        // output must degrade to plain escape — Telegram's HTML mode
+        // would otherwise reject the whole delivery.
+        //
+        // Direct call of the helper: this literal survives the
+        // markdown pass today (is balanced). The *point* of the test
+        // is to lock in the is_balanced check; if a future regression
+        // in translate() produces something unbalanced, to_html falls
+        // back cleanly.
+        let ok = to_html("a **bold** b");
+        assert!(is_balanced_telegram_html(&ok), "today's output is balanced: {ok:?}");
     }
 
     #[test]

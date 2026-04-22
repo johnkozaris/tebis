@@ -35,8 +35,35 @@ pub struct Snapshot {
     pub autostart: Option<AutostartInfo>,
     pub notify: Option<NotifyInfo>,
     pub hooks: HooksInfo,
+    /// `None` when no audio features are enabled. `Some(VoiceInfo)`
+    /// when at least one provider (STT, eventually TTS) was configured
+    /// at startup.
+    pub voice: Option<VoiceInfo>,
     /// `Some` → Settings panel becomes editable and writes here.
     pub env_file: Option<String>,
+}
+
+/// Snapshot of STT + TTS state for the dashboard Voice section. Built
+/// once at startup — config can't change without restart anyway. Live
+/// counters (transcribe/synthesize metrics) come from `LiveContext::metrics`.
+pub struct VoiceInfo {
+    /// Manifest key — `"base.en"`, `"small.en"`, etc. `None` when STT off.
+    pub stt_model: Option<String>,
+    /// Whether STT initialized successfully.
+    pub stt_ready: bool,
+    /// Backend kind: `"none"`, `"say"`, `"kokoro-local"`, `"kokoro-remote"`.
+    /// `"none"` covers both "not configured" and "failed to init".
+    pub tts_backend: &'static str,
+    /// `Some` when TTS initialized — the resolved voice name.
+    pub tts_voice: Option<String>,
+    /// Backend-specific detail — the redacted host for `kokoro-remote`,
+    /// the manifest model key for `kokoro-local`, empty for `say` /
+    /// `none`. The dashboard renderer composes these into a single
+    /// display line so front-end layout stays simple.
+    pub tts_detail: Option<String>,
+    /// "all" if `TELEGRAM_TTS_RESPOND_TO_ALL=on`, else "voice-only".
+    /// Only meaningful when `tts_voice.is_some()`.
+    pub tts_scope: &'static str,
 }
 
 /// Hooks-mode policy + snapshot of installed project dirs. `entries`

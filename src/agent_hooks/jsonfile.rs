@@ -12,7 +12,21 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
 pub(super) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tebis.tmp");
+    // Process-id + nanosecond-unique tmp name so two concurrent
+    // tebis processes materializing the same target file don't race
+    // on each other's `.tebis.tmp` — each atomically renames its own
+    // private tmp, and only the second write wins the rename,
+    // leaving no stale tmp behind.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let tmp_name = format!(
+        "{}.tebis.tmp.{}.{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("unnamed"),
+        std::process::id(),
+        nanos,
+    );
+    let tmp = path.with_file_name(tmp_name);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -82,7 +96,17 @@ mod tests {
     fn atomic_tempfile_is_gone_after_success() {
         let p = tmp_path("tempclean");
         atomic_write_bytes(&p, b"x").unwrap();
-        assert!(!p.with_extension("tebis.tmp").exists());
+        // tmp name is `<name>.tebis.tmp.<pid>.<nanos>` — check nothing
+        // matching that pattern survives alongside the target.
+        if let Some(parent) = p.parent() {
+            let stem = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let prefix = format!("{stem}.tebis.tmp.");
+            for entry in fs::read_dir(parent).unwrap().flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                assert!(!name.starts_with(&prefix), "stale tmp: {name}");
+            }
+        }
         let _ = fs::remove_file(&p);
     }
 

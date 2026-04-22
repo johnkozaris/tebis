@@ -1,487 +1,223 @@
-# Phase 2 — Agentic Session Awareness
+# Active Plan — Kokoro TTS (cross-platform)
 
-Status: **shipped** · Owner: tebis core · Delivered as one PR, no interim/backward-compat modes.
+**Branch**: `voice-bridge` · **Last updated**: 2026-04-22
 
-This is a full-migration plan. The result: tebis distinguishes *agentic* tmux
-sessions (running Claude Code, Copilot CLI) from *terminal* sessions, and
-when an agentic session is spawned it auto-installs the agent's native hooks
-so replies come via structured events — no pane-settle polling for agentic
-sessions. Pane-settle stays the universal fallback for non-agentic TUIs.
+Supersedes the TTS sections of `PLAN-VOICE.md` (historical) and folds in
+the design discipline from `PLAN-KOKORO-TTS.md`. This file is the live
+execution checklist — each `[ ]` becomes a `[x]` as it lands.
 
 ---
 
-## 1. Context — what we have today
+## Status snapshot
 
-After the v0.1.1 work the bridge has:
+- [x] Phase 0: audio plumbing (manifest / fetch / cache / codec)
+- [x] Phase 1: local STT via `whisper-rs`
+- [x] Phase 3: voice → STT → tmux end-to-end
+- [x] Phase 4a: TTS via macOS `say` (kept as opt-in fallback)
+- [x] STT default → `small.en` q5_1 (accent-friendlier)
+- [ ] **Phase 4b: Kokoro TTS cross-platform** ← this plan
 
-- **Pane-settle autoreply** — universal TUI-agnostic reply detection. Polls
-  `capture-pane`, normalizes (strip Braille spinners + C0/C1 + collapse
-  whitespace), hashes, settles after 3 s stable, sends the tail.
-- **Diff-vs-baseline** tail extraction so the user doesn't see the agent's
-  whole scrollback on every message.
-- **Typing indicator** via `sendChatAction=typing` on a 4 s refresh loop.
-- **UDS notify listener** bound by default (chat_id = allowed_user_id).
-  Ready to receive hook-forwarded events from *any* script, no config.
-- **Contrib hook script** at `contrib/claude/claude-hook.sh` — already
-  battle-tested for Claude. Exits 0 on every path; fails open.
+## Goal
 
-What's missing:
+Replace the default TTS backend with Kokoro-82M via `kokoroxide`:
 
-- **Hooks are not installed by tebis.** Users have to copy the script
-  and merge `.claude/settings.local.json` by hand. tebis doesn't own the
-  lifecycle.
-- **No Copilot CLI support** in any form.
-- **Double-reply risk.** If hooks were installed manually AND pane-settle
-  was on, the user would get two messages per agent reply.
-
-Phase 2 closes all three.
+1. Linux gets TTS (currently returns `UnsupportedPlatform`)
+2. Mac + Linux share one code path + one quality bar
+3. `say` stays as opt-in macOS-only fallback for Siri-voice users
 
 ---
 
-## 2. Research findings
+## Blockers — resolved by pre-implementation research
 
-### 2.1 Claude Code hooks (verified from official docs)
-
-Source: <https://code.claude.com/docs/en/hooks>.
-
-- **Event catalog (25+ in 2026)**. For our purposes four matter:
-  `UserPromptSubmit`, `Stop`, `SubagentStop`, `Notification`. Others we
-  can leverage later: `SessionStart`, `SessionEnd`, `PreCompact`,
-  `Elicitation`.
-- **Failure semantics.** Default: non-blocking. A hook that exits
-  non-zero, isn't found, or hangs past `timeout` prints stderr to the
-  user and the turn *continues*. **Exit code 2** is the only blocking
-  signal, and only on `UserPromptSubmit`, `PreToolUse`, `Stop`,
-  `SubagentStop`. Our script never emits 2 by design (guarded
-  `|| true`). This is the critical safety property: **our hooks cannot
-  break Claude.**
-- **Timeout.** `timeout` (seconds) is enforced. Default 600 s. We set
-  15 s for `Stop`/`SubagentStop`, 10 s for `Notification`, 5 s for
-  `UserPromptSubmit`. Termination signal is not publicly documented;
-  assume SIGKILL after grace → our script must not leave critical state
-  uncommitted. It doesn't.
-- **Merging.** All 4 settings levels (user, project, `.local`, plugin)
-  merge into a **single array per event**. Duplicates are de-duped by
-  command string. So we can safely add our entries without clobbering
-  user-owned ones.
-- **No schema-supported label field.** Claude Code's schema has no
-  `name` / `description` / custom keys on a hook object. Our
-  "is this tebis's?" query has to be **path-based**: the entry's
-  `command` field starts with the tebis data dir prefix.
-- **Reload.** `.claude/settings.local.json` is file-watched — edits are
-  picked up within seconds, no session restart needed. Useful for
-  install/upgrade paths.
-- **Settings precedence for *writing* (least to most invasive):**
-  - `.claude/settings.local.json` ← **we write here**. Lowest precedence,
-    typically `.gitignore`d, doesn't touch user's shared project config.
-  - `.claude/settings.json` ← shared with the repo; we never touch.
-  - `~/.claude/settings.json` ← user-level; we never touch.
-- **Uninstall.** Removing our entries from `.claude/settings.local.json`
-  is complete cleanup. No caches / transcripts to prune.
-
-### 2.2 Copilot CLI hooks (GA 2026-02-25, v1.0.32)
-
-Source: <https://github.com/github/copilot-cli>, `docs.github.com`,
-community blog posts. **Schema under background research** — see
-companion investigation for exact JSON field names. Plan below assumes
-the community-documented shape; the implementation of
-`src/agent_hooks/copilot.rs` is the only place that depends on exact
-schema, so a schema-miss is a localized fix.
-
-What's confirmed:
-
-- **Eight events**: `sessionStart`, `userPromptSubmitted`, `preToolUse`,
-  `postToolUse`, `agentStop`, `subagentStop`, `errorOccurred`,
-  `sessionEnd`. `agentStop` is the direct analogue of Claude's `Stop`.
-- **Two config locations**:
-  - `.github/hooks/*.json` (per-repo). ← **we write here.**
-  - `~/.copilot/hooks/` (user-wide, added in 0.0.422).
-- **Per-file** definitions (file per event / per hook) rather than one
-  big settings object like Claude.
-- **Structured stdin** with `hook_event_name`, `session_id`, ISO
-  timestamps, snake_case field names (as of 0.0.421).
-- **JSONL output mode** (`--output-format json`, added 0.0.420). Useful
-  for one-shot piping but not relevant to our REPL-attached use case.
-
-### 2.3 Industry patterns for "installer writes into user project" tools
-
-Studied to pick the right idioms:
-
-- **husky** — generates files in `.husky/` with a sentinel header
-  `# Generated by husky — DO NOT EDIT BY HAND`. Owns whole files.
-- **lefthook** — `.lefthook-local.yml` file format supports `extends:`
-  and merge. Our case is simpler.
-- **pre-commit** — owns `hooks` inside a YAML file. Installs each hook
-  as a `.git/hooks/<name>` shim that calls back into pre-commit.
-- **direnv** — doesn't touch user files; just reads `.envrc`. Inverse
-  pattern from ours.
-- **devcontainers** — owns whole `.devcontainer/` dir.
-
-**Pattern we adopt**: husky's "owns specific paths" + a **sentinel path**
-for identification (the command string in a hook entry points at our
-materialized script in `$XDG_DATA_HOME/tebis/<agent>-hook.sh`). Any entry
-whose command is under that prefix is ours; the installer never touches
-anything else.
+| Question | Answer |
+|---|---|
+| Where do voice files live on HF? | `onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/{name}.bin` — per-voice 510 KB files, not a bundle. Confirmed 200 OK for `af_bella`, `am_adam`, `bf_emma`, `bm_george`, etc. |
+| Model URL? | `onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model.onnx` — fp16 ~175 MB. |
+| Tokenizer URL? | `onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/tokenizer.json` |
+| Which crate? | `kokoroxide` — purpose-built for Kokoro, accepts onnx-community's layout directly, MIT/Apache-2.0. |
+| System deps? | `onnxruntime` (brew/apt) — required by `ort` in `load-dynamic` mode. `espeak-ng` (brew/apt) — phonemizer. User has already OK'd both. |
+| Why not `any-tts` pure Rust? | Its Kokoro path uses Candle + hexgrad safetensors, no q4/quantized variant, only 11% of the crate documented. Risk of finding surprises mid-implementation. |
 
 ---
 
-## 3. Design decisions
+## Cleanup (do as we go, not upfront)
 
-### D1. Sentinel format → **path-based**.
-
-An entry is "ours" iff its command string equals our materialized hook
-script path. The script lives at a known, stable location:
-
-```
-$XDG_DATA_HOME/tebis/claude-hook.sh     (Claude)
-$XDG_DATA_HOME/tebis/copilot-hook.sh    (Copilot)
-```
-
-Fallback when `$XDG_DATA_HOME` is unset: `$HOME/.local/share/tebis/`.
-
-Rationale:
-- Robust: string compare, no parsing of shell invocations needed.
-- Safe: won't false-positive on user's own hooks (unless they also
-  point at our path, which is their business).
-- Upgrade-safe: path never changes across tebis versions, so
-  reinstall-dedupe works forever.
-- Fail-visible: if user rm-rf's the data dir, Claude reports
-  "file not found" as a non-blocking stderr, hook gracefully skips,
-  turn continues. No user-visible breakage.
-
-### D2. Hook script materialization → **embedded, lazy, versioned**.
-
-- Scripts live in `contrib/{claude,copilot}/*.sh` in the repo,
-  shellcheck'd in CI.
-- `include_str!` into the binary at build time.
-- At install/autostart-spawn, `materialize(agent) -> PathBuf`:
-  1. Compute destination: `data_dir().join("<agent>-hook.sh")`.
-  2. If file exists and content == embedded content, skip.
-  3. Else atomic write (tmp + rename + chmod 0700).
-- No in-binary version string needed — content-equality is the upgrade
-  trigger.
-
-### D3. Install target per agent → **project-local**, never user-level by default.
-
-| Agent | Path | Rationale |
-|---|---|---|
-| Claude | `<dir>/.claude/settings.local.json` | Lowest-precedence, usually `.gitignore`d. |
-| Copilot | `<dir>/.github/hooks/tebis-<event>.json` | Per-file = ownership is obvious. |
-
-User-level install (`~/.claude/settings.json`, `~/.copilot/hooks/`) is
-**out of scope** for v1. We'd risk silent cross-project effects.
-
-### D4. Events we install (per agent).
-
-Only events that feed our Telegram-reply flow:
-
-| Claude event | Copilot analogue | Purpose |
-|---|---|---|
-| `Stop` | `agentStop` | Forward assistant's final message (primary reply). |
-| `SubagentStop` | `subagentStop` | Forward subagent's message, tagged `[agent]`. |
-| `Notification` | `notification` event (if exposed) | Forward permission / idle prompts, tagged `[ask]`/`[idle]`. |
-| `UserPromptSubmit` | `userPromptSubmitted` | Inject "conclude with a summary" context so `Stop`'s tail is useful. |
-
-No `PreToolUse`/`PostToolUse` installs — not in our contract; adds noise
-and risk (PreToolUse can block tools on exit 2).
-
-### D5. Session → hook linkage → `SessionState.hooked_sessions`.
-
-`SessionState` gains `hooked_sessions: std::sync::Mutex<HashSet<String>>`.
-- On `resolve_or_autostart` success with agentic command + `hooks_mode=auto`:
-  install hooks, add session name to set.
-- On autostart session kill (`/restart`, `/kill =name`): **do not**
-  remove from the set — if the session is immediately re-spawned we want
-  the hooks to still be there. Next `resolve_or_autostart` will re-install
-  (idempotent) and re-add.
-- On clean shutdown: nothing — hooks persist on disk for next run. User
-  explicitly removes via `tebis hooks uninstall`.
-
-### D6. Reply suppression → `bridge::handle_update` checks session set.
-
-If `session_state.is_hooked(&session)` is true on a `Response::Sent`,
-skip `autoreply::watch_and_forward` entirely. The hook will deliver.
-
-Typing indicator (the `sendChatAction=typing` loop that was in the
-autoreply task) moves out so hooked sessions still get typing feedback.
-**New shared primitive**: `typing::indicate_for(tg, chat_id, until)` that
-spins the refresh loop and cancels on a token.
-
-### D7. Config surface → one env var, one subcommand family.
-
-```
-TELEGRAM_HOOKS_MODE=auto|off      (default: off)
-
-tebis hooks install [<dir>]       (defaults to autostart dir)
-tebis hooks uninstall [<dir>]
-tebis hooks status [<dir>]
-```
-
-`off` = today's behavior, pane-settle only.
-`auto` = at autostart, detect the agent, install hooks if supported,
-mark session as hooked, skip autoreply for it.
-
-The `tebis hooks` verbs let power users manage hooks independently of
-the autostart flow (e.g. install in a dir they run `claude` in manually).
-
-### D8. Failure modes — fail-open at every layer.
-
-1. **Script materialize fails** (disk full, permission denied) → log
-   warn, fall back to pane-settle for the session. Don't crash
-   autostart.
-2. **settings.local.json merge fails** (malformed JSON from user) →
-   log error with path, fall back to pane-settle. **Do not rewrite the
-   user's file.**
-3. **Hook script runs but can't reach UDS socket** (bridge not
-   running) → script exits 0, Claude continues. User sees no reply;
-   when they message tebis it'll start and socket reappears.
-4. **Hook installed but bridge changes path** (future) → stale entry
-   points at a no-op path. Claude reports stderr once, continues.
-   Solved by D1's stable path.
-5. **Agent not detected** → log info ("command=zsh, no hooks installed"),
-   pane-settle handles the session normally.
-
-### D9. Migration → **clean cutover, no backward-compat layers**.
-
-Per user's direction, not shipping intermediate flags:
-
-- **Removed** (if still present): the pre-existing `NOTIFY_CHAT_ID` opt-in
-  behavior became default-on in v0.1.1. Already landed.
-- **No `TELEGRAM_AUTOREPLY=off` special-casing for hooks.** Autoreply
-  continues to exist as a fallback; it's just **per-session suppressed**
-  when hooks are installed.
-- **`contrib/claude/claude-hook.sh`** → still embedded, still the
-  canonical script. It moves conceptually (users no longer reference
-  its path manually), but the file stays in the repo for CI + testing.
+- [ ] Top-banner `PLAN-VOICE.md` noting it's historical (Phase 0–4a context).
+- [ ] Top-banner `PLAN-KOKORO-TTS.md` noting it's the design reference (PLAN.md is execution).
+- [ ] `src/audio/tts/mod.rs` module docs reference "macOS-only Phase 4" — update.
+- [ ] `README.md` TTS bullet says "macOS" only — update to cross-platform.
+- [ ] `examples/tts-bench.rs` hard-codes `TtsConfig` without a `backend` field — update once the field lands.
 
 ---
 
-## 4. Architecture
+## Implementation checklist
 
-### 4.1 Module tree (after)
+Each `[ ]` is a discrete commit unless noted.
 
-```
-src/
-├── bridge/
-│   ├── mod.rs          (existing: handle_update; checks hooked_sessions)
-│   ├── autoreply.rs    (existing: pane-settle; typing loop extracted)
-│   ├── typing.rs       (new: shared typing indicator loop)
-│   ├── handler.rs      (existing: Response::Sent carries session + baseline)
-│   ├── session.rs      (existing + hooked_sessions field + is_hooked / mark_hooked)
-│   └── agent.rs        (new: AgentKind::detect)
-├── agent_hooks/
-│   ├── mod.rs          (new: HookManager trait + data_dir() + materialize())
-│   ├── claude.rs       (new: ClaudeHooks impl)
-│   └── copilot.rs      (new: CopilotHooks impl)
-├── config.rs           (+ hooks_mode: HooksMode)
-├── service.rs          (+ `tebis hooks` subcommand surface)
-├── main.rs             (argv dispatch for `hooks` + wire hooks_mode into HandlerContext)
-└── ... (everything else unchanged)
+### 4b-1 · Manifest + asset pinning
 
-contrib/
-├── claude/claude-hook.sh    (existing)
-└── copilot/copilot-hook.sh  (new)
-```
+- [ ] `src/audio/manifest.json`:
+  - Keep `onnx_url` → correct `onnx/model.onnx` (already pinned SHA: `8fbea51e...`).
+  - Add `tokenizer_url` + `tokenizer_sha256` + `tokenizer_size_bytes`.
+  - Replace `voices_url` / `voices_sha256` / `voices_size_bytes` (single-bundle keys) with `voices: BTreeMap<String, VoiceAsset>` where each `VoiceAsset = { url, sha256, size_bytes }`.
+  - Shipped voice set (small by default; `TELEGRAM_STT_MODEL=<any>` works if user wants more): `af_bella`, `am_adam`, `bf_emma`, `bm_george`.
+- [ ] `src/audio/manifest.rs` — schema update to match.
+- [ ] `scripts/pin-model-shas.sh` — extend to iterate voices array, fetch each, pin SHA.
+- [ ] Run the pinning script.
+- [ ] `cargo test --lib audio::manifest::` — passes.
 
-### 4.2 Key types
+### 4b-2 · Cargo deps
 
-```rust
-// src/bridge/agent.rs
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentKind { Claude, Copilot }
+- [ ] `Cargo.toml` add:
+  - `kokoroxide = { version = "0.1" }` (pin current version once verified)
+  - `ort = { version = "2", default-features = false, features = ["load-dynamic"] }`
+- [ ] `cargo deny check` — no `reqwest`, no new GPL.
+- [ ] `cargo build` — succeeds.
 
-impl AgentKind {
-    pub fn detect(command: &str) -> Option<Self> { ... }
-    pub fn display(&self) -> &'static str { ... }  // for logs/status
-}
+### 4b-3 · System-dep probe
 
-// src/agent_hooks/mod.rs
-pub trait HookManager: Send + Sync {
-    fn agent(&self) -> AgentKind;
-    fn install(&self, project_dir: &Path, script_path: &Path) -> Result<InstallReport>;
-    fn uninstall(&self, project_dir: &Path) -> Result<UninstallReport>;
-    fn status(&self, project_dir: &Path) -> Result<StatusReport>;
-}
+- [ ] `src/audio/tts/kokoro.rs::probe_runtime_deps()`:
+  - `which espeak-ng` → return `TtsError::Init` with install hint if missing.
+  - `ort::Environment::builder().build()` via load-dynamic; on failure, surface clear error with `ORT_DYLIB_PATH` env hint.
+- [ ] Platform-specific install hints:
+  - macOS: `brew install espeak-ng onnxruntime`
+  - Ubuntu/Debian: `apt install espeak-ng libonnxruntime-dev`
+- [ ] Probe runs at `AudioSubsystem::new` time, before downloading any assets.
 
-pub struct InstallReport {
-    pub files_written: Vec<PathBuf>,
-    pub events: Vec<&'static str>,
-    pub was_fresh: bool,  // true if we created the file, false if merged
-}
+### 4b-4 · `src/audio/tts/kokoro.rs` core
 
-pub struct UninstallReport {
-    pub files_modified: Vec<PathBuf>,
-    pub files_deleted: Vec<PathBuf>,
-    pub events_removed: Vec<String>,
-}
+- [ ] `KokoroTts` struct holds `kokoroxide::KokoroTTS` + a voice-style registry (`HashMap<String, VoiceStyle>`).
+- [ ] `KokoroTts::load(model_path, tokenizer_path, voices_dir, default_voice) -> Result<Self, TtsError>`:
+  - probe deps
+  - build `TTSConfig::new(&model_path, &tokenizer_path)` + `KokoroTTS::with_config`
+  - lazy-load the default voice style (others loaded on first use)
+- [ ] `impl Tts for KokoroTts::synthesize(text, voice) -> Synthesis`:
+  - look up or lazy-load voice style
+  - `spawn_blocking(move || tts.speak(text, &style))` — inference is CPU/GPU-bound
+  - return `Synthesis { pcm, sample_rate: 24_000, duration_ms }` (Kokoro native rate)
+- [ ] Keep `kokoroxide::*` types internal — no leak through public API.
+- [ ] Unit tests: voice-lookup-miss returns clean error; pure-function voice-name validation.
 
-pub struct StatusReport {
-    pub installed_events: Vec<String>,
-    pub unexpected_entries: Vec<String>,  // tebis-like entries we don't own
-}
+### 4b-5 · Codec resampling (pure function)
 
-pub fn for_kind(k: AgentKind) -> Box<dyn HookManager> { ... }
-pub fn materialize(agent: AgentKind) -> Result<PathBuf> { ... }
+- [ ] `src/audio/codec.rs::resample_24k_to_16k(pcm: &[f32]) -> Vec<f32>`:
+  - Linear interpolation, stride 3:2.
+  - Output length = `pcm.len() * 2 / 3` (±1 for fractional endpoint).
+- [ ] Unit tests: output length, silence stays silent, sine-wave amplitude preserved within 5%.
 
-// src/config.rs
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum HooksMode {
-    #[default] Off,
-    Auto,
-}
+### 4b-6 · Backend enum dispatch
 
-// src/bridge/session.rs
-pub struct SessionState {
-    // ... existing fields ...
-    hooked_sessions: std::sync::Mutex<HashSet<String>>,
-}
-impl SessionState {
-    pub fn mark_hooked(&self, session: &str) { ... }
-    pub fn is_hooked(&self, session: &str) -> bool { ... }
-}
+- [ ] `src/audio/tts/mod.rs`:
+  ```rust
+  pub enum Backend {
+      Kokoro(kokoro::KokoroTts),
+      #[cfg(target_os = "macos")]
+      Say(say::SayTts),
+  }
+  ```
+- [ ] `Backend::synthesize`:
+  - calls the backend's `Tts::synthesize`
+  - resamples to 16 kHz at the boundary if `sr != 16_000` via `codec::resample_24k_to_16k`
+- [ ] `Backend::display_name` for logs + dashboard.
 
-// src/bridge/mod.rs
-pub struct HandlerContext {
-    // ... existing fields ...
-    pub hooks_mode: HooksMode,  // just for logging; install decision is at autostart
-}
-```
+### 4b-7 · AudioSubsystem wiring
 
-### 4.3 Data flow
+- [ ] `src/audio/mod.rs::build_tts` dispatches on `cfg.backend`:
+  - `TtsBackend::Kokoro`: download model + tokenizer + default voice; call `KokoroTts::load`
+  - `TtsBackend::Say` (macOS): existing path unchanged
+- [ ] Voice-file lazy-fetch helper: `ensure_voice_cached(name)` in `kokoro.rs`, called from `synthesize` if voice not yet on disk.
 
-**Install path (autostart):**
-```
-main.rs: build Config { hooks_mode }
-       ↓
-SessionState::new(...)
-       ↓
-[first plain-text message]
-       ↓
-SessionState::resolve_or_autostart(tmux, hooks_mode)
-       ├─ if command matches AgentKind::detect(...) && hooks_mode == Auto:
-       │     materialize(agent) → script_path
-       │     for_kind(agent).install(dir, script_path)
-       │     mark_hooked(session)
-       └─ spawn tmux session (existing)
-```
+### 4b-8 · Config
 
-**Reply path (per-message):**
-```
-handle_update(...)
-       ↓
-execute → Response::Sent { session, baseline }
-       ↓
-if session_state.is_hooked(&session):
-    typing::indicate(tg, chat_id, ~60s cap)   # still show typing
-    (hook will deliver the real reply via UDS; no autoreply task)
-else:
-    autoreply::watch_and_forward(...)         # pane-settle + typing combined
-```
+- [ ] `src/audio/tts/mod.rs::TtsConfig`:
+  ```rust
+  pub struct TtsConfig {
+      pub backend: TtsBackend,    // Kokoro (default) | Say
+      pub voice: String,          // "af_bella" for Kokoro, "Samantha" for Say
+      pub respond_to_all: bool,
+  }
+  ```
+- [ ] `src/config.rs::load_tts_config`:
+  - Parse `TELEGRAM_TTS_BACKEND` (default `kokoro`).
+  - Reject `backend=say` on non-macOS with clear error.
+  - Pick sensible voice default per backend.
 
-**Uninstall path (subcommand):**
-```
-main.rs: `tebis hooks uninstall [dir]`
-       ↓
-for_kind(detect_from_dir_or_prompt).uninstall(dir)
-       ↓
-report.print()
-```
+### 4b-9 · Wizard
 
-### 4.4 Atomic file operations
+- [ ] `src/setup/steps.rs::step_tts`:
+  - No longer cfg-gated macOS.
+  - On macOS: ask backend (Kokoro | say) — default Kokoro.
+  - Voice picker: show 4 shipped Kokoro voices + "any voice name from `tebis tts voices`".
+- [ ] `WIZARD_MANAGED_KEYS`: add `TELEGRAM_TTS_BACKEND`.
+- [ ] `src/setup/discover.rs`: parse TTS_BACKEND.
+- [ ] `src/setup/ui.rs`: Voice-out summary row mentions backend.
 
-All mutations to `settings.local.json` / Copilot hook files use:
-1. Read current content (or empty).
-2. Modify in memory.
-3. Serialize to `<path>.tebis.tmp`.
-4. `fsync` the tmp file.
-5. `rename` over the target.
+### 4b-10 · CLI
 
-A crash at any point leaves either the old file or the new file intact,
-never partial.
+- [ ] `src/tts_cli.rs` new module, mirrors `hooks_cli`:
+  - `tebis tts voices` — list manifest voices grouped by language / gender.
+  - `tebis tts test [voice]` — synthesize "Hello from tebis, I am {voice}", play via `afplay`/`aplay` if present, else print written tempfile path.
+  - `tebis tts status` — show backend, voice, cached files, last-synth metrics.
+- [ ] `src/main.rs` dispatches `tebis tts <verb>`.
+- [ ] `HELP` text in `src/main.rs` updated.
+
+### 4b-11 · Dashboard
+
+- [ ] `src/inspect/mod.rs::VoiceInfo::tts_backend: &'static str`.
+- [ ] `src/inspect/render.rs::build_voice_rows` displays the backend.
+- [ ] `examples/inspect-demo.rs` updated.
+
+### 4b-12 · Tests
+
+- [ ] Unit: voice-name validation, resample helper (length + silence + amplitude), manifest voice-map parse.
+- [ ] Integration `#[ignore]`: load cached model + tokenizer + voice, synthesize "test", assert > 100 samples.
+- [ ] `examples/audio-smoke` — exercise Kokoro; drop `say` by default.
+- [ ] `examples/tts-bench` — extend to A/B both backends on macOS.
+
+### 4b-13 · Verification gates
+
+- [ ] `cargo build --release` on macOS (primary dev box).
+- [ ] `cargo test --lib` — all pass, 230+ count.
+- [ ] `cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery`.
+- [ ] `cargo deny check` — advisories / bans / licenses / sources ok.
+- [ ] `./target/release/examples/audio-smoke` — full round-trip OK.
+- [ ] `./target/release/tebis tts test af_bella` — produces audible, correct audio.
+- [ ] README + docs cleanup from the top-of-file list done.
+
+### 4b-14 · Wrap
+
+- [ ] Squash / rebase into tidy commits per phase-step group.
+- [ ] Final `git log --oneline master..voice-bridge` reviewed for narrative.
 
 ---
 
-## 5. Edge cases + gotchas
+## Design non-negotiables (carried from PLAN-KOKORO-TTS.md §17)
 
-| # | Scenario | Handling |
-|---|---|---|
-| 1 | `$XDG_DATA_HOME` unset | Fall back to `$HOME/.local/share/tebis`. |
-| 2 | `$HOME` unset | `materialize` returns `Err`; install fails; log + fall back to pane-settle. |
-| 3 | User has existing tebis entries (upgrade) | `install` de-dupes by path match before inserting. |
-| 4 | User has non-tebis entries in same event | Preserved: uninstall removes only entries with our script path. |
-| 5 | `.claude/settings.local.json` is malformed JSON | Log error, abort install, do **not** overwrite. Pane-settle takes over. |
-| 6 | `.claude/settings.local.json` root is not an object | Refuse to install; log. |
-| 7 | User deletes `$XDG_DATA_HOME/tebis/claude-hook.sh` while installed | Next `claude` turn: hook command not found, Claude prints stderr once, continues. Autostart re-materializes on next session spawn. |
-| 8 | Two tebis instances racing install | Single-instance lockfile (v0.1.1) prevents this. |
-| 9 | Crash mid-install | Atomic rename keeps settings.local.json consistent. |
-| 10 | Empty `hooks` block / empty settings object after uninstall | Remove the key; if file becomes `{}`, remove the file. |
-| 11 | Project dir doesn't exist / not writable | `install` returns Err; autostart continues without hooks. |
-| 12 | User renames autostart session but hooks installed | Hooks live in the *directory*, not the session. Unaffected. |
-| 13 | User changes autostart dir | New dir has no hooks; auto-install fires again for new dir. Old dir keeps stale hooks; user cleans up via `tebis hooks uninstall <old>`. |
-| 14 | Two different tebis setups on same host using same project | Last one's install wins (same path, same content). No conflict. |
-| 15 | Hook script syntax error (shouldn't happen; shellcheck'd) | Claude reports non-zero exit, continues. Test in CI. |
-| 16 | User has Claude Code plugin installed that also registers hooks | Merges fine; plugin hooks are at a different command path. |
-| 17 | Hook fires before UDS socket is bound (bridge starting up) | Script's `[[ ! -S $SOCKET ]] && exit 0` already handles this. |
-| 18 | `--output-format json` Copilot mode | Not a hooks path; orthogonal to this work. |
+- **Layer decomposition**: bridge → AudioSubsystem → Backend enum → Tts trait → codec → telegram. No cross-layer imports.
+- **No leaky abstractions**: no `kokoroxide::*` or `ort::*` in public API.
+- **`spawn_blocking` for inference**. Model loaded once; inference calls share.
+- **Thiserror for module errors**; HTML-escape at the bridge boundary.
+- **Functions ≤ 50 lines**. No `unwrap`/`expect` outside known-impossible paths.
+- **RecordingTts** test fake for bridge tests — no real model in CI.
 
----
+## Success criteria
 
-## 6. Implementation plan (ordered)
+1. `TELEGRAM_TTS=on` works on both macOS and Linux after two one-time installs (`espeak-ng`, `onnxruntime`).
+2. End-to-end voice-in → voice-out round-trip ≤ 3 s on M4 Pro for a 1 k char reply.
+3. Binary size delta ≤ 15 MB.
+4. First-run TTS download ≤ 180 MB.
+5. Tests + clippy + deny all green.
 
-1. **`src/bridge/agent.rs`** — `AgentKind` + `detect()` (~40 lines; tests).
-2. **`src/bridge/typing.rs`** — extract typing loop from autoreply into
-   shared helper (~30 lines; no new logic).
-3. **`src/agent_hooks/mod.rs`** — trait, data_dir, materialize (~80 lines).
-4. **`src/agent_hooks/claude.rs`** — install/uninstall/status (~200 lines).
-5. **`src/agent_hooks/copilot.rs`** — install/uninstall/status (~200 lines,
-   pending background research).
-6. **`contrib/copilot/copilot-hook.sh`** — adapted from claude-hook.sh
-   (~80 lines).
-7. **`src/config.rs`** — `HooksMode` enum + env parse.
-8. **`src/bridge/session.rs`** — `hooked_sessions` HashSet + API.
-9. **`src/bridge/session.rs::resolve_or_autostart`** — install hooks on
-   agentic autostart when mode=auto.
-10. **`src/bridge/mod.rs::handle_update`** — branch on `is_hooked`.
-11. **`src/bridge/autoreply.rs`** — delegate typing to `typing.rs`.
-12. **`src/service.rs`** — `hooks_install(dir)`, `hooks_uninstall(dir)`,
-    `hooks_status(dir)` wrappers.
-13. **`src/main.rs`** — argv dispatch: `hooks install|uninstall|status`;
-    wire `HooksMode` through HandlerContext and autostart.
-14. **Integration test harness** — unit tests for claude.rs's JSON
-    merge/unmerge logic against representative inputs.
-15. **Review cycles** — code review, UX/lifecycle review, dead-code
-    review. Findings applied; see git history.
+## Accepted risks
 
----
+- `kokoroxide` 0.1.5 is young. Mitigation: pin version, test smoke path end-to-end.
+- `ort` `load-dynamic` may miss `libonnxruntime` on non-standard paths. Mitigation: probe + `ORT_DYLIB_PATH` hint.
+- Linear 24k → 16k resample loses content > 8 kHz. For speech this is inaudible; swap to `rubato` later if anyone complains.
 
-## 7. Code-quality guardrails (rule: do these a lot)
+## Non-goals (this phase)
 
-1. After each chunk of 200+ lines, run:
-   - `cargo fmt --all && cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery`
-   - `cargo test`
-2. After all implementation: dispatch `coderabbit:code-reviewer` + a
-   general code-review subagent; apply findings.
-3. Also dispatch: dead-code / lifecycle / UX reviews (separate
-   subagents). Apply findings.
-4. DRY: the JSON-mutate + atomic-write pattern is shared; factor once
-   (`agent_hooks/jsonfile.rs` or similar).
-5. No dead code: remove the `Command::Send`-returning-`ReactSuccess`
-   legacy branch if superseded. Remove `format_pane_reply` from `bridge/mod.rs`
-   if only autoreply uses it (move into `autoreply.rs`).
-6. No backwards-compat shims. Existing users who set
-   `TELEGRAM_AUTOREPLY=off` still get that behavior; no silent migration.
-
----
-
-## 8. Out of scope for Phase 2
-
-- User-level hook install (`~/.claude/settings.json`,
-  `~/.copilot/hooks/`).
-- Non-tmux agents (Cursor CLI, Aider, etc.).
-- Hook-event-specific routing (e.g. "PermissionPrompt → Telegram button
-  keyboard to approve/deny"). Current script forwards as text only.
-- Rich notification formatting per event (current header tags are
-  plenty).
-- Installing hooks on sessions created via `/new` (not autostart).
-  Rationale: `/new` creates bare sessions; user launches agent manually;
-  our install timing doesn't fit. Power users can `tebis hooks install <dir>`.
+- Streaming synthesis.
+- Voice cloning.
+- GPU acceleration on Linux (leave `ort`'s `cuda` feature off).
+- Windows support.
+- Removing `say` on macOS.

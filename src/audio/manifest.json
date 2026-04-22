@@ -1,0 +1,49 @@
+{
+  "manifest_version": 2,
+  "tebis_version": "0.2.0",
+  "updated_at": "2026-04-22",
+  "stt_models": {
+    "base.en": {
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin",
+      "sha256": "4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f",
+      "size_bytes": 59770597,
+      "display_name": "Whisper Base (English) Q5_1 — 57 MB",
+      "default": false
+    },
+    "small.en": {
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en-q5_1.bin",
+      "sha256": "bfdff4894dcb76bbf647d56263ea2a96645423f1669176f4844a1bf8e478ad30",
+      "size_bytes": 190134239,
+      "display_name": "Whisper Small (English) Q5_1 — 181 MB",
+      "default": true
+    },
+    "tiny.en": {
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en-q5_1.bin",
+      "sha256": "c77c5766f1cef09b6b7d47f21b546cbddd4157886b3b5d6d4f709e91e66c7c2b",
+      "size_bytes": 32201487,
+      "display_name": "Whisper Tiny (English) Q5_1 — 31 MB",
+      "default": false
+    }
+  },
+  "tts_models": {
+    "kokoro-v1.0": {
+      "onnx_url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model.onnx",
+      "onnx_sha256": "8fbea51ea711f2af382e88c833d9e288c6dc82ce5e98421ea61c058ce21a34cb",
+      "onnx_size_bytes": 346000000,
+      "voices": {
+        "af_sarah": {
+          "url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/af_sarah.bin",
+          "sha256": "4409fbc125afabacc615d94db5398d847006a737b0247d6892b7a9a0007a2f0a",
+          "size_bytes": 522240
+        },
+        "am_adam": {
+          "url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/am_adam.bin",
+          "sha256": "162b035ed91cfc48b6046982184c645f72edcdd1b82843347f605d7bf7b15716",
+          "size_bytes": 522328
+        }
+      },
+      "default_voice": "af_sarah",
+      "display_name": "Kokoro-82M v1.0 — 346 MB model + 3 KB tokenizer + ~510 KB per voice"
+    }
+  }
+}
