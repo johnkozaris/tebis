@@ -9,7 +9,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -88,6 +88,40 @@ pub fn install() -> Result<()> {
     Ok(())
 }
 
+/// Atomic write with mode 0644 for service config files (launchd plist /
+/// systemd unit). These files are non-secret but truncation-sensitive:
+/// a partial plist makes `launchctl load` fail with a cryptic parse
+/// error. `fs::write` could produce torn content if the process is
+/// killed mid-write; tmp-then-rename guarantees all-or-nothing.
+fn atomic_write_0644(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let tmp = path.with_file_name(format!(
+        "{}.tebis.tmp.{}.{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("svc"),
+        std::process::id(),
+        nanos,
+    ));
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(&tmp)
+            .with_context(|| format!("opening {}", tmp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
+    }
+    fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} → {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
 fn install_binary(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -123,7 +157,8 @@ fn install_macos() -> Result<()> {
         .parent()
         .context("plist path has no parent — $HOME is malformed?")?;
     fs::create_dir_all(plist_dir).with_context(|| format!("creating {}", plist_dir.display()))?;
-    fs::write(&plist_path, plist).with_context(|| format!("writing {}", plist_path.display()))?;
+    atomic_write_0644(&plist_path, plist.as_bytes())
+        .with_context(|| format!("writing {}", plist_path.display()))?;
     println!("    plist   {}", short(&plist_path));
 
     // Idempotent: unload first (ignore failure when not loaded).
@@ -141,7 +176,7 @@ fn install_linux() -> Result<()> {
         .parent()
         .context("systemd unit path has no parent — $HOME is malformed?")?;
     fs::create_dir_all(unit_dir).with_context(|| format!("creating {}", unit_dir.display()))?;
-    fs::write(&unit_path, LINUX_SERVICE)
+    atomic_write_0644(&unit_path, LINUX_SERVICE.as_bytes())
         .with_context(|| format!("writing {}", unit_path.display()))?;
     println!("    unit    {}", short(&unit_path));
 

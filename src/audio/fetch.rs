@@ -376,16 +376,29 @@ impl Write for TeeWriter {
 }
 
 /// Generic-string equivalent of `telegram::redact_network_error` — matches
-/// the same substrings ("/bot", "api.telegram.org") that indicate a leaked
-/// bot-token URL, and swaps them for a placeholder. The real
+/// the same shapes (`/bot<digit>`, `api.telegram.org`) that indicate a
+/// leaked bot-token URL and swaps them for a placeholder. The real
 /// `redact_network_error` consumes a `hyper_util::client::legacy::Error`;
-/// body-frame errors come through as `hyper::Error`, which has no `.source()`
-/// chain compatible with that helper. This shim keeps invariant 6 uniform.
+/// body-frame errors come through as `hyper::Error`, which has no
+/// `.source()` chain compatible with that helper. This shim keeps
+/// invariant 6 uniform.
 fn redact_hyper_error_string(s: &str) -> String {
-    if s.contains("/bot") || s.contains("api.telegram.org") {
+    if contains_bot_token_shape(s) || s.contains("api.telegram.org") {
         return "<redacted network error>".to_string();
     }
     s.to_string()
+}
+
+/// True when `s` contains `/bot` immediately followed by an ASCII digit.
+/// Duplicates `telegram::contains_bot_token_shape` so this module stays
+/// free of inbound coupling on the telegram module.
+fn contains_bot_token_shape(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let needle = b"/bot";
+    bytes
+        .windows(needle.len())
+        .enumerate()
+        .any(|(i, w)| w == needle && bytes.get(i + needle.len()).is_some_and(u8::is_ascii_digit))
 }
 
 /// Lowercase hex of bytes. 32-byte SHA-256 digest → 64 hex chars.

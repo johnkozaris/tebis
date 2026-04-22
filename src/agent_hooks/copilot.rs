@@ -138,7 +138,14 @@ impl super::HookManager for CopilotHooks {
         });
 
         jsonfile::atomic_write_json(&path, &doc)?;
-        let _ = super::manifest::record_install(AgentKind::Copilot, project_dir);
+        if let Err(e) = super::manifest::record_install(AgentKind::Copilot, project_dir) {
+            tracing::warn!(
+                err = %e,
+                dir = %project_dir.display(),
+                "copilot hooks install: failed to record manifest row — \
+                 `tebis hooks list` may omit this install"
+            );
+        }
         Ok(super::InstallReport {
             files_written: vec![path],
             events: EVENTS.iter().map(|(e, _)| *e).collect(),
@@ -150,7 +157,14 @@ impl super::HookManager for CopilotHooks {
         // same invariant. We also use data_dir via looks_like_tebis_owned
         // in install; this keeps the behavior symmetric.
         super::data_dir().context("resolving tebis data dir for ownership check")?;
-        let _ = super::manifest::record_uninstall(AgentKind::Copilot, project_dir);
+        if let Err(e) = super::manifest::record_uninstall(AgentKind::Copilot, project_dir) {
+            tracing::warn!(
+                err = %e,
+                dir = %project_dir.display(),
+                "copilot hooks uninstall: failed to drop manifest row — \
+                 `tebis hooks list` may show a stale entry"
+            );
+        }
 
         let path = hooks_file(project_dir);
         if !path.exists() {

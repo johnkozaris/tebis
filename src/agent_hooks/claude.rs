@@ -105,7 +105,14 @@ impl super::HookManager for ClaudeHooks {
         }
 
         jsonfile::atomic_write_json(&path, &settings)?;
-        let _ = super::manifest::record_install(AgentKind::Claude, project_dir);
+        if let Err(e) = super::manifest::record_install(AgentKind::Claude, project_dir) {
+            tracing::warn!(
+                err = %e,
+                dir = %project_dir.display(),
+                "claude hooks install: failed to record manifest row — \
+                 `tebis hooks list` may omit this install"
+            );
+        }
         Ok(super::InstallReport {
             files_written: vec![path],
             events: EVENTS.iter().map(|(e, _)| *e).collect(),
@@ -120,8 +127,18 @@ impl super::HookManager for ClaudeHooks {
         super::data_dir().context("resolving tebis data dir for ownership check")?;
         // Drop the manifest entry unconditionally — even when the
         // settings file is already gone, a stale manifest row would
-        // make `tebis hooks list` lie.
-        let _ = super::manifest::record_uninstall(AgentKind::Claude, project_dir);
+        // make `tebis hooks list` lie. Log on failure (NFS flakes,
+        // ManifestLock acquire timeouts) so that staleness is
+        // diagnosable; don't bail — we still want to uninstall the
+        // hook entries below.
+        if let Err(e) = super::manifest::record_uninstall(AgentKind::Claude, project_dir) {
+            tracing::warn!(
+                err = %e,
+                dir = %project_dir.display(),
+                "claude hooks uninstall: failed to drop manifest row — \
+                 `tebis hooks list` may show a stale entry"
+            );
+        }
 
         let path = settings_path(project_dir);
         if !path.exists() {

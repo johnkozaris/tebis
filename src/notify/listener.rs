@@ -44,8 +44,21 @@ pub fn spawn<F: Forwarder>(
 /// Three-layer defense so the socket never exists at a looser mode:
 /// (1) tightened `umask(0177)` around `bind(2)`, (2) explicit `chmod 0600`,
 /// (3) `peer_cred` check in `handle_connection`. Layers (1)+(2) close the
-/// TOCTOU window; (3) is the authenticated gate. Don't remove any in
-/// isolation.
+/// window between bind and the first accept; (3) is the only
+/// authenticated gate. Don't remove any in isolation.
+///
+/// Pre-bind unlink is safe on the `/tmp/tebis-$USER.sock` fallback even
+/// though `/tmp` is world-writable:
+/// - `remove_file` → `unlink(2)`, which does NOT follow symlinks. An
+///   attacker who pre-creates the path as a symlink to `/etc/passwd`
+///   only has its own symlink unlinked; the target is untouched.
+/// - The sticky bit on `/tmp` prevents attacker-owned files/symlinks
+///   from being unlinked by us (EPERM). We surface that as a non-
+///   NotFound `Err` and bail — no clobber path.
+/// - If the path is clean or ours to unlink, `bind(2)` then creates a
+///   fresh inode. A race where an attacker re-creates the path between
+///   our unlink and our bind results in `bind` failing with
+///   `EADDRINUSE` (bind refuses existing paths); still no clobber.
 fn bind(path: &Path) -> Result<UnixListener> {
     match std::fs::remove_file(path) {
         Ok(()) => {}

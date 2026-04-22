@@ -48,6 +48,19 @@ pub fn atomic_write_0600(path: &Path, content: &str) -> Result<()> {
         .with_context(|| format!("chmod 0600 {}", tmp.display()))?;
     fs::rename(&tmp, path)
         .with_context(|| format!("renaming {} → {}", tmp.display(), path.display()))?;
+    // POSIX: `rename(2)` durability requires fsync on the containing
+    // directory. Without this, a crash between the rename and the
+    // implicit dir-inode flush can leave the new filename unresolvable
+    // (target unlinked, tmp renamed but the dir entry hasn't hit disk).
+    // Best-effort — log on failure but don't bail, because on some
+    // filesystems (e.g. NFS, some tmpfs) opening a directory for
+    // reading + fsync isn't permitted.
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = fs::File::open(parent)
+        && let Err(e) = dir.sync_all()
+    {
+        tracing::debug!(err = %e, dir = %parent.display(), "atomic_write_0600: parent dir fsync failed");
+    }
     Ok(())
 }
 

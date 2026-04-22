@@ -50,6 +50,20 @@ pub fn run(args: &[String]) -> Result<()> {
 fn install(args: &[String]) -> Result<()> {
     let parsed = parse_args(args)?;
     let dir = resolve_dir(parsed.dir.as_deref())?;
+
+    // Typos like `tebis hooks install ~/projcts/foo` would otherwise
+    // silently create the dir (via `create_dir_all` deep inside the
+    // installer) and write hooks to a phantom project root — the
+    // manifest then lists an install that will never fire. Mirror
+    // `uninstall`'s fail-loud check.
+    if !dir.is_dir() {
+        anyhow::bail!(
+            "directory does not exist: {} — pass a valid project path or \
+             `cd` into the project and re-run without args",
+            dir.display()
+        );
+    }
+
     let agent = match parsed.agent {
         Some(a) => a,
         None => detect_agent_from_config()?.with_context(|| {

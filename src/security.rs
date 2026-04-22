@@ -104,7 +104,10 @@ impl RateLimiter {
     /// `Err(retry_after)` with the exact duration until the next call would
     /// be accepted. Clients surface this wait to the user so "try again
     /// later" isn't a blind guess.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "guard is held across the branch-and-write critical section; releasing earlier would race the TAT update against a concurrent request"
+    )]
     pub fn check(&self, chat_id: i64) -> std::result::Result<(), Duration> {
         let now = Instant::now();
         let mut tats = self.tats.lock().expect("rate limiter poisoned");

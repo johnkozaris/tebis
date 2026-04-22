@@ -254,6 +254,9 @@ fn redact_network_error(err: &hyper_util::client::legacy::Error) -> String {
 
 impl std::fmt::Debug for RemoteTts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `client` is intentionally omitted (hyper's Debug could leak
+        // the URI or auth headers via nested fields); `finish_non_exhaustive`
+        // signals the omission to readers and satisfies clippy.
         f.debug_struct("RemoteTts")
             .field("base_url", &"<redacted>")
             .field("model", &self.model)
@@ -267,7 +270,7 @@ impl std::fmt::Debug for RemoteTts {
                     "<unset>"
                 },
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

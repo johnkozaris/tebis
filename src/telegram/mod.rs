@@ -285,33 +285,17 @@ impl TelegramClient {
             format!("https://api.telegram.org/file/bot{token}/{file_path}")
         };
 
-        let mut last_err: Option<TelegramError> = None;
-        for attempt in 0..=1 {
-            match self.download_file_once(&url).await {
-                Ok(body) => return Ok(body),
-                Err(e) => {
-                    if attempt == 0 && matches!(
-                        &e,
-                        TelegramError::Network { retryable: true, .. }
-                    ) {
-                        tracing::warn!(
-                            attempt,
-                            err = %e,
-                            "download_file: retrying once on connect-level error"
-                        );
-                        last_err = Some(e);
-                        continue;
-                    }
-                    return Err(e);
-                }
+        // Two-shot: first attempt fails on a retryable connect-level
+        // error → retry once. Any non-retryable error bubbles
+        // immediately. The second attempt's outcome is terminal.
+        match self.download_file_once(&url).await {
+            Ok(body) => return Ok(body),
+            Err(e) if matches!(&e, TelegramError::Network { retryable: true, .. }) => {
+                tracing::warn!(err = %e, "download_file: retrying once on connect-level error");
             }
+            Err(e) => return Err(e),
         }
-        // Unreachable: loop always returns or continues.
-        Err(last_err.unwrap_or_else(|| TelegramError::Network {
-            method: "download_file".to_string(),
-            description: "retry loop exited without result".to_string(),
-            retryable: false,
-        }))
+        self.download_file_once(&url).await
     }
 
     async fn download_file_once(&self, url: &str) -> Result<Bytes> {
@@ -695,8 +679,9 @@ fn build_send_voice_body(
 }
 
 /// Render a hyper-util client error into a token-safe string. Walks to the
-/// root cause, then substring-checks for `/bot` or `api.telegram.org` as
-/// belt-and-suspenders against future hyper regressions.
+/// root cause, then substring-checks for `/bot<digit>` (the Telegram
+/// token-URL shape) or `api.telegram.org` as belt-and-suspenders against
+/// future hyper regressions.
 ///
 /// `pub(crate)` so `audio::fetch` can route its HTTP errors through the
 /// same redactor — same crypto stack, same failure modes, same secret
@@ -714,11 +699,27 @@ pub(crate) fn redact_network_error(err: &hyper_util::client::legacy::Error) -> S
         "request"
     };
     let raw = format!("{kind}: {cur}");
-    if raw.contains("/bot") || raw.contains("api.telegram.org") {
+    // Bare `/bot` is too aggressive — a benign hyper error containing a
+    // path segment, user-agent string, or random token `/bot` elsewhere
+    // in its chain would get scrubbed. Telegram's bot token URL is
+    // always `/bot<digit>...`, so gate on that.
+    if contains_bot_token_shape(&raw) || raw.contains("api.telegram.org") {
         tracing::warn!("Network error contained URI-like data; replaced with redacted placeholder");
         return format!("{kind}: <redacted network error>");
     }
     raw
+}
+
+/// True when `s` contains `/bot` immediately followed by an ASCII digit.
+/// Cheap manual scan — the alternative would be a regex or a crate
+/// dependency for one substring check.
+fn contains_bot_token_shape(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let needle = b"/bot";
+    bytes
+        .windows(needle.len())
+        .enumerate()
+        .any(|(i, w)| w == needle && bytes.get(i + needle.len()).is_some_and(u8::is_ascii_digit))
 }
 
 impl std::fmt::Debug for TelegramClient {
@@ -736,14 +737,40 @@ mod tests {
     #[test]
     fn redact_passthrough_on_clean_error() {
         let raw = "request: io: connection reset by peer";
-        assert!(!raw.contains("/bot"));
+        assert!(!contains_bot_token_shape(raw));
         assert!(!raw.contains("api.telegram.org"));
     }
 
     #[test]
     fn token_substring_triggers_redaction() {
         let leaked = "request: unexpected /bot12345:abcde in error";
-        assert!(leaked.contains("/bot"));
+        assert!(contains_bot_token_shape(leaked));
+    }
+
+    #[test]
+    fn bare_bot_path_does_not_trigger_false_positive() {
+        // Without a trailing digit, `/bot` is not the Telegram token
+        // shape — could be a user-agent, a random subpath, etc.
+        for benign in [
+            "connect: tcp stream closed to /bot/health",
+            "request: /botanical-garden sensor error",
+            "request: unrelated string ending with /bot",
+            "connect: proxy at 10.0.0.1/bot-proxy refused",
+        ] {
+            assert!(
+                !contains_bot_token_shape(benign),
+                "tightened shape should not match benign input: {benign:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bot_token_shape_requires_digit_after_bot() {
+        assert!(contains_bot_token_shape("/bot0"));
+        assert!(contains_bot_token_shape("/bot9123456789:XYZ"));
+        assert!(!contains_bot_token_shape("/bot:"));
+        assert!(!contains_bot_token_shape("/bot"));
+        assert!(!contains_bot_token_shape("/botX"));
     }
 
     #[test]
