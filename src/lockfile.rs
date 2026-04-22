@@ -144,9 +144,13 @@ pub fn active_holder(path: &Path) -> Option<u32> {
     // SAFETY: flock(2) with a valid fd and valid flags is sound.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
-        // We acquired the lock — nobody held it. Dropping `file` at
-        // end-of-scope closes the fd and releases the lock. The file
-        // content is stale; we don't bother removing it.
+        // We acquired the lock → nobody was holding it. Remove the
+        // stale file so a future `tebis status` doesn't see an
+        // orphaned pid from a crashed prior run. Safe here: we held
+        // (briefly) the exclusive flock, and any parallel checker
+        // racing with us would also acquire-and-then-lose the lock,
+        // reaching the same conclusion.
+        let _ = std::fs::remove_file(path);
         return None;
     }
     let errno = std::io::Error::last_os_error().raw_os_error();

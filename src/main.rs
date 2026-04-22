@@ -154,9 +154,7 @@ fn unauthorized_dead_end(err: &telegram::TelegramError) -> anyhow::Error {
     anyhow::anyhow!("bot token rejected by Telegram (401 Unauthorized): {err}")
 }
 
-/// Single-user workload: realistic concurrency is 1–2. 8 bounds subprocess
-/// fan-out when Telegram delivers a queued burst.
-const MAX_CONCURRENT_HANDLERS: usize = 8;
+use bridge::MAX_CONCURRENT_HANDLERS;
 
 /// Acquire the single-instance lock. On conflict, tell the user exactly
 /// who holds it — the background service, a foreground run, or unknown.

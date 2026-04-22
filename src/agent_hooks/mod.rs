@@ -135,12 +135,16 @@ pub(super) fn is_our_script(candidate: &Path) -> bool {
         }
     };
     let cand_parent = candidate.parent().unwrap_or(candidate);
-    match (
-        std::fs::canonicalize(cand_parent),
-        std::fs::canonicalize(&our_dir),
-    ) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => cand_parent == our_dir.as_path(),
+    paths_eq(cand_parent, our_dir.as_path())
+}
+
+/// Path equality that tolerates symlinks / case-fold filesystems.
+/// Canonicalizes both sides; falls back to raw `==` if either side
+/// can't be resolved (e.g. still-being-created path).
+pub(super) fn paths_eq(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
     }
 }
 

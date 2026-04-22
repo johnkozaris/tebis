@@ -44,6 +44,13 @@ pub enum Payload {
     },
 }
 
+/// Global cap on concurrent handler tasks. Single-user workload:
+/// realistic concurrency is 1–2. 8 bounds subprocess fan-out when
+/// Telegram delivers a burst (e.g. queued messages after a phone
+/// reconnect). Lives in the consumer module so the policy sits with
+/// `HandlerContext::handler_sem`.
+pub const MAX_CONCURRENT_HANDLERS: usize = 8;
+
 /// Per-handler dependencies. Fresh per inbound update, moved into the task.
 pub struct HandlerContext {
     pub tg: Arc<TelegramClient>,

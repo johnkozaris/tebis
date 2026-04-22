@@ -316,6 +316,7 @@ impl AudioSubsystem {
 ///   (task #46). The subsystem handles the error by falling back to
 ///   text-only replies (see [`AudioSubsystem::new`]).
 /// - `Remote` → construct the HTTP client; no network I/O here.
+#[cfg_attr(not(feature = "kokoro"), allow(unused_variables))]
 async fn build_tts(
     cfg: &TtsConfig,
     shutdown: &CancellationToken,

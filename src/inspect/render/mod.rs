@@ -109,6 +109,7 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext) -> String {
     <dt>Tmux version</dt><dd><code>{tmux_version}</code></dd>
     <dt>Last successful poll</dt><dd>{last_poll_success_ago}</dd>
     <dt>Handler errors</dt><dd>{handler_errors}</dd>
+    <dt>Live session slots</dt><dd><code>{dynamic_slots}</code></dd>
   </dl></div>
 </section>
 
@@ -192,6 +193,7 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext) -> String {
         in_flight = meta.in_flight,
         poll_success = meta.poll_success,
         poll_errors = meta.poll_errors,
+        dynamic_slots = meta.dynamic_slots,
     )
 }
 
@@ -213,6 +215,7 @@ struct RenderMeta {
     last_response_secondary: String,
     last_poll_success_ago: String,
     in_flight: usize,
+    dynamic_slots: usize,
 }
 
 fn build_meta(snapshot: &Snapshot, live: &LiveContext) -> RenderMeta {
@@ -253,6 +256,7 @@ fn build_meta(snapshot: &Snapshot, live: &LiveContext) -> RenderMeta {
         last_response_secondary,
         last_poll_success_ago: timefmt::format_ago(m.last_poll_success_at.load(Ordering::Relaxed)),
         in_flight: snapshot.max_concurrent_handlers.saturating_sub(available),
+        dynamic_slots: live.tmux.dynamic_slot_count(),
     }
 }
 

@@ -107,6 +107,19 @@ impl Tmux {
         self.permissive
     }
 
+    /// Count of lazily-allocated slots in permissive mode. Used by the
+    /// dashboard so operators can see the `dynamic` HashMap's size —
+    /// it never shrinks by design (allocation is driven by bounded,
+    /// regex-validated session names), but a runaway bot provisioning
+    /// hundreds of ad-hoc sessions would surface here before it
+    /// becomes a memory concern.
+    #[must_use]
+    pub fn dynamic_slot_count(&self) -> usize {
+        self.dynamic
+            .lock()
+            .map_or(0, |g| g.len())
+    }
+
     pub async fn list_sessions(&self) -> Result<Vec<String>> {
         let output = run_tmux("list-sessions", &["list-sessions", "-F", "#{session_name}"]).await?;
 
@@ -133,6 +146,14 @@ impl Tmux {
     /// Sends text with `-l` (literal, bypasses key-name lookup), a
     /// `SUBMIT_GAP` pause, then Enter as raw hex `0d`. Per-session lock
     /// keeps the text+Enter pair atomic against concurrent calls.
+    ///
+    /// **Invariant**: the `text` send → sleep → Enter send triple must
+    /// run under a single acquisition of the per-session mutex. Adding
+    /// an `.await` between the three sub-steps that isn't on the lock
+    /// itself is the bug — cancellation at an intermediate point can
+    /// leave characters in the pane without the submit Enter, which
+    /// then prepends onto the next command. Matches CLAUDE.md invariant
+    /// 3 (don't cancel mid-`send_keys`).
     pub async fn send_keys(&self, session: &str, text: &str) -> Result<()> {
         let slot = self.slot(session)?;
         let _guard = slot.lock.lock().await;

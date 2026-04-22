@@ -3,10 +3,16 @@
 //! work happens — the rate limit is cheap, the auth check is free.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::telegram::types::Update;
+
+/// Per-sender cooldown so a determined attacker DM'ing the bot can't
+/// fill the journal with "Unauthorized message — …" warns. First
+/// rejected message from each sender logs; subsequent rejections
+/// within this window are counted silently.
+const UNAUTHORIZED_LOG_COOLDOWN: Duration = Duration::from_secs(300);
 
 /// Authorize by Telegram numeric `user_id`. Never authenticate by username —
 /// usernames are recyclable and mutable, making them unsafe for access control.
@@ -19,14 +25,38 @@ pub fn is_authorized(update: &Update, allowed_user_id: i64) -> bool {
         return false;
     };
     if user.id != allowed_user_id {
-        tracing::warn!(
-            unauthorized_user_id = user.id,
-            username = ?user.username,
-            "Unauthorized message — silently dropping"
-        );
+        if should_log_unauthorized(user.id) {
+            tracing::warn!(
+                unauthorized_user_id = user.id,
+                username = ?user.username,
+                "Unauthorized message — silently dropping (further rejections from this id suppressed for 5 min)"
+            );
+        }
         return false;
     }
     true
+}
+
+/// Returns true if we haven't logged a rejection from `user_id` within
+/// [`UNAUTHORIZED_LOG_COOLDOWN`]. Map is bounded by real-world
+/// attacker count (one entry per probing user id); no eviction needed
+/// because entries stay small and the table self-prunes on restart.
+fn should_log_unauthorized(user_id: i64) -> bool {
+    static SEEN: OnceLock<Mutex<HashMap<i64, Instant>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut guard) = seen.lock() else {
+        // Poisoned → log anyway; poisoning is rare and silence here
+        // would hide real issues.
+        return true;
+    };
+    let now = Instant::now();
+    match guard.get(&user_id) {
+        Some(last) if now.duration_since(*last) < UNAUTHORIZED_LOG_COOLDOWN => false,
+        _ => {
+            guard.insert(user_id, now);
+            true
+        }
+    }
 }
 
 /// Per-chat rate limiter using GCRA (Generic Cell Rate Algorithm) — the

@@ -240,16 +240,8 @@ fn entry_points_at(entry: &Value, script_path: &Path) -> bool {
     inner.iter().any(|h| {
         h.get("command")
             .and_then(Value::as_str)
-            .is_some_and(|s| paths_eq(Path::new(s), script_path))
+            .is_some_and(|s| super::paths_eq(Path::new(s), script_path))
     })
-}
-
-/// Path equality that tolerates symlinks / case-fold filesystems.
-fn paths_eq(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(ca), Ok(cb)) => ca == cb,
-        _ => a == b,
-    }
 }
 
 /// True when an entry points at *any* tebis-owned script (i.e. any path
