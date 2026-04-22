@@ -168,7 +168,9 @@ async fn main() -> Result<()> {
         voice: Some(inspect::VoiceInfo {
             stt_model: Some("base.en".to_string()),
             stt_ready: true,
+            tts_backend: "say",
             tts_voice: Some("Samantha".to_string()),
+            tts_detail: None,
             tts_scope: "voice-only",
         }),
         // Demo passes through BRIDGE_ENV_FILE if you set it, so you can

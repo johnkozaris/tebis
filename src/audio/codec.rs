@@ -127,21 +127,31 @@ pub fn decode_opus_to_pcm16k(oga_bytes: &[u8]) -> Result<Vec<f32>, CodecError> {
     Ok(out)
 }
 
-/// Encode 16 kHz mono PCM `f32` samples to an OGG/Opus byte blob
-/// suitable for `POST /sendVoice`. 20 ms frames at `VoIP` complexity
-/// (matches Telegram's voice-note recording conventions).
+/// Encode mono PCM `f32` samples to an OGG/Opus byte blob suitable
+/// for `POST /sendVoice`. 20 ms frames at `VoIP` complexity.
 ///
-/// Telegram's voice-message bubble displays only for OGG/Opus at
-/// 16 kHz mono (cloud Bot API). Higher rates / other codecs land as a
-/// file attachment.
-pub fn encode_pcm_to_opus(pcm: &[f32]) -> Result<Bytes, CodecError> {
+/// `sample_rate` must be one of Opus's native rates: 8000, 12000,
+/// 16000, 24000, or 48000 Hz. Kokoro emits 24 kHz; the macOS `say`
+/// backend emits 16 kHz. Encoding at the source rate avoids our own
+/// (previously aliasing-prone) downsample step — Opus handles the
+/// internal conversion losslessly.
+///
+/// Telegram's voice-message bubble renders OGG/Opus at any native
+/// Opus rate; higher rates / other codecs land as a file attachment.
+pub fn encode_pcm_to_opus(pcm: &[f32], sample_rate: u32) -> Result<Bytes, CodecError> {
     use opus::{Application, Encoder as OpusEncoder};
 
     if pcm.is_empty() {
         return Err(CodecError::Encode("empty PCM input".to_string()));
     }
+    if !matches!(sample_rate, 8_000 | 12_000 | 16_000 | 24_000 | 48_000) {
+        return Err(CodecError::Encode(format!(
+            "Opus requires 8/12/16/24/48 kHz; got {sample_rate} Hz"
+        )));
+    }
+    let frame_samples: usize = (sample_rate as usize) * FRAME_MS / 1000;
 
-    let mut encoder = OpusEncoder::new(OUTPUT_RATE, Channels::Mono, Application::Voip)
+    let mut encoder = OpusEncoder::new(sample_rate, Channels::Mono, Application::Voip)
         .map_err(|e| CodecError::Encode(format!("encoder init: {e}")))?;
     // Per RFC 7845 §5.1, OpusHead preskip should be the encoder's
     // lookahead so decoders trim the warmup pop at the start of the
@@ -156,17 +166,17 @@ pub fn encode_pcm_to_opus(pcm: &[f32]) -> Result<Bytes, CodecError> {
 
     // Pad the input to a whole number of frames. Telegram tolerates the
     // ~20 ms of trailing silence, and Opus needs fixed-size input.
-    let total_samples = pcm.len().div_ceil(FRAME_SAMPLES) * FRAME_SAMPLES;
+    let total_samples = pcm.len().div_ceil(frame_samples) * frame_samples;
 
-    let mut packets: Vec<Vec<u8>> = Vec::with_capacity(total_samples / FRAME_SAMPLES);
+    let mut packets: Vec<Vec<u8>> = Vec::with_capacity(total_samples / frame_samples);
     let mut buf = vec![0u8; 4000]; // Opus packets typically < 500 B, but headroom is cheap.
-    let mut frame_buf = vec![0.0_f32; FRAME_SAMPLES];
+    let mut frame_buf = vec![0.0_f32; frame_samples];
     let mut offset = 0;
     while offset < total_samples {
-        let end = (offset + FRAME_SAMPLES).min(pcm.len());
+        let end = (offset + frame_samples).min(pcm.len());
         let have = end - offset;
         frame_buf[..have].copy_from_slice(&pcm[offset..end]);
-        if have < FRAME_SAMPLES {
+        if have < frame_samples {
             for sample in &mut frame_buf[have..] {
                 *sample = 0.0;
             }
@@ -175,7 +185,7 @@ pub fn encode_pcm_to_opus(pcm: &[f32]) -> Result<Bytes, CodecError> {
             .encode_float(&frame_buf, &mut buf)
             .map_err(|e| CodecError::Encode(format!("encode_float: {e}")))?;
         packets.push(buf[..n].to_vec());
-        offset += FRAME_SAMPLES;
+        offset += frame_samples;
     }
 
     // Mux into an OGG container. Serial number is arbitrary (Telegram
@@ -201,7 +211,7 @@ pub fn encode_pcm_to_opus(pcm: &[f32]) -> Result<Bytes, CodecError> {
         head.push(1); // version
         head.push(1); // channel count: mono
         head.extend_from_slice(&preskip.to_le_bytes());
-        head.extend_from_slice(&OUTPUT_RATE.to_le_bytes());
+        head.extend_from_slice(&sample_rate.to_le_bytes());
         head.extend_from_slice(&0i16.to_le_bytes());
         head.push(0);
         writer
@@ -217,10 +227,12 @@ pub fn encode_pcm_to_opus(pcm: &[f32]) -> Result<Bytes, CodecError> {
             .write_packet(tags, serial, ogg::PacketWriteEndInfo::EndPage, 0)
             .map_err(|e| CodecError::Encode(format!("ogg OpusTags: {e}")))?;
 
-        // Audio packets. OGG Opus granule positions are counted at 48 kHz
-        // regardless of encoded rate — multiply our frame size by 3 to
-        // convert 16 kHz samples to 48 kHz granules.
-        let granule_per_frame = (FRAME_SAMPLES as u64) * 48 / u64::from(OUTPUT_RATE);
+        // Audio packets. OGG Opus granule positions are counted at
+        // 48 kHz regardless of encoded rate. For 16 kHz input: × 3 =
+        // 960 per 20 ms frame. For 24 kHz: × 2 = 960. For 48 kHz: ×1
+        // = 960. All 20 ms frames resolve to 960 at 48 kHz. (The prior
+        // formula was off by a factor of 1000; fixed here.)
+        let granule_per_frame = (frame_samples as u64) * 48_000 / u64::from(sample_rate);
         let mut granule: u64 = 0;
         // Use Peekable to identify the final packet without `len() - 1`
         // arithmetic (which would panic on empty `packets`, even though
@@ -242,10 +254,11 @@ pub fn encode_pcm_to_opus(pcm: &[f32]) -> Result<Bytes, CodecError> {
     Ok(Bytes::from(out))
 }
 
-/// 20 ms frame at 16 kHz mono = 320 samples. Opus natively supports
-/// 2.5/5/10/20/40/60 ms; 20 ms is Telegram voice's de-facto frame size.
+/// 20 ms frame size. Opus natively supports 2.5/5/10/20/40/60 ms;
+/// 20 ms is Telegram voice's de-facto frame size. The actual sample
+/// count per frame depends on the encoder's sample rate and is
+/// computed inline in `encode_pcm_to_opus`.
 const FRAME_MS: usize = 20;
-const FRAME_SAMPLES: usize = (OUTPUT_RATE as usize) * FRAME_MS / 1000;
 
 #[cfg(test)]
 mod tests {
@@ -301,7 +314,7 @@ mod tests {
     #[test]
     fn encode_decode_round_trip_silence() {
         let silence = vec![0.0_f32; OUTPUT_RATE as usize]; // 1 s
-        let oga_bytes = encode_pcm_to_opus(&silence).expect("encode");
+        let oga_bytes = encode_pcm_to_opus(&silence, OUTPUT_RATE).expect("encode");
         assert!(!oga_bytes.is_empty());
         // OGG pages always start with "OggS".
         assert_eq!(&oga_bytes[..4], b"OggS");
@@ -319,7 +332,7 @@ mod tests {
 
     #[test]
     fn encode_empty_input_errors() {
-        let err = encode_pcm_to_opus(&[]).unwrap_err();
+        let err = encode_pcm_to_opus(&[], OUTPUT_RATE).unwrap_err();
         assert!(err.to_string().contains("empty"));
     }
 }

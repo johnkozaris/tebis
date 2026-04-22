@@ -58,6 +58,10 @@ pub struct Metrics {
     /// TTS failures — backend synthesis errors, sendVoice API errors,
     /// etc. Best-effort path, so these don't bubble back to the user.
     pub tts_failures: AtomicU64,
+    /// Wall-clock milliseconds for the last successful synthesis
+    /// (backend call only — sendVoice upload is network-bound and
+    /// not counted here). `0` means "never recorded yet".
+    pub last_tts_duration_ms: AtomicU64,
 }
 
 impl Metrics {
@@ -110,8 +114,10 @@ impl Metrics {
         self.stt_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_tts_success(&self) {
+    pub fn record_tts_success(&self, duration_ms: u64) {
         self.tts_success.fetch_add(1, Ordering::Relaxed);
+        self.last_tts_duration_ms
+            .store(duration_ms, Ordering::Relaxed);
     }
 
     pub fn record_tts_failure(&self) {

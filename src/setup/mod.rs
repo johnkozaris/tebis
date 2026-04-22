@@ -17,6 +17,11 @@ use dialoguer::{Confirm, Select};
 use crate::env_file;
 
 mod discover;
+// `pub` so `examples/kokoro-smoke.rs` can call `probe_espeak_ng` for its
+// prerequisite check. The interactive installer bits (`ensure_or_install`)
+// require a `ColorfulTheme` so are only useful from within the wizard
+// anyway, but exposing the whole module keeps the API simple.
+pub mod phonemizer;
 mod steps;
 mod ui;
 
@@ -25,7 +30,9 @@ mod ui;
 /// other key is preserved verbatim so users don't lose hand-added
 /// settings (`TELEGRAM_HOOKS_MODE`, `TELEGRAM_NOTIFY`, etc.) when they
 /// re-run `tebis setup`.
-/// Static keys the wizard always manages.
+/// Static keys the wizard always manages. TTS is now cross-platform —
+/// every host picks a backend (even if it's `none`), so the old
+/// macOS-only split is gone.
 const WIZARD_MANAGED_KEYS_ALWAYS: &[&str] = &[
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_ALLOWED_USER",
@@ -39,27 +46,22 @@ const WIZARD_MANAGED_KEYS_ALWAYS: &[&str] = &[
     // STT is cross-platform — wizard always owns these.
     "TELEGRAM_STT",
     "TELEGRAM_STT_MODEL",
+    // TTS: new backend-picker keys. Legacy `TELEGRAM_TTS` (boolean) is
+    // also included so the parser retires it cleanly on re-run.
+    "TELEGRAM_TTS",
+    "TELEGRAM_TTS_BACKEND",
+    "TELEGRAM_TTS_VOICE",
+    "TELEGRAM_TTS_MODEL",
+    "TELEGRAM_TTS_RESPOND_TO_ALL",
+    "TELEGRAM_TTS_REMOTE_URL",
+    "TELEGRAM_TTS_REMOTE_API_KEY",
+    "TELEGRAM_TTS_REMOTE_MODEL",
+    "TELEGRAM_TTS_REMOTE_TIMEOUT_SEC",
+    "TELEGRAM_TTS_REMOTE_ALLOW_HTTP",
 ];
 
-/// TTS keys the wizard manages ONLY on platforms where the TTS step
-/// actually runs (macOS only today). On Linux, `step_tts` returns
-/// `Ok(None)` → `build_env_file` writes nothing — so we must not
-/// treat these as managed, or we'd silently drop a user's hand-set
-/// `TELEGRAM_TTS=on` across wizard re-runs.
-#[cfg(target_os = "macos")]
-const WIZARD_MANAGED_KEYS_MACOS_TTS: &[&str] =
-    &["TELEGRAM_TTS", "TELEGRAM_TTS_VOICE", "TELEGRAM_TTS_RESPOND_TO_ALL"];
-
 fn wizard_managed_keys() -> impl Iterator<Item = &'static str> {
-    let always = WIZARD_MANAGED_KEYS_ALWAYS.iter().copied();
-    #[cfg(target_os = "macos")]
-    {
-        always.chain(WIZARD_MANAGED_KEYS_MACOS_TTS.iter().copied())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        always.chain(std::iter::empty())
-    }
+    WIZARD_MANAGED_KEYS_ALWAYS.iter().copied()
 }
 
 /// Autostart triple. Shared between the step that collects it and the
@@ -78,15 +80,63 @@ pub(super) struct VoiceChoice {
     pub(super) model: String,
 }
 
-/// Voice replies (TTS) wizard choice. macOS-only for now — the wizard
-/// skips the prompt entirely on other platforms, so this is always
-/// `None` on Linux (regardless of `enabled`'s value in an existing
-/// env file, which would be filtered out at load too).
-#[derive(Clone, Debug, Default)]
-pub(super) struct TtsChoice {
-    pub(super) enabled: bool,
-    pub(super) voice: String,
-    pub(super) respond_to_all: bool,
+/// Voice replies (TTS) wizard choice. Backend-tagged enum matching
+/// the runtime [`crate::audio::tts::BackendConfig`] shape, minus the
+/// secrecy wrapper on the API key (the wizard holds a plain `String`
+/// briefly during input capture and env-file write; the daemon re-
+/// wraps it in `SecretString` when loading the env file at startup).
+#[derive(Clone, Debug)]
+pub(super) enum TtsChoice {
+    /// Text-only replies (TTS disabled). Written as
+    /// `TELEGRAM_TTS_BACKEND=none` so a re-run sees the explicit
+    /// choice instead of bouncing back to the default.
+    Off,
+    /// macOS `say` shell-out.
+    Say {
+        voice: String,
+        respond_to_all: bool,
+    },
+    /// Local Kokoro ONNX via espeak-ng. Manifest key + voice.
+    KokoroLocal {
+        model: String,
+        voice: String,
+        respond_to_all: bool,
+    },
+    /// Remote OpenAI-compatible TTS endpoint. See
+    /// [`crate::audio::tts::BackendConfig::Remote`] for field semantics.
+    KokoroRemote {
+        url: String,
+        api_key: Option<String>,
+        model: String,
+        voice: String,
+        timeout_sec: u32,
+        allow_http: bool,
+        respond_to_all: bool,
+    },
+}
+
+impl TtsChoice {
+    /// Whether every text reply should also be a voice reply.
+    /// `false` for `Off`.
+    pub(super) const fn respond_to_all(&self) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Say { respond_to_all, .. }
+            | Self::KokoroLocal { respond_to_all, .. }
+            | Self::KokoroRemote { respond_to_all, .. } => *respond_to_all,
+        }
+    }
+
+    /// User-visible voice name, or empty for `Off`. Used by
+    /// [`ui::print_summary`] and the step-default pre-fill helper.
+    pub(super) fn voice_display(&self) -> &str {
+        match self {
+            Self::Off => "",
+            Self::Say { voice, .. }
+            | Self::KokoroLocal { voice, .. }
+            | Self::KokoroRemote { voice, .. } => voice,
+        }
+    }
 }
 
 /// What the caller should do after `run()` returns. Separates wizard
@@ -321,16 +371,62 @@ fn build_env_file(
     }
 
     if let Some(t) = tts {
-        out.push_str("\n# Voice replies (TTS). Currently macOS-only — shells out to the\n");
-        out.push_str("# built-in `say` binary with LEI16@16000 WAV output.\n");
-        if t.enabled {
-            let _ = writeln!(out, "TELEGRAM_TTS=on");
-            let _ = writeln!(out, "TELEGRAM_TTS_VOICE={}", t.voice);
-            if t.respond_to_all {
-                out.push_str("TELEGRAM_TTS_RESPOND_TO_ALL=on\n");
+        out.push_str(
+            "\n# Voice replies (TTS). See PLAN-TTS-V2.md for the backend story.\n",
+        );
+        match t {
+            TtsChoice::Off => {
+                let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=none");
             }
-        } else {
-            out.push_str("TELEGRAM_TTS=off\n");
+            TtsChoice::Say { voice, respond_to_all } => {
+                out.push_str("# macOS `say` shell-out.\n");
+                let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=say");
+                let _ = writeln!(out, "TELEGRAM_TTS_VOICE={voice}");
+                if *respond_to_all {
+                    out.push_str("TELEGRAM_TTS_RESPOND_TO_ALL=on\n");
+                }
+            }
+            TtsChoice::KokoroLocal { model, voice, respond_to_all } => {
+                out.push_str(
+                    "# Local Kokoro ONNX via espeak-ng phonemizer. Requires\n",
+                );
+                out.push_str("# the `kokoro` cargo feature at build time.\n");
+                let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=kokoro-local");
+                let _ = writeln!(out, "TELEGRAM_TTS_MODEL={model}");
+                let _ = writeln!(out, "TELEGRAM_TTS_VOICE={voice}");
+                if *respond_to_all {
+                    out.push_str("TELEGRAM_TTS_RESPOND_TO_ALL=on\n");
+                }
+            }
+            TtsChoice::KokoroRemote {
+                url,
+                api_key,
+                model,
+                voice,
+                timeout_sec,
+                allow_http,
+                respond_to_all,
+            } => {
+                out.push_str(
+                    "# Remote OpenAI-compatible TTS endpoint (e.g. Kokoro-FastAPI).\n",
+                );
+                let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=kokoro-remote");
+                let _ = writeln!(out, "TELEGRAM_TTS_REMOTE_URL={url}");
+                if let Some(k) = api_key
+                    && !k.is_empty()
+                {
+                    let _ = writeln!(out, "TELEGRAM_TTS_REMOTE_API_KEY={k}");
+                }
+                let _ = writeln!(out, "TELEGRAM_TTS_REMOTE_MODEL={model}");
+                let _ = writeln!(out, "TELEGRAM_TTS_VOICE={voice}");
+                let _ = writeln!(out, "TELEGRAM_TTS_REMOTE_TIMEOUT_SEC={timeout_sec}");
+                if *allow_http {
+                    out.push_str("TELEGRAM_TTS_REMOTE_ALLOW_HTTP=on\n");
+                }
+                if *respond_to_all {
+                    out.push_str("TELEGRAM_TTS_RESPOND_TO_ALL=on\n");
+                }
+            }
         }
     }
 

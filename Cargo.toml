@@ -49,19 +49,25 @@ tracing-subscriber = {version = "0.3.23", features = ["fmt", "env-filter"]}
 ogg = "0.9"
 opus = "0.3"
 
-# Cross-platform neural TTS is deferred pending Rust ecosystem maturity.
-# The three crates.io Kokoro crates as of 2026-04-22 all fail to build
-# in this workspace:
-#   - kokoroxide 0.1.5          pins ort ^1.16 which has been yanked
-#   - kokoro-tiny 0.1.0         Cursor import bug without `playback`
-#   - tts-rs 2026.2.3           type mismatch against current ort
-#   - any-tts 0.1.1             transitively pulls aws-lc-rs (banned
-#                               in our deny.toml) via reqwest →
-#                               rustls-platform-verifier, plus a
-#                               Zlib-licensed `foldhash`
-# TTS stays on macOS `say` shell-out; Linux returns
-# UnsupportedPlatform until one of these stabilizes or an espeak-ng
-# fallback is shipped.
+# Phase 4b-v2 TTS: three backends.
+# - `say` (macOS) — shell-out, no deps, already shipped.
+# - `kokoro-remote` (cross-platform) — HTTP POST to an
+#   OpenAI-compatible TTS endpoint (Kokoro-FastAPI etc.). Uses the
+#   existing hyper + hyper-rustls stack, so zero new crates. Always
+#   compiled in.
+# - `kokoro-local` (cross-platform, optional) — ort + ndarray +
+#   shelling out to espeak-ng for phonemization. Opt-in via the
+#   `kokoro` cargo feature (adds ~20 MB of ONNX Runtime static libs).
+#   Feature is declared below but the deps are not yet wired in; the
+#   runtime surface returns `TtsError::Init("not yet implemented")`
+#   until `src/audio/tts/kokoro/` lands.
+#
+# Why we stopped trying to wrap third-party crates: kokoroxide,
+# kokoro-tiny, tts-rs, any-tts, and kitten_tts_rs each had a blocking
+# issue (yanked ort pin, non-feature-gated server deps, banned
+# transitive crates, etc.). The Rust Kokoro ecosystem isn't ready;
+# a direct ort integration in ~500 LoC is cleaner than vendoring a
+# partial fork. See PLAN-TTS-V2.md for the full reasoning.
 
 # Local STT — whisper.cpp Rust bindings, linked in-process. Inference
 # runs inside the tebis daemon, no subprocess / server / network hop.
@@ -76,6 +82,82 @@ whisper-rs = {version = "0.16", default-features = false, features = ["metal"]}
 
 [target.'cfg(target_os = "linux")'.dependencies]
 whisper-rs = {version = "0.16", default-features = false}
+
+[features]
+default = []
+# Enables the local Kokoro TTS backend (`TELEGRAM_TTS_BACKEND=kokoro-local`).
+# Pulls `ort` (ONNX Runtime) + `ndarray` + `ndarray-npy` (voice .bin
+# loader) + `num2words` + `regex` (text normalization for numbers /
+# titles / currency so Kokoro doesn't pronounce "2024" as "two zero
+# two four"). Users who only want remote TTS or macOS `say` should
+# leave this off.
+kokoro = [
+    "dep:ndarray",
+    "dep:num2words",
+    "dep:ort",
+    "dep:regex",
+]
+
+# Local Kokoro TTS deps. Declared optional so the default build doesn't
+# link ONNX Runtime (adds ~20 MB of static libs). Only pulled in when
+# the `kokoro` feature is on.
+#
+# - `ort` 2.0.0-rc.x — maintained Rust bindings to Microsoft's ONNX
+#   Runtime. 2.0 line dropped the legacy `onnxruntime-sys` shim in favor
+#   of `ort-sys`, which is what current Kokoro Rust integrations use
+#   (tts-rs, kokoro-tts, kitten_tts_rs as of Q1 2026). We use
+#   `download-binaries` so cargo fetches the right onnxruntime static
+#   lib for the host — same story whisper-rs uses for its bindings.
+# - `ndarray` is the array primitive `ort` hands back; we own it too
+#   for shaping input_ids / style / speed.
+# - The per-voice `<name>.bin` files from HuggingFace are raw LE f32
+#   arrays of shape `(N, 1, 256)` — no `.npy` header, no container.
+#   `voices.rs` parses them by hand, so we don't pull in `ndarray-npy`.
+[dependencies.ndarray]
+optional = true
+version = "0.16"
+default-features = false
+features = ["std"]
+
+[dependencies.ort]
+optional = true
+# Pinned to rc.10 because rc.11 + rc.12 have compile-time breakage
+# against `ort-sys` as of 2026-04: rc.11 pulls a broken ureq TLS
+# config via `download-binaries`, rc.12 references a VitisAI sys
+# field that its generated bindings don't expose. rc.10 is what
+# tts-rs 2026.2.3 uses in production and is known-good on Rust 1.95.
+version = "=2.0.0-rc.10"
+default-features = false
+# `load-dynamic` — load `libonnxruntime` at runtime from the system.
+# Mac: `brew install onnxruntime`. Linux: `apt install libonnxruntime-dev`.
+# Same pattern we use for espeak-ng (shell-out, not linked) and jq/nc
+# in `tebis hooks install` — we PATH-probe at startup and fail-open to
+# text replies when the shared library is missing.
+#
+# We explicitly avoid `download-binaries`: as of ort 2.0.0-rc.12 it
+# pulls `ureq` with a broken `rustls` TLS config that fails to build
+# against our workspace. `load-dynamic` also cuts ~20 MB of prebuilt
+# ONNX Runtime out of our release artifact.
+features = ["std", "load-dynamic"]
+
+# English-language number / ordinal / currency → words conversion for
+# the Kokoro text-normalization pass. Covers the pile of boundary rules
+# (hundred-thousand-million, hyphenation for 21-99, year-reading like
+# 1900 vs 2024) we'd otherwise reinvent. MIT-OR-Apache-2.0.
+[dependencies.num2words]
+optional = true
+version = "1"
+default-features = false
+
+# Pattern matching for titles (Dr., Mr., Mrs.), currency ($3.50), and
+# number extraction in the Kokoro normalizer. Already transitive via
+# other deps; promoted to a direct dep so upgrades aren't silently
+# coupled to unrelated crates' pins.
+[dependencies.regex]
+optional = true
+version = "1"
+default-features = false
+features = ["std", "unicode-perl"]
 
 [profile.release]
 codegen-units = 1

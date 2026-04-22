@@ -32,6 +32,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use self::stt::{Stt as _, SttConfig, SttError, Transcription};
+#[cfg(any(target_os = "macos", feature = "kokoro"))]
+use self::tts::Tts as _;
 use self::tts::{TtsConfig, TtsError};
 
 /// Composite config consumed by [`AudioSubsystem::new`]. Built from env
@@ -83,9 +85,7 @@ pub struct AudioSubsystem {
     /// `None` when STT is disabled. Local whisper.cpp is the only
     /// backend tebis ships — no cloud / LAN escape hatches.
     stt: Option<stt::local::LocalStt>,
-    /// `None` when TTS is disabled. Currently macOS-only (`say`);
-    /// `tts::Backend` is variantless on non-macOS targets so `Option<_>`
-    /// is statically always `None` there.
+    /// `None` when TTS is disabled or failed to initialize.
     tts: Option<tts::Backend>,
     stt_model_name: Option<String>,
     /// Snapshot of STT runtime caps. `None` when STT is off. The bridge
@@ -98,6 +98,14 @@ pub struct AudioSubsystem {
     /// Whether TTS applies to every outbound reply or only replies to
     /// inbound voice messages.
     tts_respond_to_all: bool,
+    /// Backend kind for display — `"none"`, `"say"`, `"kokoro-local"`,
+    /// or `"kokoro-remote"`. Static-lifetime since the variants are
+    /// fixed at compile time.
+    tts_backend_kind: &'static str,
+    /// Backend-specific display detail. For `kokoro-remote` this is the
+    /// redacted host (`"kokoro.example.com"`); for `kokoro-local` it's
+    /// the manifest model key; `None` for `say` / `none`.
+    tts_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -140,31 +148,40 @@ impl AudioSubsystem {
         };
 
         // TTS init is decoupled from STT: a TTS failure must NOT take
-        // STT down with it. Linux currently returns `UnsupportedPlatform`
-        // for TTS — downgrading to `tts = None` keeps STT fully usable
-        // for those users instead of killing both branches.
-        let (tts, tts_voice, tts_respond_to_all) = match &cfg.tts {
-            None => (None, None, false),
-            Some(tcfg) => match build_tts(tcfg).await {
-                Ok(backend) => (
-                    Some(backend),
-                    Some(tcfg.voice.clone()),
-                    tcfg.respond_to_all,
-                ),
+        // STT down with it. A backend that doesn't fit the host platform
+        // (e.g. `say` on Linux, or `kokoro-local` in a build without the
+        // `kokoro` feature) downgrades to `tts = None` so STT stays fully
+        // usable for those users instead of killing both branches.
+        let (tts, tts_voice, tts_respond_to_all, tts_backend_kind, tts_detail) = match &cfg.tts {
+            None => (None, None, false, "none", None),
+            Some(tcfg) => match build_tts(tcfg, shutdown.clone()).await {
+                Ok(backend) => {
+                    let kind = tcfg.backend.kind_str();
+                    let detail = display_detail_for(&tcfg.backend);
+                    (
+                        Some(backend),
+                        Some(tcfg.backend.voice().to_string()),
+                        tcfg.respond_to_all,
+                        kind,
+                        detail,
+                    )
+                }
                 Err(TtsError::UnsupportedPlatform) => {
                     tracing::warn!(
-                        "TTS requested but not available on this platform; \
-                         continuing with STT-only. Set TELEGRAM_TTS=off to silence this."
+                        backend = tcfg.backend.kind_str(),
+                        "TTS backend not available on this platform; \
+                         continuing with STT-only. Set TELEGRAM_TTS_BACKEND=none to silence this."
                     );
-                    (None, None, false)
+                    (None, None, false, "none", None)
                 }
                 Err(e) => {
                     tracing::warn!(
+                        backend = tcfg.backend.kind_str(),
                         err = %e,
                         "TTS failed to initialize; continuing with STT-only. \
-                         Fix the cause above or set TELEGRAM_TTS=off."
+                         Fix the cause above or set TELEGRAM_TTS_BACKEND=none."
                     );
-                    (None, None, false)
+                    (None, None, false, "none", None)
                 }
             },
         };
@@ -177,6 +194,8 @@ impl AudioSubsystem {
             stt_language,
             tts_voice,
             tts_respond_to_all,
+            tts_backend_kind,
+            tts_detail,
         }))
     }
 
@@ -220,20 +239,60 @@ impl AudioSubsystem {
         self.tts.is_some() && self.tts_respond_to_all
     }
 
+    /// Backend kind string for the dashboard. `"none"` when TTS is off
+    /// or init failed; otherwise `"say"` / `"kokoro-local"` /
+    /// `"kokoro-remote"`.
+    pub const fn tts_backend_kind(&self) -> &'static str {
+        if self.tts.is_none() {
+            "none"
+        } else {
+            self.tts_backend_kind
+        }
+    }
+
+    /// Backend-specific display detail for the dashboard. For
+    /// `kokoro-remote` this is the redacted host; for `kokoro-local`
+    /// it's the model key. `None` when `say` / `none`.
+    pub fn tts_detail(&self) -> Option<&str> {
+        self.tts.as_ref()?;
+        self.tts_detail.as_deref()
+    }
+
     /// Synthesize `text` to an OGG/Opus byte blob ready for `sendVoice`.
     /// Returns the encoded bytes **and** the accurate audio duration in
-    /// seconds (computed from sample count, not guessed from bitrate).
+    /// seconds.
+    ///
+    /// Backend dispatch:
+    /// - `Say` (macOS): PCM from `say` → encode to OGG/Opus via codec.
+    /// - `Remote`: the server returns OGG/Opus already, pass through
+    ///   verbatim; duration is extracted by decoding to PCM and counting
+    ///   samples (cheap, reuses the inbound STT decode path).
+    ///
     /// Returns [`AudioError::NotEnabled`] when TTS is off.
     pub async fn synthesize(&self, text: &str) -> Result<(Bytes, u32), AudioError> {
         let backend = self
             .tts
             .as_ref()
             .ok_or(AudioError::NotEnabled { feature: "tts" })?;
-        let voice = self.tts_voice.as_deref().unwrap_or("");
-        let synthesis = backend.synthesize(text, voice).await?;
-        let duration_sec = synthesis.audio_duration_sec();
-        let opus = codec::encode_pcm_to_opus(&synthesis.pcm)?;
-        Ok((opus, duration_sec))
+        match backend {
+            #[cfg(target_os = "macos")]
+            tts::Backend::Say(b) => {
+                let voice = self.tts_voice.as_deref().unwrap_or("");
+                let synthesis = b.synthesize(text, voice).await?;
+                let duration_sec = synthesis.audio_duration_sec();
+                let opus = codec::encode_pcm_to_opus(&synthesis.pcm, synthesis.sample_rate)?;
+                Ok((opus, duration_sec))
+            }
+            tts::Backend::Remote(b) => Ok(b.synthesize_to_opus(text).await?),
+            #[cfg(feature = "kokoro")]
+            tts::Backend::Kokoro(b) => {
+                let voice = self.tts_voice.as_deref().unwrap_or("");
+                let synthesis = b.synthesize(text, voice).await?;
+                let duration_sec = synthesis.audio_duration_sec();
+                let opus = codec::encode_pcm_to_opus(&synthesis.pcm, synthesis.sample_rate)?;
+                Ok((opus, duration_sec))
+            }
+        }
     }
 
     /// Whether the caller should voice-reply to a given inbound payload.
@@ -245,17 +304,69 @@ impl AudioSubsystem {
     }
 }
 
-/// Construct the concrete TTS backend. macOS → `say` shell-out.
-/// Linux and other platforms return `TtsError::UnsupportedPlatform`.
-async fn build_tts(_cfg: &TtsConfig) -> Result<tts::Backend, TtsError> {
-    #[cfg(target_os = "macos")]
-    {
-        tts::say::SayTts::probe().await?;
-        Ok(tts::Backend::Say(tts::say::SayTts::new()))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err(TtsError::UnsupportedPlatform)
+/// Construct the concrete TTS backend from the configured variant.
+///
+/// - `Say` on macOS → probe `say` + wrap in `SayTts`.
+/// - `Say` on non-macOS → `UnsupportedPlatform` (validated at config
+///   load, but the check here makes the type-system branching
+///   exhaustive).
+/// - `KokoroLocal` → `Init` error until the feature-gated backend lands
+///   (task #46). The subsystem handles the error by falling back to
+///   text-only replies (see [`AudioSubsystem::new`]).
+/// - `Remote` → construct the HTTP client; no network I/O here.
+async fn build_tts(
+    cfg: &TtsConfig,
+    shutdown: CancellationToken,
+) -> Result<tts::Backend, TtsError> {
+    match &cfg.backend {
+        tts::BackendConfig::Say { .. } => {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = shutdown;
+                tts::say::SayTts::probe().await?;
+                Ok(tts::Backend::Say(tts::say::SayTts::new()))
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = shutdown;
+                Err(TtsError::UnsupportedPlatform)
+            }
+        }
+        tts::BackendConfig::KokoroLocal { model, voice } => {
+            #[cfg(feature = "kokoro")]
+            {
+                // Thread the parent shutdown so Ctrl-C during the 346 MB
+                // Kokoro model download cancels promptly instead of
+                // running to completion then exiting.
+                build_kokoro_local(model, voice, shutdown).await
+            }
+            #[cfg(not(feature = "kokoro"))]
+            {
+                let _ = (model, voice, shutdown);
+                Err(TtsError::Init(
+                    "backend=kokoro-local needs the `kokoro` cargo feature \
+                     (rebuild with `cargo build --features kokoro`). \
+                     Alternatively use kokoro-remote or say."
+                        .to_string(),
+                ))
+            }
+        }
+        tts::BackendConfig::Remote {
+            url,
+            api_key,
+            model,
+            voice,
+            timeout_sec,
+        } => {
+            let rt = tts::remote::RemoteTts::new(
+                url.clone(),
+                api_key.clone(),
+                model.clone(),
+                voice.clone(),
+                *timeout_sec,
+            )?;
+            Ok(tts::Backend::Remote(Box::new(rt)))
+        }
     }
 }
 
@@ -334,6 +445,151 @@ async fn build_local_stt(
     Ok((backend, cfg.model.clone()))
 }
 
+/// Build the local Kokoro backend: probe espeak-ng, download model +
+/// voice from the manifest (SHA-verified), load the ONNX session.
+///
+/// Only exists with the `kokoro` cargo feature. Error on missing
+/// espeak-ng is surfaced early (at `AudioSubsystem::new`) instead of
+/// at first-synth so users see "install espeak-ng" in the startup log
+/// rather than a cryptic process-spawn failure minutes later.
+#[cfg(feature = "kokoro")]
+async fn build_kokoro_local(
+    model_key: &str,
+    voice: &str,
+    shutdown: CancellationToken,
+) -> Result<tts::Backend, TtsError> {
+    // Early espeak-ng probe. espeak-ng is a runtime requirement for
+    // every synth call; no point loading a 346 MB ONNX if it'll never
+    // produce a single sample.
+    if crate::setup::phonemizer::probe_espeak_ng().is_none() {
+        return Err(TtsError::Init(
+            "espeak-ng not found on PATH — local Kokoro requires it. \
+             macOS: `brew install espeak-ng`; Linux: `apt/dnf/pacman \
+             install espeak-ng`. Alternatively set \
+             TELEGRAM_TTS_BACKEND=kokoro-remote or none."
+                .to_string(),
+        ));
+    }
+
+    // Validate + look up manifest entry.
+    let manifest = manifest::get();
+    manifest
+        .validate_tts_usable(model_key)
+        .map_err(|e| TtsError::Init(format!("TTS manifest: {e}")))?;
+    let model_entry = manifest
+        .tts_model(model_key)
+        .map_err(|e| TtsError::Init(format!("TTS manifest: {e}")))?;
+    let voice_asset = manifest
+        .validate_voice(model_key, voice)
+        .map_err(|e| TtsError::Init(format!("TTS voice: {e}")))?;
+
+    // Resolve cache paths. Voice files go into `models/` alongside the
+    // ONNX — same dir simplifies `KokoroTts::load`, which just
+    // concatenates `<voices_dir>/<voice_name>.bin` at synth time.
+    let models_dir = cache::models_dir()
+        .map_err(|e| TtsError::Init(format!("models dir: {e}")))?;
+    cache::reap_stale_tmps(&models_dir)
+        .map_err(|e| TtsError::Init(format!("reap stale tmps: {e}")))?;
+    let model_file_name = filename_from_url(&model_entry.onnx_url);
+    let model_path = cache::model_path(&model_file_name)
+        .map_err(|e| TtsError::Init(format!("model path: {e}")))?;
+    let voice_file_name = filename_from_url(&voice_asset.url);
+    let voice_path = cache::model_path(&voice_file_name)
+        .map_err(|e| TtsError::Init(format!("voice path: {e}")))?;
+
+    let client = fetch::FetchClient::new();
+
+    // Download the ONNX model if missing. Large (~346 MB) — log every
+    // 32 MiB so the operator sees progress.
+    if !model_path.exists() {
+        tracing::info!(
+            model = %model_key,
+            size_mb = model_entry.onnx_size_bytes / (1024 * 1024),
+            "Downloading Kokoro model (~{} MB, one-time)…",
+            model_entry.onnx_size_bytes / (1024 * 1024),
+        );
+        let tmp = cache::tmp_path_for(&model_path);
+        let mut last_logged = 0u64;
+        client
+            .download_verified(
+                &model_entry.onnx_url,
+                &model_entry.onnx_sha256,
+                &tmp,
+                &model_path,
+                |bytes, total| {
+                    const LOG_EVERY: u64 = 32 * 1024 * 1024;
+                    if bytes.saturating_sub(last_logged) >= LOG_EVERY {
+                        last_logged = bytes;
+                        if let Some(t) = total {
+                            tracing::info!(
+                                "  …{} / {} MB",
+                                bytes / (1024 * 1024),
+                                t / (1024 * 1024),
+                            );
+                        }
+                    }
+                },
+                shutdown.clone(),
+            )
+            .await
+            .map_err(|e| TtsError::Init(format!("download Kokoro model: {e}")))?;
+        tracing::info!("Kokoro model downloaded + SHA-verified");
+    }
+
+    // Download the voice if missing. Small (~510 KB) — single-log.
+    if !voice_path.exists() {
+        tracing::info!(voice = %voice, "Downloading Kokoro voice (~510 KB)…");
+        let tmp = cache::tmp_path_for(&voice_path);
+        client
+            .download_verified(
+                &voice_asset.url,
+                &voice_asset.sha256,
+                &tmp,
+                &voice_path,
+                |_, _| {},
+                shutdown,
+            )
+            .await
+            .map_err(|e| TtsError::Init(format!("download voice `{voice}`: {e}")))?;
+    }
+
+    // Load ONNX — blocking, ~500 ms cold start. Spawn_blocking to
+    // avoid stalling the startup event loop for the other init paths.
+    let model_path_c = model_path.clone();
+    let voices_dir_c = models_dir.clone();
+    let backend = tokio::task::spawn_blocking(move || {
+        tts::kokoro::KokoroTts::load(&model_path_c, voices_dir_c)
+    })
+    .await
+    .map_err(|e| TtsError::Init(format!("Kokoro load join: {e}")))??;
+
+    Ok(tts::Backend::Kokoro(Box::new(backend)))
+}
+
+/// Return a dashboard-ready detail string for the configured TTS
+/// backend. For `kokoro-remote` we extract only the host portion of
+/// the URL — the path and query could theoretically contain secrets
+/// (someone embedding an auth token in the path on a `*.hf.space`
+/// endpoint), so we clip before any `/` after the scheme.
+fn display_detail_for(cfg: &tts::BackendConfig) -> Option<String> {
+    match cfg {
+        tts::BackendConfig::Say { .. } => None,
+        tts::BackendConfig::KokoroLocal { model, .. } => Some(model.clone()),
+        tts::BackendConfig::Remote { url, .. } => Some(redacted_host_from_url(url)),
+    }
+}
+
+/// Extract `host[:port]` from `https://host[:port]/path?query`. Falls
+/// back to the input string if no `://` is present — defensive rather
+/// than an error, since config parsing already enforces the scheme.
+fn redacted_host_from_url(url: &str) -> String {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host_end = after_scheme
+        .find('/')
+        .unwrap_or(after_scheme.len());
+    after_scheme[..host_end].to_string()
+}
+
 /// Extract the filename from an HF download URL (the basename of the
 /// path). HF uses `https://.../resolve/main/<filename>` with no query
 /// string, so `rsplit('/').next()` is sufficient.
@@ -379,5 +635,28 @@ mod tests {
     fn audio_config_any_enabled_tracks_stt() {
         let off = AudioConfig { stt: None, tts: None };
         assert!(!off.any_enabled());
+    }
+
+    #[test]
+    fn redacted_host_strips_path_and_query() {
+        assert_eq!(
+            redacted_host_from_url("https://kokoro.example.com/v1/audio/speech?q=1"),
+            "kokoro.example.com"
+        );
+        assert_eq!(
+            redacted_host_from_url("https://host:8443/path"),
+            "host:8443"
+        );
+        assert_eq!(
+            redacted_host_from_url("http://internal-lan:8880"),
+            "internal-lan:8880"
+        );
+    }
+
+    #[test]
+    fn redacted_host_handles_missing_scheme() {
+        // Defensive — config validation enforces https/http, but a
+        // user hand-editing the env file could produce anything.
+        assert_eq!(redacted_host_from_url("bare-host"), "bare-host");
     }
 }

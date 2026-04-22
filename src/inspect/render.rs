@@ -349,14 +349,34 @@ fn build_voice_rows(
     if let Some(voice_name) = &v.tts_voice {
         let tts_success = metrics.tts_success.load(Ordering::Relaxed);
         let tts_failures = metrics.tts_failures.load(Ordering::Relaxed);
+        let last_ms = metrics.last_tts_duration_ms.load(Ordering::Relaxed);
         let activity = if tts_success + tts_failures == 0 {
             "<span class=\"muted\">no replies synthesized yet</span>".to_string()
-        } else {
+        } else if last_ms == 0 {
             format!("<code>{tts_success}</code> sent · <code>{tts_failures}</code> failed")
+        } else {
+            format!(
+                "<code>{tts_success}</code> sent · <code>{tts_failures}</code> failed · last <code>{last_ms} ms</code>",
+            )
+        };
+        // Backend-specific display line. Detail is the redacted host
+        // for remote / model key for local; empty for say.
+        let backend_display = match v.tts_backend {
+            "say" => "macOS <code>say</code>".to_string(),
+            "kokoro-local" => v.tts_detail.as_deref().map_or_else(
+                || "Kokoro local".to_string(),
+                |d| format!("Kokoro local <span class=\"muted\">({})</span>", sanitize::escape_html(d)),
+            ),
+            "kokoro-remote" => v.tts_detail.as_deref().map_or_else(
+                || "Kokoro remote".to_string(),
+                |d| format!("Kokoro remote <span class=\"muted\">({})</span>", sanitize::escape_html(d)),
+            ),
+            _ => sanitize::escape_html(v.tts_backend),
         };
         let _ = write!(
             out,
-            "<dt>Voice TTS voice</dt><dd><code>{voice}</code> <span class=\"muted\">({scope})</span></dd>\
+            "<dt>Voice TTS backend</dt><dd>{backend_display}</dd>\
+             <dt>Voice TTS voice</dt><dd><code>{voice}</code> <span class=\"muted\">({scope})</span></dd>\
              <dt>Voice TTS activity</dt><dd>{activity}</dd>",
             voice = sanitize::escape_html(voice_name),
             scope = sanitize::escape_html(v.tts_scope),

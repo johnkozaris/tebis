@@ -393,6 +393,7 @@ async fn synthesize_and_send_voice_detached(
     if plain.trim().is_empty() {
         return;
     }
+    let synth_start = std::time::Instant::now();
     let (voice_bytes, duration_sec) = match audio.synthesize(&plain).await {
         Ok(pair) => pair,
         Err(e) => {
@@ -401,12 +402,13 @@ async fn synthesize_and_send_voice_detached(
             return;
         }
     };
+    let synth_ms = u64::try_from(synth_start.elapsed().as_millis()).unwrap_or(u64::MAX);
     if let Err(e) = tg.send_voice(chat_id, voice_bytes, Some(duration_sec)).await {
         metrics.record_tts_failure();
         tracing::warn!(err = %e, "sendVoice failed; text reply already sent");
         return;
     }
-    metrics.record_tts_success();
+    metrics.record_tts_success(synth_ms);
 }
 
 /// Minimal HTML-strip for TTS input. The bodies we send go through

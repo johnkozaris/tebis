@@ -7,7 +7,7 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use tebis::audio::{AudioConfig, AudioSubsystem, tts::TtsConfig};
+use tebis::audio::{AudioConfig, AudioSubsystem, tts::{BackendConfig, TtsConfig}};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -18,7 +18,9 @@ async fn main() -> Result<()> {
     let cfg = AudioConfig {
         stt: None,
         tts: Some(TtsConfig {
-            voice: "Samantha".to_string(),
+            backend: BackendConfig::Say {
+                voice: "Samantha".to_string(),
+            },
             respond_to_all: false,
         }),
     };

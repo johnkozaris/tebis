@@ -336,7 +336,9 @@ async fn run_bridge() -> Result<()> {
                 stt_ready: audio
                     .as_ref()
                     .is_some_and(|a| a.stt_model_name().is_some()),
+                tts_backend: audio.as_ref().map_or("none", |a| a.tts_backend_kind()),
                 tts_voice: audio.as_ref().and_then(|a| a.tts_voice().map(String::from)),
+                tts_detail: audio.as_ref().and_then(|a| a.tts_detail().map(String::from)),
                 tts_scope: audio
                     .as_ref()
                     .map_or("", |a| if a.tts_respond_to_all() { "all" } else { "voice-only" }),

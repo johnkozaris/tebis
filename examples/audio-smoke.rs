@@ -18,7 +18,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use tebis::audio::{AudioConfig, AudioSubsystem, stt::SttConfig};
 #[cfg(target_os = "macos")]
-use tebis::audio::tts::TtsConfig;
+use tebis::audio::tts::{BackendConfig, TtsConfig};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -39,7 +39,9 @@ async fn main() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     let tts_cfg = Some(TtsConfig {
-        voice: "Samantha".to_string(),
+        backend: BackendConfig::Say {
+            voice: "Samantha".to_string(),
+        },
         respond_to_all: false,
     });
     #[cfg(not(target_os = "macos"))]

@@ -118,6 +118,9 @@ impl Tts for SayTts {
         Ok(Synthesis {
             pcm,
             duration_ms: u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX),
+            // We explicitly ask `say` for `LEI16@16000`, so output rate
+            // is always 16 kHz here.
+            sample_rate: 16_000,
         })
     }
 }

@@ -51,8 +51,16 @@ pub struct VoiceInfo {
     pub stt_model: Option<String>,
     /// Whether STT initialized successfully.
     pub stt_ready: bool,
-    /// `Some` when `TELEGRAM_TTS=on`. Holds the resolved voice name.
+    /// Backend kind: `"none"`, `"say"`, `"kokoro-local"`, `"kokoro-remote"`.
+    /// `"none"` covers both "not configured" and "failed to init".
+    pub tts_backend: &'static str,
+    /// `Some` when TTS initialized — the resolved voice name.
     pub tts_voice: Option<String>,
+    /// Backend-specific detail — the redacted host for `kokoro-remote`,
+    /// the manifest model key for `kokoro-local`, empty for `say` /
+    /// `none`. The dashboard renderer composes these into a single
+    /// display line so front-end layout stays simple.
+    pub tts_detail: Option<String>,
     /// "all" if `TELEGRAM_TTS_RESPOND_TO_ALL=on`, else "voice-only".
     /// Only meaningful when `tts_voice.is_some()`.
     pub tts_scope: &'static str,

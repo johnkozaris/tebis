@@ -182,15 +182,31 @@ pub(super) fn print_summary(
     let tts_row = tts.map_or_else(
         || style("(not configured)").dim().to_string(),
         |t| {
-            if t.enabled {
-                let scope = if t.respond_to_all {
-                    "all replies"
-                } else {
-                    "voice replies only"
-                };
-                format!("macOS `say` · voice: {} · {}", style(&t.voice).bold(), scope)
+            use super::TtsChoice;
+            let scope = if t.respond_to_all() {
+                "all replies"
             } else {
-                style("(disabled)").dim().to_string()
+                "voice replies only"
+            };
+            match t {
+                TtsChoice::Off => style("(disabled)").dim().to_string(),
+                TtsChoice::Say { voice, .. } => {
+                    format!("macOS `say` · voice: {} · {scope}", style(voice).bold())
+                }
+                TtsChoice::KokoroLocal { model, voice, .. } => {
+                    format!(
+                        "Kokoro local · model: {} · voice: {} · {scope}",
+                        style(model).bold(),
+                        style(voice).bold(),
+                    )
+                }
+                TtsChoice::KokoroRemote { voice, model, .. } => {
+                    format!(
+                        "Kokoro remote · model: {} · voice: {} · {scope}",
+                        style(model).bold(),
+                        style(voice).bold(),
+                    )
+                }
             }
         },
     );

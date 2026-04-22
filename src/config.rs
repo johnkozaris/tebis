@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use crate::agent_hooks::HooksMode;
 use crate::audio::AudioConfig;
 use crate::audio::stt::SttConfig;
-use crate::audio::tts::TtsConfig;
+use crate::audio::tts::{BackendConfig as TtsBackendConfig, TtsConfig};
 use crate::bridge::autoreply::AutoreplyConfig;
 use crate::bridge::session::AutostartConfig;
 use crate::env_file;
@@ -138,22 +138,127 @@ fn load_audio_config() -> Result<AudioConfig> {
     Ok(AudioConfig { stt, tts })
 }
 
+/// Resolve the TTS configuration from `TELEGRAM_TTS_*` env vars.
+///
+/// Selection order:
+/// 1. `TELEGRAM_TTS_BACKEND=none` (or `off`) → `None`, no TTS.
+/// 2. `TELEGRAM_TTS_BACKEND=<say|kokoro-local|kokoro-remote>` → load
+///    that backend's specific config.
+/// 3. `TELEGRAM_TTS_BACKEND` unset but legacy `TELEGRAM_TTS=on` → fall
+///    back to the platform's historical default (`say` on macOS;
+///    hard error on other platforms so existing macOS env files keep
+///    working across upgrades without silently enabling something).
+/// 4. Neither set → `None`.
 fn load_tts_config() -> Result<Option<TtsConfig>> {
-    if !parse_toggle_env("TELEGRAM_TTS", false)? {
+    let backend_raw = env::var("TELEGRAM_TTS_BACKEND").ok();
+    let legacy_on = parse_toggle_env("TELEGRAM_TTS", false)?;
+
+    let backend_kind = match backend_raw.as_deref().map(str::trim) {
+        Some("") | None => {
+            if !legacy_on {
+                return Ok(None);
+            }
+            // Legacy fallback: TELEGRAM_TTS=on with no explicit backend
+            // means "the Phase-4a default" — `say` on macOS, refuse
+            // elsewhere so operators notice the new env-var contract.
+            #[cfg(target_os = "macos")]
+            {
+                "say".to_string()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                bail!(
+                    "TELEGRAM_TTS=on with no TELEGRAM_TTS_BACKEND — \
+                     set TELEGRAM_TTS_BACKEND to one of \
+                     say (macOS only), kokoro-local, kokoro-remote, or none"
+                );
+            }
+        }
+        Some(s) => s.to_ascii_lowercase(),
+    };
+
+    // Short-circuit disabled.
+    if matches!(backend_kind.as_str(), "none" | "off" | "false" | "0") {
         return Ok(None);
     }
 
-    // Default voice depends on platform; `say` understands
-    // `"Samantha"` (built-in) and premium voices like `"Ava (Premium)"`
-    // if the user has downloaded them via System Settings → Spoken
-    // Content. We pick Samantha as the lowest-common-denominator
-    // default so first-run works without extra setup.
-    let voice = env::var("TELEGRAM_TTS_VOICE").unwrap_or_else(|_| "Samantha".to_string());
-
     let respond_to_all = parse_toggle_env("TELEGRAM_TTS_RESPOND_TO_ALL", false)?;
 
+    let backend = match backend_kind.as_str() {
+        "say" => {
+            #[cfg(not(target_os = "macos"))]
+            {
+                bail!(
+                    "TELEGRAM_TTS_BACKEND=say is macOS-only — \
+                     use kokoro-local or kokoro-remote on this platform"
+                );
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let voice =
+                    env::var("TELEGRAM_TTS_VOICE").unwrap_or_else(|_| "Samantha".to_string());
+                TtsBackendConfig::Say { voice }
+            }
+        }
+        "kokoro-local" | "kokoro_local" | "local" => {
+            let voice =
+                env::var("TELEGRAM_TTS_VOICE").unwrap_or_else(|_| "af_sarah".to_string());
+            let model = env::var("TELEGRAM_TTS_MODEL").ok().unwrap_or_else(|| {
+                crate::audio::manifest::get()
+                    .default_tts_model()
+                    .unwrap_or("kokoro-v1.0")
+                    .to_string()
+            });
+            TtsBackendConfig::KokoroLocal { model, voice }
+        }
+        "kokoro-remote" | "kokoro_remote" | "remote" => {
+            let url = env::var("TELEGRAM_TTS_REMOTE_URL").context(
+                "TELEGRAM_TTS_BACKEND=remote requires TELEGRAM_TTS_REMOTE_URL",
+            )?;
+            if url.trim().is_empty() {
+                bail!("TELEGRAM_TTS_REMOTE_URL must not be empty");
+            }
+            let allow_http = parse_toggle_env("TELEGRAM_TTS_REMOTE_ALLOW_HTTP", false)?;
+            let lower = url.trim().to_ascii_lowercase();
+            let is_https = lower.starts_with("https://");
+            let is_allowed_http = allow_http && lower.starts_with("http://");
+            if !is_https && !is_allowed_http {
+                bail!(
+                    "TELEGRAM_TTS_REMOTE_URL must start with https:// \
+                     (set TELEGRAM_TTS_REMOTE_ALLOW_HTTP=true to allow http:// for LAN)"
+                );
+            }
+            let api_key = env::var("TELEGRAM_TTS_REMOTE_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(SecretString::from);
+            let model = env::var("TELEGRAM_TTS_REMOTE_MODEL")
+                .unwrap_or_else(|_| "kokoro".to_string());
+            let voice =
+                env::var("TELEGRAM_TTS_VOICE").unwrap_or_else(|_| "af_sarah".to_string());
+            let timeout_sec: u32 = env::var("TELEGRAM_TTS_REMOTE_TIMEOUT_SEC")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()
+                .context("TELEGRAM_TTS_REMOTE_TIMEOUT_SEC must be a positive integer")?;
+            if !(1..=300).contains(&timeout_sec) {
+                bail!("TELEGRAM_TTS_REMOTE_TIMEOUT_SEC must be 1..=300");
+            }
+            TtsBackendConfig::Remote {
+                url: url.trim().to_string(),
+                api_key,
+                model,
+                voice,
+                timeout_sec,
+            }
+        }
+        other => bail!(
+            "TELEGRAM_TTS_BACKEND must be one of: \
+             say, kokoro-local, kokoro-remote, none (got {other:?})"
+        ),
+    };
+
     Ok(Some(TtsConfig {
-        voice,
+        backend,
         respond_to_all,
     }))
 }

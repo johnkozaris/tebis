@@ -45,9 +45,6 @@ pub struct TtsModel {
     pub onnx_url: String,
     pub onnx_sha256: String,
     pub onnx_size_bytes: u64,
-    pub tokenizer_url: String,
-    pub tokenizer_sha256: String,
-    pub tokenizer_size_bytes: u64,
     /// Per-voice style files. Kokoro ships each voice as an individual
     /// ~510 KB `.bin` containing that voice's style embedding. Users can
     /// opt into additional voices beyond the shipped set by adding entries
@@ -57,6 +54,11 @@ pub struct TtsModel {
     /// Which voice to use when `TELEGRAM_TTS_VOICE` is unset.
     pub default_voice: String,
     pub display_name: String,
+    // NOTE: upstream Kokoro ships a `tokenizer.json` too, but tebis
+    // hardcodes the 114-entry sparse vocab in `audio::tts::kokoro::tokens`
+    // (copied verbatim from `config.json` in the HF repo). The file
+    // never needs to be fetched, so we don't carry a manifest entry
+    // for it.
 }
 
 /// One Kokoro voice-style file. Small (~510 KB each) so downloading on
@@ -136,19 +138,13 @@ impl Manifest {
     }
 
     /// Fail loudly if callers try to use a TTS model whose SHAs are still
-    /// placeholders. Validates onnx + tokenizer + the default voice; other
-    /// voices are validated lazily when the user picks one.
+    /// placeholders. Validates onnx + the default voice; other voices
+    /// are validated lazily when the user picks one.
     pub fn validate_tts_usable(&self, name: &str) -> Result<()> {
         let m = self.tts_model(name)?;
         if m.onnx_sha256.starts_with(PLACEHOLDER_PREFIX) {
             bail!(
                 "TTS model `{name}` has placeholder ONNX SHA — pin via \
-                 scripts/pin-model-shas.sh --apply"
-            );
-        }
-        if m.tokenizer_sha256.starts_with(PLACEHOLDER_PREFIX) {
-            bail!(
-                "TTS model `{name}` has placeholder tokenizer SHA — pin via \
                  scripts/pin-model-shas.sh --apply"
             );
         }
@@ -219,14 +215,8 @@ mod tests {
     fn every_tts_model_has_nonempty_urls_and_shas() {
         for (name, m) in &get().tts_models {
             assert!(!m.onnx_url.is_empty(), "TTS `{name}` has empty onnx URL");
-            assert!(
-                !m.tokenizer_url.is_empty(),
-                "TTS `{name}` has empty tokenizer URL"
-            );
             assert!(!m.onnx_sha256.is_empty());
-            assert!(!m.tokenizer_sha256.is_empty());
             assert!(m.onnx_size_bytes > 0);
-            assert!(m.tokenizer_size_bytes > 0);
             assert!(
                 !m.voices.is_empty(),
                 "TTS `{name}` declares no voices"
