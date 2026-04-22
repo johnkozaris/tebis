@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use autoreply::AutoreplyConfig;
@@ -69,6 +70,10 @@ pub struct HandlerContext {
     /// at shutdown drains them deterministically. Violating this was
     /// CLAUDE.md invariant 12.
     pub tracker: TaskTracker,
+    /// Daemon's root cancel token. Threaded into typing guards + pane
+    /// watcher so shutdown drain doesn't wait up to `HOOK_TYPING_CAP`
+    /// or the next `REFRESH` for their timers to fire naturally.
+    pub shutdown: CancellationToken,
     /// `None` when the user has `TELEGRAM_STT=off` (default). When
     /// present, voice/audio payloads get transcribed in-process and
     /// fed through the text handler.
@@ -194,7 +199,13 @@ pub async fn handle_update(
                 // the actual state is "delivered but the hook never
                 // replied." If the typing indicator stops without a
                 // message, the user investigates via /read or /status.
-                typing::spawn_with_cap(&ctx.tracker, ctx.tg.clone(), chat_id, HOOK_TYPING_CAP);
+                typing::spawn_with_cap(
+                    &ctx.tracker,
+                    ctx.tg.clone(),
+                    chat_id,
+                    HOOK_TYPING_CAP,
+                    &ctx.shutdown,
+                );
             } else if let Some(cfg) = ctx.autoreply.clone() {
                 // Auto-reply IS the ack when it produces content —
                 // skip the 👍 up front. If the pane has nothing new,
@@ -210,6 +221,7 @@ pub async fn handle_update(
                     message_id,
                     baseline,
                     cfg,
+                    ctx.shutdown.clone(),
                 ));
             } else {
                 // No auto-reply configured → the 👍 is the only signal

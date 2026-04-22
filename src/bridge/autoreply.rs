@@ -26,6 +26,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use super::typing::TypingGuard;
@@ -76,7 +77,7 @@ impl Default for AutoreplyConfig {
 /// handlers.
 #[allow(
     clippy::too_many_arguments,
-    reason = "wires together tracker + tg + tmux + identifiers + baseline + cfg; a context struct adds more code than it saves"
+    reason = "wires together tracker + tg + tmux + identifiers + baseline + cfg + shutdown; a context struct adds more code than it saves"
 )]
 pub async fn watch_and_forward(
     tracker: TaskTracker,
@@ -87,13 +88,15 @@ pub async fn watch_and_forward(
     message_id: i64,
     baseline: Option<String>,
     cfg: Arc<AutoreplyConfig>,
+    shutdown: CancellationToken,
 ) {
     // Kick off the typing indicator immediately — before min_wait — so
     // the user sees feedback within a second of sending. The guard
     // auto-cancels on Drop, which happens at every exit below
     // (early return on capture failure, normal completion after
-    // send_message, or max_wait timeout).
-    let typing = TypingGuard::start(&tracker, tg.clone(), chat_id);
+    // send_message, or max_wait timeout). Shutdown propagates via
+    // child_token so SIGTERM cancels the refresh loop immediately.
+    let typing = TypingGuard::start(&tracker, tg.clone(), chat_id, &shutdown);
 
     tokio::time::sleep(cfg.min_wait).await;
 

@@ -535,6 +535,7 @@ async fn run_bridge() -> Result<()> {
                         metrics: metrics.clone(),
                         autoreply: autoreply_cfg.clone(),
                         tracker: tracker.clone(),
+                        shutdown: shutdown.clone(),
                         audio: audio.clone(),
                     };
 

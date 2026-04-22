@@ -35,9 +35,18 @@ pub struct TypingGuard {
 
 impl TypingGuard {
     /// Spawn the refresh loop; cancel on drop. Caller keeps the guard
-    /// alive for as long as typing should show.
-    pub fn start(tracker: &TaskTracker, tg: Arc<TelegramClient>, chat_id: i64) -> Self {
-        let cancel = CancellationToken::new();
+    /// alive for as long as typing should show. `shutdown` is the
+    /// daemon's root cancel token — the guard's inner token is a child
+    /// of it, so a SIGTERM cancels typing immediately instead of
+    /// waiting for drop (tracker.wait() would otherwise block up to
+    /// the next REFRESH tick).
+    pub fn start(
+        tracker: &TaskTracker,
+        tg: Arc<TelegramClient>,
+        chat_id: i64,
+        shutdown: &CancellationToken,
+    ) -> Self {
+        let cancel = shutdown.child_token();
         tracker.spawn(indicate(tg, chat_id, cancel.clone()));
         Self { cancel }
     }
@@ -61,13 +70,22 @@ impl Drop for TypingGuard {
 /// only load-bearing when the hook fails silently.
 ///
 /// Both the refresh loop and the deadline timer spawn on `tracker`,
-/// so neither outlives shutdown drain.
-pub fn spawn_with_cap(tracker: &TaskTracker, tg: Arc<TelegramClient>, chat_id: i64, cap: Duration) {
-    let cancel = CancellationToken::new();
+/// and both listen to the daemon's `shutdown` token — so shutdown
+/// drain doesn't wait up to `cap` for the timer to fire naturally.
+pub fn spawn_with_cap(
+    tracker: &TaskTracker,
+    tg: Arc<TelegramClient>,
+    chat_id: i64,
+    cap: Duration,
+    shutdown: &CancellationToken,
+) {
+    let cancel = shutdown.child_token();
     tracker.spawn(indicate(tg, chat_id, cancel.clone()));
     tracker.spawn(async move {
-        tokio::time::sleep(cap).await;
-        cancel.cancel();
+        tokio::select! {
+            () = tokio::time::sleep(cap) => cancel.cancel(),
+            () = cancel.cancelled() => {}
+        }
     });
 }
 
