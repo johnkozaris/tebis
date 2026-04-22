@@ -203,6 +203,13 @@ fn load_tts_config() -> Result<Option<TtsConfig>> {
         "kokoro-local" | "kokoro_local" | "local" => {
             let voice =
                 env::var("TELEGRAM_TTS_VOICE").unwrap_or_else(|_| "af_sarah".to_string());
+            // Defensive shape check. Manifest validation at audio-init
+            // time also rejects unknown voices, but a `/` or `..` in
+            // the string would otherwise reach
+            // `voices_dir.join(format!("{voice}.bin"))` in the Kokoro
+            // crate — path traversal surface if manifest validation
+            // ever reorders. Same bar as `is_valid_session_name`.
+            ensure_safe_voice_name(&voice)?;
             let model = env::var("TELEGRAM_TTS_MODEL").ok().unwrap_or_else(|| {
                 crate::audio::manifest::get()
                     .default_tts_model()
@@ -389,6 +396,27 @@ fn reject_control_chars(value: &str, name: &str) -> Result<()> {
         bail!(
             "{name} contains a control character (U+{:04X}); tmux argv values must be printable",
             bad as u32
+        );
+    }
+    Ok(())
+}
+
+/// Defensive check on `TELEGRAM_TTS_VOICE`: `[A-Za-z0-9._-]{1,64}`, same
+/// bar as tmux session names. The Kokoro crate builds the voice file
+/// path as `voices_dir.join(format!("{voice_name}.bin"))`; without this
+/// check a `/` or `..` would become a path-traversal surface if manifest
+/// validation ordering ever changes.
+fn ensure_safe_voice_name(voice: &str) -> Result<()> {
+    if voice.is_empty() || voice.len() > 64 {
+        bail!("TELEGRAM_TTS_VOICE must be 1..=64 chars (got {})", voice.len());
+    }
+    if !voice
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!(
+            "TELEGRAM_TTS_VOICE {voice:?} contains disallowed characters — \
+             use [A-Za-z0-9._-] only"
         );
     }
     Ok(())

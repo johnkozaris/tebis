@@ -32,13 +32,19 @@ pub enum CodecError {
     NotOpus,
 
     #[error(
-        "this audio file has {0} channels — tebis only handles mono voice recordings. \
+        "this audio file has {0} channel(s) (tebis only handles mono voice recordings). \
          Record a voice note (hold the mic button) instead of sending a music file."
     )]
     UnsupportedChannels(u8),
 
     #[error("ogg read error: {0}")]
     OggRead(String),
+
+    #[error(
+        "decoded audio exceeds {max_samples} samples (16 kHz ≈ {max_sec}s) — \
+         input may be a bitrate-stuffed adversarial blob"
+    )]
+    DecodedTooLarge { max_samples: usize, max_sec: u32 },
 }
 
 /// Maximum PCM samples a single Opus packet can decode to, per channel.
@@ -54,13 +60,22 @@ const OUTPUT_RATE: u32 = 16_000;
 /// 16 kHz mono PCM `f32` samples in `[-1.0, 1.0]`. The first two OGG
 /// packets (`OpusHead` + `OpusTags`) are metadata and skipped.
 ///
+/// `max_samples` caps the output. The byte-input cap is not sufficient
+/// alone — Opus compresses aggressively, so a malicious input with many
+/// 1-byte packets can decode to tens of GB of PCM from a modestly-sized
+/// input. Pass `max_duration_sec * 16_000 * 2` (the × 2 is slack for
+/// stream preskip / trailing silence that whisper ignores).
+///
 /// Rejects multi-channel input outright — Telegram voice is always
 /// mono, and silently downmixing stereo would be a footgun. If you hit
 /// [`CodecError::UnsupportedChannels`] in practice, it means Telegram
 /// shipped a music file via `sendAudio`, not a voice note; the bridge
 /// should either re-mux to mono before calling this or reject the
 /// attachment upstream.
-pub fn decode_opus_to_pcm16k(oga_bytes: &[u8]) -> Result<Vec<f32>, CodecError> {
+pub fn decode_opus_to_pcm16k(
+    oga_bytes: &[u8],
+    max_samples: usize,
+) -> Result<Vec<f32>, CodecError> {
     if oga_bytes.is_empty() {
         return Err(CodecError::Decode("empty input".to_string()));
     }
@@ -115,6 +130,19 @@ pub fn decode_opus_to_pcm16k(oga_bytes: &[u8]) -> Result<Vec<f32>, CodecError> {
         let n = decoder
             .decode_float(&packet.data, &mut buf, false)
             .map_err(|e| CodecError::Decode(format!("decode_float: {e}")))?;
+        if out.len().saturating_add(n) > max_samples {
+            return Err(CodecError::DecodedTooLarge {
+                max_samples,
+                // Truncating cast: u32::from(usize) isn't infallible on 64-bit.
+                // max_samples is a user-supplied budget; if it overflows u32
+                // the error message is informational, not load-bearing.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "max_samples is a budget; the error message is informational"
+                )]
+                max_sec: (max_samples / 16_000).min(u32::MAX as usize) as u32,
+            });
+        }
         out.extend_from_slice(&buf[..n]);
     }
 
@@ -277,9 +305,14 @@ mod tests {
         assert!(CodecError::NotOpus.to_string().contains("OpusHead"));
     }
 
+    /// Sample budget that comfortably exceeds any test case here —
+    /// 10 minutes at 16 kHz. Keeps call sites readable without
+    /// hardcoding the literal in every test.
+    const TEST_SAMPLE_BUDGET: usize = 600 * 16_000;
+
     #[test]
     fn decode_empty_input_errors() {
-        let err = decode_opus_to_pcm16k(&[]).unwrap_err();
+        let err = decode_opus_to_pcm16k(&[], TEST_SAMPLE_BUDGET).unwrap_err();
         assert!(err.to_string().contains("empty"));
     }
 
@@ -289,7 +322,7 @@ mod tests {
         // so the ogg reader should error out before we get to the magic
         // check. Either error is fine; we just need a clean error path.
         let garbage = vec![0xffu8; 16];
-        let err = decode_opus_to_pcm16k(&garbage).unwrap_err();
+        let err = decode_opus_to_pcm16k(&garbage, TEST_SAMPLE_BUDGET).unwrap_err();
         // Don't assert on the specific variant — ogg-crate's parser
         // may report it as an OggRead or the downstream packet reader
         // may surface it differently across versions.
@@ -312,7 +345,7 @@ mod tests {
         // OGG pages always start with "OggS".
         assert_eq!(&oga_bytes[..4], b"OggS");
 
-        let pcm = decode_opus_to_pcm16k(&oga_bytes).expect("decode");
+        let pcm = decode_opus_to_pcm16k(&oga_bytes, TEST_SAMPLE_BUDGET).expect("decode");
         // Opus has a small internal preskip + latency; allow tolerance.
         assert!(
             pcm.len() > 14_000 && pcm.len() < 18_000,
@@ -321,6 +354,24 @@ mod tests {
         );
         let peak = pcm.iter().copied().map(f32::abs).fold(0.0_f32, f32::max);
         assert!(peak < 0.05, "silence decoded with peak {peak}");
+    }
+
+    /// A byte-input cap alone is insufficient: low-bitrate Opus can
+    /// decode to far more output than input. This test encodes 2 s of
+    /// silence, then decodes with a sample budget that's too small
+    /// by ~2× and asserts we bail with the specific variant (rather
+    /// than allocating unbounded PCM).
+    #[test]
+    fn decode_rejects_output_over_budget() {
+        let two_sec = vec![0.0_f32; (OUTPUT_RATE as usize) * 2];
+        let oga_bytes = encode_pcm_to_opus(&two_sec, OUTPUT_RATE).expect("encode");
+        // Budget of 1 s < 2 s of actual audio.
+        let budget = OUTPUT_RATE as usize;
+        let err = decode_opus_to_pcm16k(&oga_bytes, budget).unwrap_err();
+        assert!(
+            matches!(err, CodecError::DecodedTooLarge { .. }),
+            "expected DecodedTooLarge, got: {err:?}"
+        );
     }
 
     #[test]

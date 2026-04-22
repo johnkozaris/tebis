@@ -340,7 +340,10 @@ async fn transcribe_voice(
         "Voice downloaded"
     );
 
-    let pcm = codec::decode_opus_to_pcm16k(&oga_bytes).map_err(|e| {
+    // × 2 on the sample budget covers Opus preskip + trailing silence
+    // that whisper ignores. Beyond that we assume adversarial input.
+    let max_samples = (limits.max_duration_sec as usize).saturating_mul(16_000).saturating_mul(2);
+    let pcm = codec::decode_opus_to_pcm16k(&oga_bytes, max_samples).map_err(|e| {
         format!("Voice decode failed: {e}. Tebis only accepts OGG/Opus voice notes — music files in other formats aren't supported.")
     })?;
 

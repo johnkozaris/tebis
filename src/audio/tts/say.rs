@@ -54,6 +54,27 @@ impl Tts for SayTts {
                 .map_or(0, |d| d.as_nanos()),
         ));
 
+        // Pre-create the file with O_CREAT|O_EXCL mode 0600 so an
+        // attacker who races a symlink at the same path (predicting
+        // both pid AND nanosecond-scale timestamp) fails to clobber a
+        // real file. Fail-open if pre-create fails — the path is
+        // near-unguessable and `say` will still refuse to write
+        // outside what it has permission to.
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Err(e) = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+            {
+                return Err(TtsError::Synthesis(format!(
+                    "tmp-file pre-create {}: {e}",
+                    tmp.display()
+                )));
+            }
+        }
+
         let mut cmd = Command::new("say");
         cmd.arg("--file-format=WAVE")
             .arg("--data-format=LEI16@16000")

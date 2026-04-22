@@ -399,51 +399,81 @@ async fn build_local_stt(
     cache::reap_stale_tmps(&models_dir)
         .context("reaping stale .tmp files in models dir")?;
 
-    if model_path.exists() {
+    let was_cached = model_path.exists();
+    if was_cached {
         tracing::info!(model = %cfg.model, path = %model_path.display(), "Using cached STT model");
     } else {
-        let client = fetch::FetchClient::new();
-        let tmp = cache::tmp_path_for(&model_path);
-        tracing::info!(
-            model = %cfg.model,
-            size_mb = asset.size_bytes / (1024 * 1024),
-            "Downloading {}…",
-            asset.display_name
-        );
-
-        let mut last_logged = 0u64;
-        client
-            .download_verified(
-                &asset.url,
-                &asset.sha256,
-                &tmp,
-                &model_path,
-                |bytes, total| {
-                    // Throttled progress log: at most once every 8 MiB.
-                    const LOG_EVERY: u64 = 8 * 1024 * 1024;
-                    if bytes.saturating_sub(last_logged) >= LOG_EVERY {
-                        last_logged = bytes;
-                        if let Some(t) = total {
-                            tracing::info!(
-                                "  …downloaded {} / {} MB",
-                                bytes / (1024 * 1024),
-                                t / (1024 * 1024),
-                            );
-                        } else {
-                            tracing::info!("  …downloaded {} MB", bytes / (1024 * 1024));
-                        }
-                    }
-                },
-                shutdown,
-            )
-            .await
-            .context("downloading local STT model")?;
-        tracing::info!(model = %cfg.model, "Model download + verification complete");
+        download_stt_model(&cfg.model, asset, &model_path, shutdown.clone()).await?;
     }
 
-    let backend = stt::local::LocalStt::load(&model_path, cfg.threads, &cfg.language)
-        .context("loading whisper-rs context")?;
-    Ok((backend, cfg.model.clone()))
+    match stt::local::LocalStt::load(&model_path, cfg.threads, &cfg.language) {
+        Ok(backend) => Ok((backend, cfg.model.clone())),
+        Err(load_err) if was_cached => {
+            // Cached file exists but whisper refuses it — most likely
+            // truncated by disk-full / power-loss / user tampering.
+            // Delete and refetch once; if the fresh download still
+            // fails to load, bubble up.
+            tracing::warn!(
+                err = %load_err,
+                path = %model_path.display(),
+                "Cached STT model failed to load — assuming corrupt, re-downloading"
+            );
+            let _ = std::fs::remove_file(&model_path);
+            download_stt_model(&cfg.model, asset, &model_path, shutdown).await?;
+            let backend = stt::local::LocalStt::load(&model_path, cfg.threads, &cfg.language)
+                .context("loading whisper-rs context after re-download")?;
+            Ok((backend, cfg.model.clone()))
+        }
+        Err(e) => Err(e).context("loading whisper-rs context"),
+    }
+}
+
+/// Download an STT model asset with SHA verification + progress log.
+/// Extracted so the corrupt-cache-recovery path in `build_local_stt`
+/// can reuse the exact same fetch without duplicating the closure.
+async fn download_stt_model(
+    model_key: &str,
+    asset: &manifest::SttModel,
+    model_path: &std::path::Path,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let client = fetch::FetchClient::new();
+    let tmp = cache::tmp_path_for(model_path);
+    tracing::info!(
+        model = %model_key,
+        size_mb = asset.size_bytes / (1024 * 1024),
+        "Downloading {}…",
+        asset.display_name
+    );
+
+    let mut last_logged = 0u64;
+    client
+        .download_verified(
+            &asset.url,
+            &asset.sha256,
+            &tmp,
+            model_path,
+            |bytes, total| {
+                const LOG_EVERY: u64 = 8 * 1024 * 1024;
+                if bytes.saturating_sub(last_logged) >= LOG_EVERY {
+                    last_logged = bytes;
+                    if let Some(t) = total {
+                        tracing::info!(
+                            "  …downloaded {} / {} MB",
+                            bytes / (1024 * 1024),
+                            t / (1024 * 1024),
+                        );
+                    } else {
+                        tracing::info!("  …downloaded {} MB", bytes / (1024 * 1024));
+                    }
+                }
+            },
+            shutdown,
+        )
+        .await
+        .context("downloading local STT model")?;
+    tracing::info!(model = %model_key, "Model download + verification complete");
+    Ok(())
 }
 
 /// Build the local Kokoro backend end-to-end: probe espeak-ng,
@@ -498,8 +528,93 @@ async fn build_kokoro_local(
 
     let client = fetch::FetchClient::new();
 
-    // Download the ONNX model if missing. Large (~346 MB) — log every
-    // 32 MiB so the operator sees progress.
+    let was_cached = model_path.exists() && voice_path.exists();
+
+    download_kokoro_if_missing(
+        &client,
+        model_key,
+        voice,
+        model_entry,
+        voice_asset,
+        &model_path,
+        &voice_path,
+        shutdown.clone(),
+    )
+    .await?;
+
+    // Load ONNX — blocking, ~500 ms cold start. Spawn_blocking to
+    // avoid stalling the startup event loop for the other init paths.
+    // On a corrupt cached file (truncated by disk-full, user tampering,
+    // etc.) delete both files and refetch once. Without this, the
+    // daemon loops on load-fail forever.
+    let load_attempt = {
+        let model_path_c = model_path.clone();
+        let voices_dir_c = models_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            tts::kokoro::KokoroTts::load(&model_path_c, voices_dir_c)
+        })
+        .await
+        .map_err(|e| TtsError::Init(format!("Kokoro load join: {e}")))?
+    };
+    let backend = match load_attempt {
+        Ok(b) => b,
+        Err(load_err) if was_cached => {
+            tracing::warn!(
+                err = %load_err,
+                model = %model_path.display(),
+                voice = %voice_path.display(),
+                "Cached Kokoro files failed to load — assuming corrupt, re-downloading"
+            );
+            let _ = std::fs::remove_file(&model_path);
+            let _ = std::fs::remove_file(&voice_path);
+            download_kokoro_if_missing(
+                &client,
+                model_key,
+                voice,
+                model_entry,
+                voice_asset,
+                &model_path,
+                &voice_path,
+                shutdown,
+            )
+            .await?;
+            let model_path_c = model_path.clone();
+            let voices_dir_c = models_dir;
+            tokio::task::spawn_blocking(move || {
+                tts::kokoro::KokoroTts::load(&model_path_c, voices_dir_c)
+            })
+            .await
+            .map_err(|e| TtsError::Init(format!("Kokoro load retry join: {e}")))?
+                .map_err(|e| {
+                    TtsError::Init(format!("Kokoro load retry after refetch: {e}"))
+                })?
+        }
+        Err(e) => return Err(TtsError::Init(format!("Kokoro load: {e}"))),
+    };
+
+    Ok(tts::Backend::Kokoro(Box::new(backend)))
+}
+
+/// Download ONNX model + voice file if either is absent on disk. No-op
+/// when both are already cached (the caller has verified this for the
+/// happy path; used on the corrupt-cache retry path to re-fetch after
+/// deletion). Extracted so the happy-path and retry-path share one
+/// definition — drift between them once broke SHA verification.
+#[cfg(feature = "kokoro")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "keeps the retry path's call-site free of helper-struct plumbing"
+)]
+async fn download_kokoro_if_missing(
+    client: &fetch::FetchClient,
+    model_key: &str,
+    voice: &str,
+    model_entry: &manifest::TtsModel,
+    voice_asset: &manifest::VoiceAsset,
+    model_path: &std::path::Path,
+    voice_path: &std::path::Path,
+    shutdown: CancellationToken,
+) -> Result<(), TtsError> {
     if !model_path.exists() {
         tracing::info!(
             model = %model_key,
@@ -507,14 +622,14 @@ async fn build_kokoro_local(
             "Downloading Kokoro model (~{} MB, one-time)…",
             model_entry.onnx_size_bytes / (1024 * 1024),
         );
-        let tmp = cache::tmp_path_for(&model_path);
+        let tmp = cache::tmp_path_for(model_path);
         let mut last_logged = 0u64;
         client
             .download_verified(
                 &model_entry.onnx_url,
                 &model_entry.onnx_sha256,
                 &tmp,
-                &model_path,
+                model_path,
                 |bytes, total| {
                     const LOG_EVERY: u64 = 32 * 1024 * 1024;
                     if bytes.saturating_sub(last_logged) >= LOG_EVERY {
@@ -535,34 +650,22 @@ async fn build_kokoro_local(
         tracing::info!("Kokoro model downloaded + SHA-verified");
     }
 
-    // Download the voice if missing. Small (~510 KB) — single-log.
     if !voice_path.exists() {
         tracing::info!(voice = %voice, "Downloading Kokoro voice (~510 KB)…");
-        let tmp = cache::tmp_path_for(&voice_path);
+        let tmp = cache::tmp_path_for(voice_path);
         client
             .download_verified(
                 &voice_asset.url,
                 &voice_asset.sha256,
                 &tmp,
-                &voice_path,
+                voice_path,
                 |_, _| {},
                 shutdown,
             )
             .await
             .map_err(|e| TtsError::Init(format!("download voice `{voice}`: {e}")))?;
     }
-
-    // Load ONNX — blocking, ~500 ms cold start. Spawn_blocking to
-    // avoid stalling the startup event loop for the other init paths.
-    let model_path_c = model_path.clone();
-    let voices_dir_c = models_dir.clone();
-    let backend = tokio::task::spawn_blocking(move || {
-        tts::kokoro::KokoroTts::load(&model_path_c, voices_dir_c)
-    })
-    .await
-    .map_err(|e| TtsError::Init(format!("Kokoro load join: {e}")))??;
-
-    Ok(tts::Backend::Kokoro(Box::new(backend)))
+    Ok(())
 }
 
 /// Return a dashboard-ready detail string for the configured TTS

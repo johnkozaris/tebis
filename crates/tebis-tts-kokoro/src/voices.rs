@@ -16,6 +16,13 @@ use ndarray::{Array2, Array3, Axis};
 use crate::KokoroError;
 
 /// Per-row inner dim. Fixed by the Kokoro v1.0 model signature.
+/// Hard ceiling on a voice-file size. Real HuggingFace voices are
+/// ~510 KB (511 rows × 1024 bytes); 16 MiB leaves ~16,000 rows of
+/// headroom, far beyond any plausible legitimate file. Prevents an
+/// attacker with local write access from planting a giant `.bin` that
+/// would OOM the daemon at `fs::read`.
+const MAX_VOICE_BYTES: u64 = 16 * 1024 * 1024;
+
 const STYLE_DIM: usize = 256;
 /// Bytes per row = 1 × 256 × sizeof(f32).
 const BYTES_PER_ROW: usize = STYLE_DIM * 4;
@@ -38,6 +45,18 @@ impl Voice {
     /// - byte count isn't a multiple of 1024 (= 1 × 256 × 4 bytes)
     /// - the implied outer dim is zero
     pub fn load(path: &Path) -> Result<Self, KokoroError> {
+        // stat before read so we never allocate gigabytes for a
+        // hostile file. `fs::metadata` is cheap (one syscall); the
+        // subsequent `fs::read` path stays simple.
+        let meta = std::fs::metadata(path)
+            .map_err(|e| KokoroError::Init(format!("stat voice `{}`: {e}", path.display())))?;
+        if meta.len() > MAX_VOICE_BYTES {
+            return Err(KokoroError::Init(format!(
+                "voice `{}` is {} bytes, refusing to load (cap: {MAX_VOICE_BYTES} bytes)",
+                path.display(),
+                meta.len(),
+            )));
+        }
         let bytes = std::fs::read(path)
             .map_err(|e| KokoroError::Init(format!("read voice `{}`: {e}", path.display())))?;
 

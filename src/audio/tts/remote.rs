@@ -219,7 +219,13 @@ impl RemoteTts {
 
         // Decode to count samples → duration. Cheap; shares coverage with
         // the inbound STT OGG path.
-        let pcm = codec::decode_opus_to_pcm16k(&bytes)
+        //
+        // `MAX_RESPONSE_BYTES` (10 MiB) caps the input. The decode cap
+        // below caps the output at ~1 hour of audio @ 16 kHz — generous
+        // headroom for any legitimate remote Kokoro response, tight
+        // enough to refuse a bitrate-stuffed adversarial blob.
+        const MAX_DECODED_SAMPLES: usize = 3600 * 16_000;
+        let pcm = codec::decode_opus_to_pcm16k(&bytes, MAX_DECODED_SAMPLES)
             .map_err(|e| TtsError::Synthesis(format!("decode ogg duration: {e}")))?;
         let duration_sec = u32::try_from(pcm.len() / 16_000).unwrap_or(u32::MAX);
         Ok((bytes, duration_sec))

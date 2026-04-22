@@ -305,10 +305,15 @@ fn configure_kokoro_remote(
         .allow_empty(true)
         .interact_text()
         .context("prompt: remote api key")?;
-    let api_key = if api_key_raw.is_empty() {
+    // Trim surrounding whitespace before the empty check and before
+    // persisting. A trailing space in the env file would otherwise be
+    // carried into the Bearer header and silently break auth; surrounded
+    // whitespace from paste is an easy mistake to miss.
+    let api_key_trimmed = api_key_raw.trim();
+    let api_key = if api_key_trimmed.is_empty() {
         None
     } else {
-        Some(api_key_raw)
+        Some(api_key_trimmed.to_string())
     };
 
     let default_model = existing_remote
