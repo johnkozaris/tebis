@@ -90,28 +90,51 @@ echo "TTS models:"
 tts_keys="$(jq -r '.tts_models | keys[]' "${MANIFEST}")"
 while IFS= read -r key; do
   [[ -z "${key}" ]] && continue
+
+  # ONNX
   onnx_url=$(jq -r --arg k "${key}" '.tts_models[$k].onnx_url' "${MANIFEST}")
-  voices_url=$(jq -r --arg k "${key}" '.tts_models[$k].voices_url' "${MANIFEST}")
   old_onnx=$(jq -r --arg k "${key}" '.tts_models[$k].onnx_sha256' "${MANIFEST}")
-  old_voices=$(jq -r --arg k "${key}" '.tts_models[$k].voices_sha256' "${MANIFEST}")
   new_onnx="$(download_and_hash "${onnx_url}")"
-  new_voices="$(download_and_hash "${voices_url}")"
   if [[ -n "${new_onnx}" ]]; then
-    printf "  %-20s  onnx:   %s → %s\n" "${key}" "${old_onnx:0:12}…" "${new_onnx}"
+    printf "  %-20s  onnx:       %s → %s\n" "${key}" "${old_onnx:0:12}…" "${new_onnx}"
     jq --arg k "${key}" --arg sha "${new_onnx}" \
       '.tts_models[$k].onnx_sha256 = $sha' "${STAGE_MANIFEST}" > "${STAGE_MANIFEST}.work"
     mv "${STAGE_MANIFEST}.work" "${STAGE_MANIFEST}"
   else
-    printf "  %-20s  onnx:   %s → (skipped)\n" "${key}" "${old_onnx:0:12}…"
+    printf "  %-20s  onnx:       %s → (skipped)\n" "${key}" "${old_onnx:0:12}…"
   fi
-  if [[ -n "${new_voices}" ]]; then
-    printf "  %-20s  voices: %s → %s\n" "${key}" "${old_voices:0:12}…" "${new_voices}"
-    jq --arg k "${key}" --arg sha "${new_voices}" \
-      '.tts_models[$k].voices_sha256 = $sha' "${STAGE_MANIFEST}" > "${STAGE_MANIFEST}.work"
-    mv "${STAGE_MANIFEST}.work" "${STAGE_MANIFEST}"
-  else
-    printf "  %-20s  voices: %s → (skipped)\n" "${key}" "${old_voices:0:12}…"
+
+  # Tokenizer
+  tok_url=$(jq -r --arg k "${key}" '.tts_models[$k].tokenizer_url // empty' "${MANIFEST}")
+  if [[ -n "${tok_url}" ]]; then
+    old_tok=$(jq -r --arg k "${key}" '.tts_models[$k].tokenizer_sha256 // empty' "${MANIFEST}")
+    new_tok="$(download_and_hash "${tok_url}")"
+    if [[ -n "${new_tok}" ]]; then
+      printf "  %-20s  tokenizer:  %s → %s\n" "${key}" "${old_tok:0:12}…" "${new_tok}"
+      jq --arg k "${key}" --arg sha "${new_tok}" \
+        '.tts_models[$k].tokenizer_sha256 = $sha' "${STAGE_MANIFEST}" > "${STAGE_MANIFEST}.work"
+      mv "${STAGE_MANIFEST}.work" "${STAGE_MANIFEST}"
+    else
+      printf "  %-20s  tokenizer:  %s → (skipped)\n" "${key}" "${old_tok:0:12}…"
+    fi
   fi
+
+  # Per-voice files (new schema)
+  voice_keys="$(jq -r --arg k "${key}" '.tts_models[$k].voices // {} | keys[]' "${MANIFEST}")"
+  while IFS= read -r voice; do
+    [[ -z "${voice}" ]] && continue
+    v_url=$(jq -r --arg k "${key}" --arg v "${voice}" '.tts_models[$k].voices[$v].url' "${MANIFEST}")
+    old_v=$(jq -r --arg k "${key}" --arg v "${voice}" '.tts_models[$k].voices[$v].sha256' "${MANIFEST}")
+    new_v="$(download_and_hash "${v_url}")"
+    if [[ -n "${new_v}" ]]; then
+      printf "  %-20s  voice %-10s %s → %s\n" "${key}" "${voice}" "${old_v:0:12}…" "${new_v}"
+      jq --arg k "${key}" --arg v "${voice}" --arg sha "${new_v}" \
+        '.tts_models[$k].voices[$v].sha256 = $sha' "${STAGE_MANIFEST}" > "${STAGE_MANIFEST}.work"
+      mv "${STAGE_MANIFEST}.work" "${STAGE_MANIFEST}"
+    else
+      printf "  %-20s  voice %-10s %s → (skipped)\n" "${key}" "${voice}" "${old_v:0:12}…"
+    fi
+  done <<< "${voice_keys}"
 done <<< "${tts_keys}"
 
 if [[ ${APPLY} -eq 0 ]]; then

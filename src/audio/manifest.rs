@@ -45,12 +45,27 @@ pub struct TtsModel {
     pub onnx_url: String,
     pub onnx_sha256: String,
     pub onnx_size_bytes: u64,
-    pub voices_url: String,
-    pub voices_sha256: String,
-    pub voices_size_bytes: u64,
+    pub tokenizer_url: String,
+    pub tokenizer_sha256: String,
+    pub tokenizer_size_bytes: u64,
+    /// Per-voice style files. Kokoro ships each voice as an individual
+    /// ~510 KB `.bin` containing that voice's style embedding. Users can
+    /// opt into additional voices beyond the shipped set by adding entries
+    /// here (or via `TELEGRAM_TTS_VOICE=<name>` if the file is already in
+    /// the cache).
+    pub voices: std::collections::BTreeMap<String, VoiceAsset>,
+    /// Which voice to use when `TELEGRAM_TTS_VOICE` is unset.
+    pub default_voice: String,
     pub display_name: String,
-    #[serde(default)]
-    pub default: bool,
+}
+
+/// One Kokoro voice-style file. Small (~510 KB each) so downloading on
+/// demand is cheap; we ship a few by default and lazy-fetch others.
+#[derive(Debug, Deserialize)]
+pub struct VoiceAsset {
+    pub url: String,
+    pub sha256: String,
+    pub size_bytes: u64,
 }
 
 /// Sentinel prefix for SHAs that haven't been filled in yet. `validate_for_use`
@@ -95,13 +110,15 @@ impl Manifest {
             .context("manifest has no default STT model")
     }
 
-    /// Name of the TTS model marked `default: true`.
+    /// Name of the first declared TTS model. With one model in the
+    /// manifest today this is unambiguous; if we ever ship multiple
+    /// TTS models, add a `default: true` field like STT has.
     pub fn default_tts_model(&self) -> Result<&str> {
         self.tts_models
-            .iter()
-            .find(|(_, m)| m.default)
-            .map(|(k, _)| k.as_str())
-            .context("manifest has no default TTS model")
+            .keys()
+            .next()
+            .map(String::as_str)
+            .context("manifest has no TTS models")
     }
 
     /// Fail loudly if callers try to use an asset whose SHA is still a
@@ -119,18 +136,55 @@ impl Manifest {
     }
 
     /// Fail loudly if callers try to use a TTS model whose SHAs are still
-    /// placeholders (both onnx and voices must be pinned).
+    /// placeholders. Validates onnx + tokenizer + the default voice; other
+    /// voices are validated lazily when the user picks one.
     pub fn validate_tts_usable(&self, name: &str) -> Result<()> {
         let m = self.tts_model(name)?;
-        if m.onnx_sha256.starts_with(PLACEHOLDER_PREFIX)
-            || m.voices_sha256.starts_with(PLACEHOLDER_PREFIX)
-        {
+        if m.onnx_sha256.starts_with(PLACEHOLDER_PREFIX) {
             bail!(
-                "TTS model `{name}` has placeholder SHA(s) — pin real hashes in \
-                 src/audio/manifest.json before enabling `local` TTS"
+                "TTS model `{name}` has placeholder ONNX SHA — pin via \
+                 scripts/pin-model-shas.sh --apply"
+            );
+        }
+        if m.tokenizer_sha256.starts_with(PLACEHOLDER_PREFIX) {
+            bail!(
+                "TTS model `{name}` has placeholder tokenizer SHA — pin via \
+                 scripts/pin-model-shas.sh --apply"
+            );
+        }
+        let default_voice = m.voices.get(&m.default_voice).with_context(|| {
+            format!(
+                "TTS model `{name}` default_voice `{}` not declared in voices map",
+                m.default_voice
+            )
+        })?;
+        if default_voice.sha256.starts_with(PLACEHOLDER_PREFIX) {
+            bail!(
+                "TTS voice `{}` (the default) has placeholder SHA — pin via \
+                 scripts/pin-model-shas.sh --apply",
+                m.default_voice
             );
         }
         Ok(())
+    }
+
+    /// Validate a specific voice (used when the user picks a non-default
+    /// voice at runtime). Returns the voice descriptor on success.
+    pub fn validate_voice(&self, model: &str, voice: &str) -> Result<&VoiceAsset> {
+        let m = self.tts_model(model)?;
+        let asset = m.voices.get(voice).with_context(|| {
+            format!(
+                "unknown TTS voice `{voice}` — manifest has: {:?}",
+                m.voices.keys().collect::<Vec<_>>()
+            )
+        })?;
+        if asset.sha256.starts_with(PLACEHOLDER_PREFIX) {
+            bail!(
+                "TTS voice `{voice}` has placeholder SHA — pin via \
+                 scripts/pin-model-shas.sh --apply"
+            );
+        }
+        Ok(asset)
     }
 }
 
@@ -142,7 +196,8 @@ mod tests {
     #[test]
     fn embedded_manifest_parses() {
         let m = get();
-        assert_eq!(m.manifest_version, 1);
+        // v2 added per-voice files + tokenizer to the TTS schema.
+        assert_eq!(m.manifest_version, 2);
         assert!(!m.stt_models.is_empty());
         assert!(!m.tts_models.is_empty());
     }
@@ -164,11 +219,31 @@ mod tests {
     fn every_tts_model_has_nonempty_urls_and_shas() {
         for (name, m) in &get().tts_models {
             assert!(!m.onnx_url.is_empty(), "TTS `{name}` has empty onnx URL");
-            assert!(!m.voices_url.is_empty(), "TTS `{name}` has empty voices URL");
+            assert!(
+                !m.tokenizer_url.is_empty(),
+                "TTS `{name}` has empty tokenizer URL"
+            );
             assert!(!m.onnx_sha256.is_empty());
-            assert!(!m.voices_sha256.is_empty());
+            assert!(!m.tokenizer_sha256.is_empty());
             assert!(m.onnx_size_bytes > 0);
-            assert!(m.voices_size_bytes > 0);
+            assert!(m.tokenizer_size_bytes > 0);
+            assert!(
+                !m.voices.is_empty(),
+                "TTS `{name}` declares no voices"
+            );
+            assert!(
+                m.voices.contains_key(&m.default_voice),
+                "TTS `{name}` default_voice `{}` not in voices map",
+                m.default_voice
+            );
+            for (v_name, v) in &m.voices {
+                assert!(
+                    !v.url.is_empty(),
+                    "TTS `{name}` voice `{v_name}` has empty URL"
+                );
+                assert!(!v.sha256.is_empty());
+                assert!(v.size_bytes > 0);
+            }
         }
     }
 

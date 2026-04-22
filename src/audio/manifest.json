@@ -1,5 +1,5 @@
 {
-  "manifest_version": 1,
+  "manifest_version": 2,
   "tebis_version": "0.2.0",
   "updated_at": "2026-04-22",
   "stt_models": {
@@ -30,11 +30,33 @@
       "onnx_url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model.onnx",
       "onnx_sha256": "8fbea51ea711f2af382e88c833d9e288c6dc82ce5e98421ea61c058ce21a34cb",
       "onnx_size_bytes": 346000000,
-      "voices_url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices.bin",
-      "voices_sha256": "TBD-PLACEHOLDER-kokoro-voices",
-      "voices_size_bytes": 26000000,
-      "display_name": "Kokoro-82M v1.0 — 346 MB + 26 MB voices",
-      "default": true
+      "tokenizer_url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/tokenizer.json",
+      "tokenizer_sha256": "77a02c8e164413299b4b4c403b14f8e0e1c1b727db4d46a09d6327b861060a34",
+      "tokenizer_size_bytes": 3497,
+      "voices": {
+        "af_bella": {
+          "url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/af_bella.bin",
+          "sha256": "f69d836209b78eb8c66e75e3cda491e26ea838a3674257e9d4e5703cbaf55c8b",
+          "size_bytes": 522328
+        },
+        "am_adam": {
+          "url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/am_adam.bin",
+          "sha256": "162b035ed91cfc48b6046982184c645f72edcdd1b82843347f605d7bf7b15716",
+          "size_bytes": 522328
+        },
+        "bf_emma": {
+          "url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/bf_emma.bin",
+          "sha256": "669fe0647f9dd04fcab92f1439a40eeb4c8b4ab1f82e4996fe3d918ce4a63b73",
+          "size_bytes": 522328
+        },
+        "bm_george": {
+          "url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/bm_george.bin",
+          "sha256": "c4b235a4c1f2cd3b939fed08b899ce9385638b763f7b73a59616c4fc9bd6c9bc",
+          "size_bytes": 522328
+        }
+      },
+      "default_voice": "af_bella",
+      "display_name": "Kokoro-82M v1.0 — 346 MB model + 3 KB tokenizer + ~510 KB per voice"
     }
   }
 }
