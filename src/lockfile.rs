@@ -162,3 +162,63 @@ pub fn active_holder(path: &Path) -> Option<u32> {
         .ok()
         .and_then(|s| s.trim().parse().ok())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_tmp_path(tag: &str) -> PathBuf {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!(
+            "tebis-lockfile-test-{tag}-{}-{ns:x}.lock",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn acquire_then_drop_removes_file() {
+        let path = unique_tmp_path("acquire-drop");
+        {
+            let _guard = acquire(&path).expect("acquire");
+            assert!(path.exists(), "lockfile should exist while held");
+        }
+        assert!(!path.exists(), "drop should remove the lockfile");
+    }
+
+    #[test]
+    fn second_acquire_returns_locked_with_pid() {
+        let path = unique_tmp_path("double-acquire");
+        let _guard = acquire(&path).expect("first acquire");
+        match acquire(&path) {
+            Err(AcquireError::Locked { pid, .. }) => {
+                assert_eq!(pid, Some(std::process::id()));
+            }
+            Err(AcquireError::Io(e)) => panic!("expected Locked, got Io: {e}"),
+            Ok(_) => panic!("expected Locked, got Ok"),
+        }
+    }
+
+    #[test]
+    fn active_holder_cleans_stale_file() {
+        let path = unique_tmp_path("stale-cleanup");
+        // Create an unlocked file with a fake pid — simulates a crashed
+        // prior run.
+        std::fs::write(&path, "99999\n").expect("write stale pidfile");
+        assert!(path.exists());
+        assert_eq!(active_holder(&path), None, "no one holds the lock");
+        assert!(
+            !path.exists(),
+            "active_holder should sweep the stale pidfile"
+        );
+    }
+
+    #[test]
+    fn active_holder_reports_pid_when_held() {
+        let path = unique_tmp_path("held");
+        let _guard = acquire(&path).expect("acquire");
+        assert_eq!(active_holder(&path), Some(std::process::id()));
+        assert!(path.exists(), "held lockfile must still be present");
+    }
+}

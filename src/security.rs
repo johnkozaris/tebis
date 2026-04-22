@@ -159,4 +159,27 @@ mod tests {
         assert!(err.as_millis() > 0);
         assert!(err <= Duration::from_secs(30));
     }
+
+    #[test]
+    fn unauthorized_log_cooldown_suppresses_repeats() {
+        // Distinct user ids so we don't race with other tests sharing the
+        // module-global SEEN map. First hit logs; back-to-back repeats
+        // within the cooldown window stay silent. Different id is
+        // independent.
+        let attacker = 999_999_001;
+        let other = 999_999_002;
+        assert!(should_log_unauthorized(attacker), "first must log");
+        assert!(
+            !should_log_unauthorized(attacker),
+            "second within cooldown must suppress"
+        );
+        assert!(
+            !should_log_unauthorized(attacker),
+            "third within cooldown must suppress"
+        );
+        assert!(
+            should_log_unauthorized(other),
+            "different sender is independent"
+        );
+    }
 }
