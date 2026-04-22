@@ -15,6 +15,11 @@ use std::sync::OnceLock;
 use num2words::{Currency, Lang, Num2Words};
 use regex::Regex;
 
+// Every `Regex::new(...).expect(...)` below compiles a string literal
+// pattern at first-use. `.expect` cannot fire at runtime — the tests
+// exercise each pattern, so any malformed pattern is caught at
+// `cargo test` time, never in production.
+
 /// Apply all normalization passes in order.
 #[must_use]
 pub fn preprocess(text: &str) -> String {

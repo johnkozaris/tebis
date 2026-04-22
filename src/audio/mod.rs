@@ -19,6 +19,7 @@
 
 pub mod cache;
 pub mod codec;
+pub mod espeak;
 pub mod fetch;
 pub mod manifest;
 pub mod stt;
@@ -154,7 +155,7 @@ impl AudioSubsystem {
         // usable for those users instead of killing both branches.
         let (tts, tts_voice, tts_respond_to_all, tts_backend_kind, tts_detail) = match &cfg.tts {
             None => (None, None, false, "none", None),
-            Some(tcfg) => match build_tts(tcfg, shutdown.clone()).await {
+            Some(tcfg) => match build_tts(tcfg, &shutdown).await {
                 Ok(backend) => {
                     let kind = tcfg.backend.kind_str();
                     let detail = display_detail_for(&tcfg.backend);
@@ -229,7 +230,8 @@ impl AudioSubsystem {
     /// failed (e.g. unsupported platform). The dashboard reads this to
     /// show real runtime state instead of what the user configured.
     pub fn tts_voice(&self) -> Option<&str> {
-        self.tts.as_ref().and(self.tts_voice.as_deref())
+        self.tts.as_ref()?;
+        self.tts_voice.as_deref()
     }
 
     /// Whether every outbound reply also triggers a voice reply, or
@@ -316,19 +318,17 @@ impl AudioSubsystem {
 /// - `Remote` → construct the HTTP client; no network I/O here.
 async fn build_tts(
     cfg: &TtsConfig,
-    shutdown: CancellationToken,
+    shutdown: &CancellationToken,
 ) -> Result<tts::Backend, TtsError> {
     match &cfg.backend {
         tts::BackendConfig::Say { .. } => {
             #[cfg(target_os = "macos")]
             {
-                let _ = shutdown;
                 tts::say::SayTts::probe().await?;
                 Ok(tts::Backend::Say(tts::say::SayTts::new()))
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = shutdown;
                 Err(TtsError::UnsupportedPlatform)
             }
         }
@@ -338,11 +338,11 @@ async fn build_tts(
                 // Thread the parent shutdown so Ctrl-C during the 346 MB
                 // Kokoro model download cancels promptly instead of
                 // running to completion then exiting.
-                build_kokoro_local(model, voice, shutdown).await
+                build_kokoro_local(model, voice, shutdown.clone()).await
             }
             #[cfg(not(feature = "kokoro"))]
             {
-                let _ = (model, voice, shutdown);
+                let _ = (model, voice);
                 Err(TtsError::Init(
                     "backend=kokoro-local needs the `kokoro` cargo feature \
                      (rebuild with `cargo build --features kokoro`). \
@@ -459,7 +459,7 @@ async fn build_kokoro_local(
     // Early espeak-ng probe. espeak-ng is a runtime requirement for
     // every synth call; no point loading a 346 MB ONNX if it'll never
     // produce a single sample.
-    if crate::setup::phonemizer::probe_espeak_ng().is_none() {
+    if espeak::probe().is_none() {
         return Err(TtsError::Init(
             "espeak-ng not found on PATH — local Kokoro requires it. \
              macOS: `brew install espeak-ng`; Linux: `apt/dnf/pacman \
@@ -592,12 +592,15 @@ fn redacted_host_from_url(url: &str) -> String {
 /// path). HF uses `https://.../resolve/main/<filename>` with no query
 /// string, so `rsplit('/').next()` is sufficient.
 fn filename_from_url(url: &str) -> String {
-    // Strip optional query string defensively, in case an upstream
-    // URL ever grows one.
+    // Strip optional query string defensively, in case an upstream URL
+    // ever grows one. `rsplit('/').next()` on a URL ending with `/`
+    // returns `""` — fall back to a generic name so we never cache a
+    // file with an empty stem.
     let no_query = url.split('?').next().unwrap_or(url);
     no_query
         .rsplit('/')
         .next()
+        .filter(|s| !s.is_empty())
         .unwrap_or("model.bin")
         .to_string()
 }

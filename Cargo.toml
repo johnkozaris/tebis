@@ -1,6 +1,8 @@
 # Root workspace. `tebis` (the daemon) is the root package;
-# `crates/tebis-tts-kokoro/` is an optional separate crate so dropping
-# Kokoro is a one-line change here.
+# `crates/tebis-tts-kokoro/` is an optional separate crate. Dropping
+# Kokoro touches three entries in this file (feature list, dep block,
+# workspace member) plus the adapter at `src/audio/tts/kokoro.rs`, and
+# nothing else — the crate is otherwise fully isolated.
 [workspace]
 members = [".", "crates/tebis-tts-kokoro"]
 

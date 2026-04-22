@@ -60,11 +60,11 @@ impl KokoroTts {
     /// Don't invoke from a request handler — this is startup work.
     pub fn load(model_path: &Path, voices_dir: PathBuf) -> Result<Self, KokoroError> {
         let session = SessionBuilder::new()
-            .map_err(|e| KokoroError::Init(format!("ort SessionBuilder: {e}")))?
+            .map_err(|e| init_err("ort SessionBuilder", &e))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| KokoroError::Init(format!("ort optimization level: {e}")))?
+            .map_err(|e| init_err("ort optimization level", &e))?
             .with_execution_providers([CPUExecutionProvider::default().build()])
-            .map_err(|e| KokoroError::Init(format!("ort CPU provider: {e}")))?
+            .map_err(|e| init_err("ort CPU provider", &e))?
             .commit_from_file(model_path)
             .map_err(|e| {
                 KokoroError::Init(format!(
@@ -130,6 +130,10 @@ impl KokoroTts {
             sample_rate: crate::OUTPUT_SAMPLE_RATE,
         })
     }
+}
+
+fn init_err(ctx: &'static str, e: &dyn std::fmt::Display) -> KokoroError {
+    KokoroError::Init(format!("{ctx}: {e}"))
 }
 
 fn detect_speed_dtype(session: &Session) -> Result<SpeedDtype, KokoroError> {

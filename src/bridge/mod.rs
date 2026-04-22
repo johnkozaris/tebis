@@ -144,20 +144,19 @@ pub async fn handle_update(
                 ctx.metrics.record_handler_error();
                 tracing::error!(err = %e, "Failed to send response");
             }
-            // TTS: if the user's inbound was a voice note (or they opted
-            // into `respond_to_all`), also send a voice reply. Spawned on
-            // the tracker so the handler can release its permit
-            // immediately — `say` + sendVoice can take seconds, and we
-            // don't want to starve the next user's handler waiting for
-            // it. Best-effort: failure only warns, since the user
-            // already has the text.
+            // TTS path runs detached on the tracker so the handler
+            // releases its permit immediately — `say` + sendVoice can
+            // take seconds; we don't want to stall the next reply.
+            // Best-effort: failure only warns, the user already has
+            // the text.
             if let Some(audio) = ctx.audio.as_ref()
                 && audio.should_tts_reply(inbound_was_voice)
             {
                 let tg = ctx.tg.clone();
                 let metrics = ctx.metrics.clone();
                 let audio = audio.clone();
-                let body = body.clone();
+                // `body` moves into the task — no clone, since we've
+                // already awaited the text send above.
                 ctx.tracker.spawn(async move {
                     synthesize_and_send_voice_detached(
                         &tg, &metrics, &audio, chat_id, &body,

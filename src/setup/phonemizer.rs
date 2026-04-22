@@ -12,6 +12,8 @@ use console::style;
 use dialoguer::Confirm;
 use dialoguer::theme::ColorfulTheme;
 
+pub use crate::audio::espeak::{EspeakInfo, probe as probe_espeak_ng};
+
 /// Platform package managers we drive directly. Order of enum variants
 /// has no semantic meaning; priority order lives in
 /// [`detect_package_manager`].
@@ -80,44 +82,6 @@ impl PackageManager {
     }
 }
 
-/// Result of a successful probe: where espeak-ng lives on PATH.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EspeakInfo {
-    pub path: PathBuf,
-}
-
-/// Look for `espeak-ng` on `PATH`. Runs `espeak-ng --version` and
-/// checks exit-status 0. Returns the resolved absolute path, or
-/// `None` if the binary isn't present or didn't run cleanly.
-///
-/// Safe to call at startup on every platform — on Windows it simply
-/// returns `None`, which the caller handles as "Kokoro local is
-/// unavailable, fall back to text-only."
-pub fn probe_espeak_ng() -> Option<EspeakInfo> {
-    // `espeak-ng --version` prints to stderr and exits 0 on success.
-    // We ignore the output; a clean exit is the signal.
-    let out = Command::new("espeak-ng").arg("--version").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let path = which_in_path("espeak-ng")?;
-    Some(EspeakInfo { path })
-}
-
-/// Minimal `which`-equivalent. Walks `$PATH` and returns the first
-/// file-existing match. Avoids pulling in the `which` crate for one
-/// call site.
-fn which_in_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 /// Detect the first supported package manager on this host, in
 /// priority order. Returns `None` on systems we don't know how to
 /// drive (Windows, FreeBSD, exotic distros) — the caller prints
@@ -157,7 +121,7 @@ pub fn detect_package_manager() -> Option<PackageManager> {
 }
 
 fn binary_on_path(name: &str) -> bool {
-    which_in_path(name).is_some()
+    crate::audio::espeak::which_in_path(name).is_some()
 }
 
 /// Outcome of the interactive install flow — so the caller can
@@ -338,15 +302,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn which_in_path_finds_shell_builtin_binaries() {
-        // /bin/sh exists on every POSIX host cargo test runs on.
-        let p = which_in_path("sh");
-        assert!(p.is_some(), "expected `sh` somewhere on PATH");
-    }
-
-    #[test]
-    fn which_in_path_returns_none_for_impossible_name() {
-        assert!(which_in_path("__tebis_absolutely_not_a_real_binary__").is_none());
-    }
+    // `which_in_path` tests live in `crate::audio::espeak` — the helper
+    // moved there to keep runtime audio deps separate from wizard UI.
 }

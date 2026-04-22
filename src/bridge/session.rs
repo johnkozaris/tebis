@@ -161,10 +161,8 @@ impl SessionState {
             return Err(ResolveError::AutostartCommandDied(auto.command.clone()));
         }
 
-        // Mark hooked BEFORE publishing the target. Otherwise a concurrent
-        // observer could see `target == auto.session` and `is_hooked == false`
-        // in the same microsecond and route the first reply through
-        // pane-settle instead of the (installed) hook path.
+        // Mark hooked before publishing the target so no observer ever
+        // sees `target == auto.session` with `is_hooked == false`.
         if hooked {
             self.mark_hooked(&auto.session);
         }

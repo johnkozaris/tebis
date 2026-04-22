@@ -216,10 +216,14 @@ fn configure_say(
     _existing: Option<&TtsChoice>,
     _respond_to_all_default: bool,
 ) -> Result<Option<TtsChoice>> {
-    // The Advanced UI hides `Say` on non-macOS, so this branch is
-    // unreachable from user flow. The function has to exist so the
-    // match in `advanced_tts` type-checks on every platform.
-    unreachable!("Say backend is macOS-only — UI should not offer it here")
+    // The Advanced UI hides `Say` on non-macOS, so this branch should
+    // never be hit from a user flow. Degrade gracefully rather than
+    // panicking in case future refactors change the UI — a wizard
+    // panic is exactly the kind of failure mode to avoid.
+    tracing::warn!(
+        "configure_say invoked on non-macOS; falling back to TTS off"
+    );
+    Ok(Some(TtsChoice::Off))
 }
 
 fn configure_kokoro_local(
