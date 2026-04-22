@@ -108,16 +108,17 @@ async fn main() -> Result<()> {
         println!();
         println!("Synthesizing 'hello from tebis' via macOS `say`…");
         let t3 = Instant::now();
-        let oga = audio
+        let (oga, duration_sec) = audio
             .synthesize("hello from tebis")
             .await
             .context("synthesize failed")?;
         let out_path = std::env::temp_dir().join("tebis-smoke.oga");
         std::fs::write(&out_path, &oga).context("write OGG")?;
         println!(
-            "  ✓ Done in {:.2}s · {} bytes written to {}",
+            "  ✓ Done in {:.2}s · {} bytes · {} s audio · written to {}",
             t3.elapsed().as_secs_f64(),
             oga.len(),
+            duration_sec,
             out_path.display()
         );
         println!("  (open with QuickTime / afplay to hear it)");

@@ -1,5 +1,12 @@
 # tebis — Voice Bridge Design (STT + TTS)
 
+> **📜 HISTORICAL** — This document captures the Phase 0–4a design as it was
+> when the voice bridge was first planned. Several sections (cloud providers,
+> whisper-server sidecar, initial TTS plans) were pivoted during
+> implementation. The execution source-of-truth now lives in `PLAN.md`, and
+> the latest design rationale lives in `PLAN-KOKORO-TTS.md`. Keep this file
+> for historical context; do not use it as the current reference.
+
 **Status:** Design · updated 2026-04-21 after architectural pivots
 **Scope:** Phone → voice → tmux pipeline. STT is the primary v1 feature. TTS is Phase 4, flag-gated, off by default.
 **Audience:** tebis core; public release targets Mac (M-series) and Linux x86_64 / ARM64.

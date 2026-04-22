@@ -7,12 +7,15 @@
 //! ```text
 //! $XDG_DATA_HOME/tebis/
 //! ├── models/
-//! │   ├── ggml-base.en.bin        (0644, only present if STT enabled)
-//! │   ├── kokoro-v1.0.onnx        (0644, only present if TTS enabled)
-//! │   └── voices-v1.0.bin         (0644, only present if TTS enabled)
+//! │   └── ggml-small.en-q5_1.bin  (0644, only present if STT enabled)
 //! ├── installed.json              (existing — agent_hooks)
 //! └── ...
 //! ```
+//!
+//! TTS models (Kokoro ONNX + tokenizer + per-voice files) have schema
+//! entries in the manifest but are not yet downloaded — Phase 4b is
+//! blocked on Rust ecosystem maturity. See `PLAN.md` and the comment
+//! block in `Cargo.toml`.
 //!
 //! Dirs are created 0700, files 0644. Mirrors the dual-enforcement
 //! pattern from `env_file::atomic_write_0600`: set the mode via

@@ -1,16 +1,18 @@
 //! Voice bridge subsystem: STT (inbound) and TTS (outbound, Phase 4).
 //!
-//! Phase 1 status: local STT works end-to-end via `whisper-rs`; remote
-//! providers (Groq / `OpenAI` / `openai_compat`) are declared in config
-//! but will be wired in Phase 2.
+//! Current state (2026-04-22): STT is local-only via `whisper-rs`
+//! (cross-platform). TTS is macOS-only via `say` shell-out; Linux
+//! currently returns `TtsError::UnsupportedPlatform`. Cross-platform
+//! Kokoro TTS is blocked on Rust ecosystem maturity (see `Cargo.toml`
+//! comment block and `PLAN.md`).
 //!
 //! - `manifest.rs` — embedded JSON of pinned asset URLs + SHAs.
 //! - `cache.rs` — `$XDG_DATA_HOME/tebis/models/` filesystem layout,
 //!   atomic model install, stale-tmp reaping.
 //! - `fetch.rs` — HTTPS streaming download with SHA-256 verification.
-//! - `codec.rs` — OGG/Opus ↔ PCM for Telegram voice (stub, Phase 3).
-//! - `stt/` — whisper-rs in-process. The only STT backend tebis ships.
-//! - `tts/` — Phase 4 (not yet implemented): `any-tts` with Kokoro.
+//! - `codec.rs` — OGG/Opus ↔ PCM for Telegram voice.
+//! - `stt/` — whisper-rs in-process. The only STT backend.
+//! - `tts/` — macOS `say` shell-out (the only shipped backend today).
 //!
 //! See `/PLAN-VOICE.md` for the end-to-end design, including invariant
 //! compliance (CLAUDE.md 4, 5, 6, 9, 10, 12) and the rollout phases.
@@ -137,14 +139,34 @@ impl AudioSubsystem {
             }
         };
 
+        // TTS init is decoupled from STT: a TTS failure must NOT take
+        // STT down with it. Linux currently returns `UnsupportedPlatform`
+        // for TTS — downgrading to `tts = None` keeps STT fully usable
+        // for those users instead of killing both branches.
         let (tts, tts_voice, tts_respond_to_all) = match &cfg.tts {
             None => (None, None, false),
-            Some(tcfg) => {
-                let backend = build_tts(tcfg)
-                    .await
-                    .context("initializing TTS backend")?;
-                (Some(backend), Some(tcfg.voice.clone()), tcfg.respond_to_all)
-            }
+            Some(tcfg) => match build_tts(tcfg).await {
+                Ok(backend) => (
+                    Some(backend),
+                    Some(tcfg.voice.clone()),
+                    tcfg.respond_to_all,
+                ),
+                Err(TtsError::UnsupportedPlatform) => {
+                    tracing::warn!(
+                        "TTS requested but not available on this platform; \
+                         continuing with STT-only. Set TELEGRAM_TTS=off to silence this."
+                    );
+                    (None, None, false)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        "TTS failed to initialize; continuing with STT-only. \
+                         Fix the cause above or set TELEGRAM_TTS=off."
+                    );
+                    (None, None, false)
+                }
+            },
         };
 
         Ok(Arc::new(Self {
@@ -183,17 +205,35 @@ impl AudioSubsystem {
         self.stt_language.as_deref()
     }
 
+    /// Name of the TTS voice currently loaded (e.g. `"Samantha"` for
+    /// the `say` backend). `None` when TTS is disabled OR initialization
+    /// failed (e.g. unsupported platform). The dashboard reads this to
+    /// show real runtime state instead of what the user configured.
+    pub fn tts_voice(&self) -> Option<&str> {
+        self.tts.as_ref().and(self.tts_voice.as_deref())
+    }
+
+    /// Whether every outbound reply also triggers a voice reply, or
+    /// only replies to inbound voice messages. Honors the subsystem's
+    /// actual initialized state — returns `false` when TTS init failed.
+    pub const fn tts_respond_to_all(&self) -> bool {
+        self.tts.is_some() && self.tts_respond_to_all
+    }
+
     /// Synthesize `text` to an OGG/Opus byte blob ready for `sendVoice`.
+    /// Returns the encoded bytes **and** the accurate audio duration in
+    /// seconds (computed from sample count, not guessed from bitrate).
     /// Returns [`AudioError::NotEnabled`] when TTS is off.
-    pub async fn synthesize(&self, text: &str) -> Result<Bytes, AudioError> {
+    pub async fn synthesize(&self, text: &str) -> Result<(Bytes, u32), AudioError> {
         let backend = self
             .tts
             .as_ref()
             .ok_or(AudioError::NotEnabled { feature: "tts" })?;
         let voice = self.tts_voice.as_deref().unwrap_or("");
         let synthesis = backend.synthesize(text, voice).await?;
+        let duration_sec = synthesis.audio_duration_sec();
         let opus = codec::encode_pcm_to_opus(&synthesis.pcm)?;
-        Ok(opus)
+        Ok((opus, duration_sec))
     }
 
     /// Whether the caller should voice-reply to a given inbound payload.

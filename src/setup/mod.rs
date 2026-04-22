@@ -25,7 +25,8 @@ mod ui;
 /// other key is preserved verbatim so users don't lose hand-added
 /// settings (`TELEGRAM_HOOKS_MODE`, `TELEGRAM_NOTIFY`, etc.) when they
 /// re-run `tebis setup`.
-const WIZARD_MANAGED_KEYS: &[&str] = &[
+/// Static keys the wizard always manages.
+const WIZARD_MANAGED_KEYS_ALWAYS: &[&str] = &[
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_ALLOWED_USER",
     "TELEGRAM_ALLOWED_SESSIONS",
@@ -35,15 +36,31 @@ const WIZARD_MANAGED_KEYS: &[&str] = &[
     "INSPECT_PORT",
     "BRIDGE_ENV_FILE",
     "TELEGRAM_HOOKS_MODE",
-    // Voice input (STT). Local whisper.cpp is the only backend —
-    // the wizard writes just the on/off flag + the model choice.
+    // STT is cross-platform — wizard always owns these.
     "TELEGRAM_STT",
     "TELEGRAM_STT_MODEL",
-    // Voice replies (TTS). macOS `say` is the Phase 4 backend.
-    "TELEGRAM_TTS",
-    "TELEGRAM_TTS_VOICE",
-    "TELEGRAM_TTS_RESPOND_TO_ALL",
 ];
+
+/// TTS keys the wizard manages ONLY on platforms where the TTS step
+/// actually runs (macOS only today). On Linux, `step_tts` returns
+/// `Ok(None)` → `build_env_file` writes nothing — so we must not
+/// treat these as managed, or we'd silently drop a user's hand-set
+/// `TELEGRAM_TTS=on` across wizard re-runs.
+#[cfg(target_os = "macos")]
+const WIZARD_MANAGED_KEYS_MACOS_TTS: &[&str] =
+    &["TELEGRAM_TTS", "TELEGRAM_TTS_VOICE", "TELEGRAM_TTS_RESPOND_TO_ALL"];
+
+fn wizard_managed_keys() -> impl Iterator<Item = &'static str> {
+    let always = WIZARD_MANAGED_KEYS_ALWAYS.iter().copied();
+    #[cfg(target_os = "macos")]
+    {
+        always.chain(WIZARD_MANAGED_KEYS_MACOS_TTS.iter().copied())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        always.chain(std::iter::empty())
+    }
+}
 
 /// Autostart triple. Shared between the step that collects it and the
 /// discover pass that reloads it from an existing env file.
@@ -321,7 +338,8 @@ fn build_env_file(
 }
 
 /// Read the existing env file and return every line that sets a key
-/// NOT in `WIZARD_MANAGED_KEYS`. These are user-added settings
+/// NOT in the wizard-managed set (see [`wizard_managed_keys`]). These
+/// are user-added settings
 /// (`TELEGRAM_NOTIFY`, `TELEGRAM_AUTOREPLY`, `NOTIFY_CHAT_ID`, etc.) we
 /// must not silently drop when the wizard rewrites the file.
 ///
@@ -332,7 +350,7 @@ fn extra_lines_to_preserve(env_path: &Path) -> Vec<String> {
     let Ok(content) = fs::read_to_string(env_path) else {
         return Vec::new();
     };
-    let managed: HashSet<&str> = WIZARD_MANAGED_KEYS.iter().copied().collect();
+    let managed: HashSet<&str> = wizard_managed_keys().collect();
     content
         .lines()
         .filter_map(|line| match env_file::parse_kv_line(line) {

@@ -26,13 +26,59 @@ pub struct TtsConfig {
     pub respond_to_all: bool,
 }
 
-/// Synthesis result — PCM + the rate the backend actually produced at.
+/// Synthesis result — PCM + wall-clock synthesis time.
 /// `encode_pcm_to_opus` requires 16 kHz mono; backends that emit other
 /// rates must resample before returning.
 #[derive(Debug)]
 pub struct Synthesis {
     pub pcm: Vec<f32>,
+    /// Wall-clock milliseconds spent in the backend's synthesize call.
     pub duration_ms: u32,
+}
+
+impl Synthesis {
+    /// Actual audio duration in seconds, computed from sample count at
+    /// 16 kHz mono. Used by the bridge to send an accurate `duration`
+    /// field with `sendVoice` so Telegram displays the right length on
+    /// the waveform bubble (beats guessing from byte count).
+    #[must_use]
+    pub fn audio_duration_sec(&self) -> u32 {
+        // PCM is always 16 kHz mono by contract (backend resamples).
+        u32::try_from(self.pcm.len() / 16_000).unwrap_or(u32::MAX)
+    }
+}
+
+#[cfg(test)]
+mod synthesis_tests {
+    use super::Synthesis;
+
+    #[test]
+    fn audio_duration_floors_to_whole_second() {
+        // 23_999 samples at 16 kHz = 1.499 s → 1 second floored.
+        let s = Synthesis {
+            pcm: vec![0.0; 23_999],
+            duration_ms: 0,
+        };
+        assert_eq!(s.audio_duration_sec(), 1);
+    }
+
+    #[test]
+    fn audio_duration_exact_seconds() {
+        let s = Synthesis {
+            pcm: vec![0.0; 32_000],
+            duration_ms: 0,
+        };
+        assert_eq!(s.audio_duration_sec(), 2);
+    }
+
+    #[test]
+    fn audio_duration_empty_is_zero() {
+        let s = Synthesis {
+            pcm: Vec::new(),
+            duration_ms: 0,
+        };
+        assert_eq!(s.audio_duration_sec(), 0);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

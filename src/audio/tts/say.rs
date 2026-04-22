@@ -152,7 +152,16 @@ fn parse_le_i16_wav(bytes: &[u8]) -> Result<Vec<f32>, TtsError> {
             bytes[cursor + 7],
         ]) as usize;
         let body_start = cursor + 8;
-        let body_end = body_start + chunk_size;
+        // Checked arithmetic: a malicious or corrupted WAV with
+        // `chunk_size = u32::MAX` could otherwise overflow `usize` on
+        // 32-bit targets (release has `overflow-checks = true`, which
+        // would panic). `say` is our producer today so the risk is
+        // low, but defensive arithmetic costs nothing.
+        let Some(body_end) = body_start.checked_add(chunk_size) else {
+            return Err(TtsError::Synthesis(
+                "WAV chunk size overflow — file is malformed".to_string(),
+            ));
+        };
         if body_end > bytes.len() {
             return Err(TtsError::Synthesis(format!(
                 "WAV chunk {:?} runs past end of file",

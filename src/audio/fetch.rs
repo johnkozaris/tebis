@@ -279,7 +279,13 @@ impl FetchClient {
                     match frame {
                         None => break,  // clean EOF
                         Some(Err(e)) => {
-                            return Err(FetchError::Network(e.to_string()));
+                            // Body-frame errors from hyper can in theory carry URIs
+                            // in their cause chain. HF URLs don't have secrets, but
+                            // invariant 6 is uniform — route through the same
+                            // substring-redaction used for request-level errors.
+                            return Err(FetchError::Network(redact_hyper_error_string(
+                                &e.to_string(),
+                            )));
                         }
                         Some(Ok(f)) => {
                             if let Ok(chunk) = f.into_data() {
@@ -360,6 +366,19 @@ impl Write for TeeWriter {
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
     }
+}
+
+/// Generic-string equivalent of `telegram::redact_network_error` — matches
+/// the same substrings ("/bot", "api.telegram.org") that indicate a leaked
+/// bot-token URL, and swaps them for a placeholder. The real
+/// `redact_network_error` consumes a `hyper_util::client::legacy::Error`;
+/// body-frame errors come through as `hyper::Error`, which has no `.source()`
+/// chain compatible with that helper. This shim keeps invariant 6 uniform.
+fn redact_hyper_error_string(s: &str) -> String {
+    if s.contains("/bot") || s.contains("api.telegram.org") {
+        return "<redacted network error>".to_string();
+    }
+    s.to_string()
 }
 
 /// Lowercase hex of bytes. 32-byte SHA-256 digest → 64 hex chars.

@@ -56,14 +56,14 @@ async fn main() -> Result<()> {
     ] {
         let char_count = text.chars().count();
         let t0 = Instant::now();
-        let oga = audio.synthesize(text).await?;
+        let (oga, duration_sec) = audio.synthesize(text).await?;
         let elapsed = t0.elapsed();
         // Precision loss on the cast is fine — these are display numbers
         // for a dev-only bench, not a measurement pipeline.
         #[allow(clippy::cast_precision_loss)]
         let us_per_char = (elapsed.as_micros() as f64) / (char_count as f64);
         println!(
-            "{label}: {elapsed:.2?} · {oga_kb} KB OGG · {us_per_char:.1} µs/char",
+            "{label}: {elapsed:.2?} · {oga_kb} KB · {duration_sec} s · {us_per_char:.1} µs/char",
             elapsed = elapsed,
             oga_kb = oga.len() / 1024,
         );

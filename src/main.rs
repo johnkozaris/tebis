@@ -325,19 +325,21 @@ async fn run_bridge() -> Result<()> {
     // vs download failed) rather than guessing from config alone.
     let inspect_snapshot = if inspect_port.is_some() {
         let tmux_ver = inspect::tmux_version().await;
-        // Voice section shows when at least one of STT/TTS is enabled.
+        // Voice section reflects ACTUAL runtime state, not config
+        // intent. On Linux with TELEGRAM_TTS=on, TTS init fails with
+        // UnsupportedPlatform and the subsystem continues STT-only —
+        // the dashboard should say "TTS disabled" for that user, not
+        // dangle a voice name that isn't actually synthesizing.
         let voice_info = if config.audio.any_enabled() {
             Some(inspect::VoiceInfo {
                 stt_model: config.audio.stt.as_ref().map(|s| s.model.clone()),
                 stt_ready: audio
                     .as_ref()
                     .is_some_and(|a| a.stt_model_name().is_some()),
-                tts_voice: config.audio.tts.as_ref().map(|t| t.voice.clone()),
-                tts_scope: config
-                    .audio
-                    .tts
+                tts_voice: audio.as_ref().and_then(|a| a.tts_voice().map(String::from)),
+                tts_scope: audio
                     .as_ref()
-                    .map_or("", |t| if t.respond_to_all { "all" } else { "voice-only" }),
+                    .map_or("", |a| if a.tts_respond_to_all() { "all" } else { "voice-only" }),
             })
         } else {
             None

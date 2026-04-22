@@ -143,6 +143,16 @@ pub fn encode_pcm_to_opus(pcm: &[f32]) -> Result<Bytes, CodecError> {
 
     let mut encoder = OpusEncoder::new(OUTPUT_RATE, Channels::Mono, Application::Voip)
         .map_err(|e| CodecError::Encode(format!("encoder init: {e}")))?;
+    // Per RFC 7845 §5.1, OpusHead preskip should be the encoder's
+    // lookahead so decoders trim the warmup pop at the start of the
+    // first frame. libopus reports this via opus_encoder_ctl;
+    // `get_lookahead` is the opus crate's safe wrapper. Fallback to 0
+    // if the call fails (no ambient audio issue — just a small click).
+    let preskip: u16 = encoder
+        .get_lookahead()
+        .ok()
+        .and_then(|n| u16::try_from(n).ok())
+        .unwrap_or(0);
 
     // Pad the input to a whole number of frames. Telegram tolerates the
     // ~20 ms of trailing silence, and Opus needs fixed-size input.
@@ -169,14 +179,15 @@ pub fn encode_pcm_to_opus(pcm: &[f32]) -> Result<Bytes, CodecError> {
     }
 
     // Mux into an OGG container. Serial number is arbitrary (Telegram
-    // ignores it but requires a unique stream-serial in the page header);
-    // a timestamp-derived 32-bit value is fine.
-    let serial: u32 = u32::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_micros() & 0xFFFF_FFFF),
-    )
-    .unwrap_or(0xC0FF_EE42);
+    // ignores it but the OGG spec requires a unique stream-serial in
+    // the page header); low 32 bits of the current micros work.
+    // Casting after the `& 0xFFFF_FFFF` mask is infallible — we use
+    // `as u32` rather than `try_from` so the dead `unwrap_or` fallback
+    // goes away.
+    #[allow(clippy::cast_possible_truncation, reason = "masked to 32 bits explicitly")]
+    let serial: u32 = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() & 0xFFFF_FFFF)) as u32;
 
     let mut out: Vec<u8> = Vec::with_capacity(total_samples * 2 / 10);
     {
@@ -187,9 +198,9 @@ pub fn encode_pcm_to_opus(pcm: &[f32]) -> Result<Bytes, CodecError> {
         // channel_mapping_family(0).
         let mut head = Vec::with_capacity(19);
         head.extend_from_slice(b"OpusHead");
-        head.push(1);
-        head.push(1);
-        head.extend_from_slice(&0u16.to_le_bytes());
+        head.push(1); // version
+        head.push(1); // channel count: mono
+        head.extend_from_slice(&preskip.to_le_bytes());
         head.extend_from_slice(&OUTPUT_RATE.to_le_bytes());
         head.extend_from_slice(&0i16.to_le_bytes());
         head.push(0);
@@ -210,11 +221,14 @@ pub fn encode_pcm_to_opus(pcm: &[f32]) -> Result<Bytes, CodecError> {
         // regardless of encoded rate — multiply our frame size by 3 to
         // convert 16 kHz samples to 48 kHz granules.
         let granule_per_frame = (FRAME_SAMPLES as u64) * 48 / u64::from(OUTPUT_RATE);
-        let last_idx = packets.len() - 1;
         let mut granule: u64 = 0;
-        for (i, pkt) in packets.into_iter().enumerate() {
+        // Use Peekable to identify the final packet without `len() - 1`
+        // arithmetic (which would panic on empty `packets`, even though
+        // the `pcm.is_empty()` check above already guarantees non-empty).
+        let mut iter = packets.into_iter().peekable();
+        while let Some(pkt) = iter.next() {
             granule += granule_per_frame;
-            let end_kind = if i == last_idx {
+            let end_kind = if iter.peek().is_none() {
                 ogg::PacketWriteEndInfo::EndStream
             } else {
                 ogg::PacketWriteEndInfo::NormalPacket

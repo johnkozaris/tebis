@@ -128,8 +128,8 @@ impl Manifest {
         if m.sha256.starts_with(PLACEHOLDER_PREFIX) {
             bail!(
                 "STT model `{name}` has placeholder SHA — pin the real hash in \
-                 src/audio/manifest.json before enabling `local` STT, or switch to \
-                 a remote provider (`groq`, `openai`, `openai_compat`)"
+                 src/audio/manifest.json (run `scripts/pin-model-shas.sh --apply`) \
+                 before enabling local STT."
             );
         }
         Ok(())

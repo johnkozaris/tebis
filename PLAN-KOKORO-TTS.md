@@ -1,5 +1,13 @@
 # Phase 4b — Kokoro q4 TTS Implementation Plan
 
+> **📜 DESIGN REFERENCE** — This document is the design rationale for
+> cross-platform Kokoro TTS. Execution was attempted and is currently
+> **blocked** on Rust ecosystem issues (see `Cargo.toml` comment block
+> and `PLAN.md`). All four candidate Kokoro crates fail to build in
+> this workspace as of 2026-04-22. The live execution status is in
+> `PLAN.md`; this file stays as the go-to reference for when the
+> ecosystem stabilizes and implementation can resume.
+
 **Status:** Design · 2026-04-22 · supersedes the `say`-based Phase 4 in `PLAN-VOICE.md`
 **Scope:** Replace macOS `say` with cross-platform Kokoro q4 TTS. Close the Linux TTS gap. Keep `say` as an optional Mac-only fallback.
 

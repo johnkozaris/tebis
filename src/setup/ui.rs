@@ -29,9 +29,14 @@ pub(super) fn print_welcome() {
     println!();
 }
 
+/// Total wizard steps. Update when steps are added/removed so the
+/// "Step N of TOTAL" banner stays accurate. On non-macOS the TTS step
+/// (step 8) is a no-op; we print the banner anyway for consistency.
+const WIZARD_STEP_COUNT: u8 = 8;
+
 pub(super) fn step_header(n: u8, title: &str) {
     let width = text_width();
-    let prefix = format!("───── Step {n} of 6 · ");
+    let prefix = format!("───── Step {n} of {WIZARD_STEP_COUNT} · ");
     let suffix = " ";
     let prefix_w = measure_text_width(&prefix);
     let title_w = measure_text_width(title);

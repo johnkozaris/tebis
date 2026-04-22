@@ -145,13 +145,25 @@ pub async fn handle_update(
                 tracing::error!(err = %e, "Failed to send response");
             }
             // TTS: if the user's inbound was a voice note (or they opted
-            // into `respond_to_all`), also send a voice reply. The
-            // synthesize + sendVoice is best-effort — a failure here
-            // does NOT retry or escalate; the user already has the text.
+            // into `respond_to_all`), also send a voice reply. Spawned on
+            // the tracker so the handler can release its permit
+            // immediately — `say` + sendVoice can take seconds, and we
+            // don't want to starve the next user's handler waiting for
+            // it. Best-effort: failure only warns, since the user
+            // already has the text.
             if let Some(audio) = ctx.audio.as_ref()
                 && audio.should_tts_reply(inbound_was_voice)
             {
-                synthesize_and_send_voice(&ctx, chat_id, &body).await;
+                let tg = ctx.tg.clone();
+                let metrics = ctx.metrics.clone();
+                let audio = audio.clone();
+                let body = body.clone();
+                ctx.tracker.spawn(async move {
+                    synthesize_and_send_voice_detached(
+                        &tg, &metrics, &audio, chat_id, &body,
+                    )
+                    .await;
+                });
             }
         }
         Response::ReactSuccess => {
@@ -276,6 +288,21 @@ async fn transcribe_voice(
         .await
         .map_err(|e| format!("Voice download failed: {e}"))?;
 
+    // Post-download size check. The pre-download guard above uses
+    // `size_bytes` from the `Voice`/`Audio` Bot API field — which is
+    // `Option<u32>` and can be absent entirely. When absent we still
+    // get the actual bytes from `download_file` (bounded at
+    // MAX_FILE_DOWNLOAD_BYTES=50 MiB) but a user who tightened
+    // TELEGRAM_STT_MAX_BYTES expects THEIR cap to apply. Enforce here.
+    let actual_bytes = u32::try_from(oga_bytes.len()).unwrap_or(u32::MAX);
+    if actual_bytes > limits.max_bytes {
+        return Err(format!(
+            "Voice file is too large ({actual} B > {cap} B cap). Raise TELEGRAM_STT_MAX_BYTES to accept it.",
+            actual = actual_bytes,
+            cap = limits.max_bytes,
+        ));
+    }
+
     // Metadata-only log. Never the transcript.
     tracing::debug!(
         chat_id,
@@ -350,29 +377,36 @@ async fn transcribe_voice(
 /// and friends aloud. Tebis's outbound text is simple — wrapping in
 /// `<pre>`/`<code>` for the /read path is the main offender — so a
 /// straightforward "drop angle-bracket tags" pass suffices.
-async fn synthesize_and_send_voice(ctx: &HandlerContext, chat_id: i64, body: &str) {
-    let Some(audio) = ctx.audio.as_ref() else {
-        return;
-    };
+///
+/// Takes primitive shared handles rather than `&HandlerContext` because
+/// it runs on the task tracker after the parent handler has already
+/// returned and released its concurrency permit — by design. See the
+/// spawn-site in `handle_update`.
+async fn synthesize_and_send_voice_detached(
+    tg: &crate::telegram::TelegramClient,
+    metrics: &crate::metrics::Metrics,
+    audio: &crate::audio::AudioSubsystem,
+    chat_id: i64,
+    body: &str,
+) {
     let plain = strip_html_for_tts(body);
     if plain.trim().is_empty() {
         return;
     }
-    let voice_bytes = match audio.synthesize(&plain).await {
-        Ok(b) => b,
+    let (voice_bytes, duration_sec) = match audio.synthesize(&plain).await {
+        Ok(pair) => pair,
         Err(e) => {
-            ctx.metrics.record_tts_failure();
+            metrics.record_tts_failure();
             tracing::warn!(err = %e, "TTS synthesis failed; text reply already sent");
             return;
         }
     };
-    let duration_guess = u32::try_from(voice_bytes.len() / (2_000)).unwrap_or(0);
-    if let Err(e) = ctx.tg.send_voice(chat_id, voice_bytes, Some(duration_guess)).await {
-        ctx.metrics.record_tts_failure();
+    if let Err(e) = tg.send_voice(chat_id, voice_bytes, Some(duration_sec)).await {
+        metrics.record_tts_failure();
         tracing::warn!(err = %e, "sendVoice failed; text reply already sent");
         return;
     }
-    ctx.metrics.record_tts_success();
+    metrics.record_tts_success();
 }
 
 /// Minimal HTML-strip for TTS input. The bodies we send go through
@@ -388,13 +422,25 @@ fn strip_html_for_tts(body: &str) -> String {
         .replace("</pre>", "")
         .replace("<code>", "")
         .replace("</code>", "");
-    no_tags
+    // Decode entities. `&amp;` MUST come last: consider input
+    // "&amp;lt;" (which should decode to literal "&lt;"). If we
+    // decoded `&lt;` first we'd double-decode to "&<". Sentinel
+    // approach: swap `&amp;` for U+0001 first, do the others, then
+    // swap the sentinel back to `&`. U+0001 Start-of-Heading is a C0
+    // control char already stripped by `sanitize::escape_html` on
+    // inbound data, so there's no risk of collision with user text.
+    let step1 = no_tags.replace("&amp;", &AMP_SENTINEL.to_string());
+    let step2 = step1
         .replace("&lt;", "<")
         .replace("&gt;", ">")
-        .replace("&amp;", "&")
         .replace("&quot;", "\"")
-        .replace("&#39;", "'")
+        .replace("&#39;", "'");
+    step2.replace(AMP_SENTINEL, "&")
 }
+
+/// Placeholder used by `strip_html_for_tts` to protect `&amp;` from
+/// double-decoding (see function-level comment).
+const AMP_SENTINEL: char = '\u{0001}';
 
 /// Maximum wall-clock the typing indicator will refresh on the
 /// hook-driven reply path. Once the real reply arrives (via the
@@ -411,3 +457,46 @@ fn strip_html_for_tts(body: &str) -> String {
 ///   hook fires — we just don't drive typing past the cap. A user
 ///   who wants confirmation can `/read` the pane or `/status`.
 const HOOK_TYPING_CAP: std::time::Duration = std::time::Duration::from_secs(20);
+
+#[cfg(test)]
+mod strip_html_tests {
+    use super::strip_html_for_tts;
+
+    #[test]
+    fn strips_pre_and_code_tags() {
+        assert_eq!(
+            strip_html_for_tts("<pre>hello</pre>"),
+            "hello"
+        );
+        assert_eq!(
+            strip_html_for_tts("before <code>mid</code> after"),
+            "before mid after"
+        );
+    }
+
+    #[test]
+    fn decodes_basic_entities() {
+        assert_eq!(strip_html_for_tts("&lt;tag&gt;"), "<tag>");
+        assert_eq!(strip_html_for_tts("&quot;quoted&quot;"), "\"quoted\"");
+        assert_eq!(strip_html_for_tts("it&#39;s"), "it's");
+        assert_eq!(strip_html_for_tts("a &amp; b"), "a & b");
+    }
+
+    #[test]
+    fn amp_decoded_last_avoids_double_decode() {
+        // "&amp;lt;" represents the literal text `&lt;`, not `<`. If we
+        // decoded &amp; before &lt; we'd get `<` (wrong). The sentinel
+        // pass preserves the correct literal.
+        assert_eq!(strip_html_for_tts("&amp;lt;"), "&lt;");
+        assert_eq!(strip_html_for_tts("&amp;amp;"), "&amp;");
+    }
+
+    #[test]
+    fn handles_empty_and_unescaped() {
+        assert_eq!(strip_html_for_tts(""), "");
+        assert_eq!(
+            strip_html_for_tts("plain text with & and < intact"),
+            "plain text with & and < intact"
+        );
+    }
+}
