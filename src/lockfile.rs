@@ -138,19 +138,18 @@ impl Drop for LockFile {
 /// that fails with `EWOULDBLOCK` do we read the pid from the file. Just
 /// checking `kill(pid, 0)` on a pid-from-file would produce false
 /// positives when the pid has been recycled to an unrelated process.
+///
+/// A stale pidfile left over from a crashed prior run is not cleaned up
+/// here — doing so would race with a concurrent `acquire` on a
+/// different inode (we hold the flock but not an exclusive-open
+/// guarantee). The next `acquire` call naturally reuses the file:
+/// `set_len(0)` + `writeln!` overwrite the stale pid.
 pub fn active_holder(path: &Path) -> Option<u32> {
     let file = OpenOptions::new().read(true).open(path).ok()?;
 
     // SAFETY: flock(2) with a valid fd and valid flags is sound.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
-        // We acquired the lock → nobody was holding it. Remove the
-        // stale file so a future `tebis status` doesn't see an
-        // orphaned pid from a crashed prior run. Safe here: we held
-        // (briefly) the exclusive flock, and any parallel checker
-        // racing with us would also acquire-and-then-lose the lock,
-        // reaching the same conclusion.
-        let _ = std::fs::remove_file(path);
         return None;
     }
     let errno = std::io::Error::last_os_error().raw_os_error();
@@ -201,17 +200,16 @@ mod tests {
     }
 
     #[test]
-    fn active_holder_cleans_stale_file() {
-        let path = unique_tmp_path("stale-cleanup");
-        // Create an unlocked file with a fake pid — simulates a crashed
-        // prior run.
+    fn active_holder_returns_none_for_unlocked_file() {
+        let path = unique_tmp_path("stale-probe");
+        // Simulate a crashed prior run: the pidfile exists on disk but
+        // no process holds the flock.
         std::fs::write(&path, "99999\n").expect("write stale pidfile");
         assert!(path.exists());
         assert_eq!(active_holder(&path), None, "no one holds the lock");
-        assert!(
-            !path.exists(),
-            "active_holder should sweep the stale pidfile"
-        );
+        // File is intentionally NOT cleaned up here — see doc on
+        // active_holder for rationale. Next `acquire` will overwrite it.
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

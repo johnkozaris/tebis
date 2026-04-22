@@ -540,4 +540,33 @@ mod strip_html_tests {
             assert_eq!(round, input, "round-trip failed for {input:?}");
         }
     }
+
+    /// Real-body roundtrip: simulate the path used by error / code
+    /// responses where the escaped payload is wrapped in `<pre>...</pre>`
+    /// before send. The stripper must drop the wrapper tags and decode
+    /// entities so TTS speaks the original text, not `"less-than pre
+    /// greater-than"`. If someone adds a new wrapper tag (e.g. `<b>`)
+    /// without updating `strip_html_for_tts`, this test flags it.
+    #[test]
+    fn wrapped_body_roundtrips_to_original() {
+        for raw in [
+            "a & b",
+            "error: 1 < 2",
+            "multi\nline\npayload",
+            "\"quoted\" & 'apos'",
+        ] {
+            let escaped = crate::sanitize::escape_html(raw);
+            let wrapped = format!("<pre>{escaped}</pre>");
+            let spoken = strip_html_for_tts(&wrapped);
+            assert_eq!(spoken, raw, "pre-wrapper roundtrip failed for {raw:?}");
+
+            let code_wrapped = format!("prefix <code>{escaped}</code> suffix");
+            let spoken = strip_html_for_tts(&code_wrapped);
+            assert_eq!(
+                spoken,
+                format!("prefix {raw} suffix"),
+                "code-wrapper roundtrip failed for {raw:?}"
+            );
+        }
+    }
 }

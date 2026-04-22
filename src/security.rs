@@ -37,10 +37,17 @@ pub fn is_authorized(update: &Update, allowed_user_id: i64) -> bool {
     true
 }
 
+/// Soft cap on the `SEEN` table. At 1024 entries we sweep anything older
+/// than the cooldown window — so a cold start during a scan-bomb still
+/// logs, and steady-state memory is bounded. Plain full-table eviction
+/// at the cap would be fine; the cooldown filter is cheap and keeps
+/// "currently suppressing" entries around.
+const SEEN_SOFT_CAP: usize = 1024;
+
 /// Returns true if we haven't logged a rejection from `user_id` within
-/// [`UNAUTHORIZED_LOG_COOLDOWN`]. Map is bounded by real-world
-/// attacker count (one entry per probing user id); no eviction needed
-/// because entries stay small and the table self-prunes on restart.
+/// [`UNAUTHORIZED_LOG_COOLDOWN`]. The map is pruned when it grows past
+/// [`SEEN_SOFT_CAP`]: an attacker rotating through fresh spoofed ids
+/// would otherwise add one entry per probe for the process lifetime.
 fn should_log_unauthorized(user_id: i64) -> bool {
     static SEEN: OnceLock<Mutex<HashMap<i64, Instant>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
@@ -50,6 +57,9 @@ fn should_log_unauthorized(user_id: i64) -> bool {
         return true;
     };
     let now = Instant::now();
+    if guard.len() >= SEEN_SOFT_CAP {
+        guard.retain(|_, last| now.duration_since(*last) < UNAUTHORIZED_LOG_COOLDOWN);
+    }
     match guard.get(&user_id) {
         Some(last) if now.duration_since(*last) < UNAUTHORIZED_LOG_COOLDOWN => false,
         _ => {

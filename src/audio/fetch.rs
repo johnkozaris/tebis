@@ -214,9 +214,16 @@ impl FetchClient {
                 .body(Full::<Bytes>::new(Bytes::new()))
                 .map_err(|e| FetchError::Network(e.to_string()))?;
 
-            let resp = self.client.request(req).await.map_err(|e| {
-                FetchError::Network(crate::telegram::redact_network_error(&e))
-            })?;
+            // Listen for cancel here too, not just during body streaming:
+            // a misbehaving server that emits MAX_REDIRECTS 302s would
+            // otherwise burn ~5× connect_timeout before drain.
+            let resp = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(FetchError::Cancelled),
+                r = self.client.request(req) => r.map_err(|e| {
+                    FetchError::Network(crate::telegram::redact_network_error(&e))
+                })?,
+            };
             let status = resp.status();
 
             if status.is_redirection() {

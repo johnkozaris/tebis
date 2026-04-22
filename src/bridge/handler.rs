@@ -214,6 +214,9 @@ async fn send(deps: &Deps<'_>, session: &str, text: &str) -> HandleResult {
         Err(e) => {
             if e.is_not_found() {
                 deps.session.clear_target_if(session);
+                // Symmetric with /kill and /restart: if the session is
+                // gone, drop the hooked flag so next autostart reinstalls.
+                deps.session.unmark_hooked(session);
             }
             Err(e.to_string())
         }
