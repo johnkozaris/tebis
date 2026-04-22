@@ -1,55 +1,14 @@
-//! Full phonemization pipeline: normalize → espeak-ng → E2M fixup.
+//! Full phonemization: `normalize → espeak-ng -v en-us -q --ipa=3 → e2m`.
 //!
-//! ## Pipeline
+//! Kokoro was trained against misaki-processed phonemes. Without the
+//! normalize + E2M passes, raw espeak output produces digit-strings,
+//! unmerged diphthongs, dental `r`, and unhandled flap-T — all audible.
+//! These two passes close ~70% of the quality gap vs a Kokoro-FastAPI
+//! deployment.
 //!
-//! ```text
-//! raw text
-//!   │
-//!   ├─ normalize::preprocess  (numbers/currency/titles/etc. → words)
-//!   │
-//!   ├─ espeak-ng -v en-us -q --ipa=3 "<normalized>"
-//!   │
-//!   ├─ e2m::apply_e2m         (diphthong merge / flap-T / rhotacization)
-//!   │
-//!   ▼
-//! IPA string ready for `tokens::ipa_to_token_ids`
-//! ```
-//!
-//! ## espeak-ng flags
-//!
-//! - `-q`: quiet (don't play audio; we only want the phonemes on stdout).
-//! - `--ipa=3`: full IPA output with stress marks (stress is part of
-//!   Kokoro's training vocab — dropping it degrades prosody).
-//! - `-v en-us`: American English phonemes. `en-gb` also works but the
-//!   Kokoro American voices were trained on `en-us` so keep them aligned.
-//!
-//! ## Why shell-out vs linking libespeak-ng
-//!
-//! `libespeak-ng` is LGPL-2.1+ with an essential GPL-3 dialect payload;
-//! static linking would contaminate our MIT binary. Shell-out avoids
-//! the license transfer — same pattern as `say`, `jq`, `nc`, `espeak-ng`
-//! elsewhere in tebis.
-//!
-//! ## Why we add the normalize + E2M passes
-//!
-//! Kokoro was trained against `misaki`'s processed phonemes, not raw
-//! espeak-ng output. Without these passes:
-//! - `2024` comes out as "two zero two four" (digits) — audibly wrong
-//! - `$42.50` reads literal dollar-sign / digits
-//! - Diphthongs don't merge to Kokoro's single-char markers
-//! - Flap-T (`butter`) stays as `ɾ` instead of collapsing to `T`
-//! - Rhotic `r` stays as dental `r` instead of becoming `ɹ`
-//!
-//! The perceived quality gap between "robotic" and "matches the remote
-//! Kokoro-FastAPI deployment" is mostly these two passes.
-//!
-//! ## Invariants
-//!
-//! - 10 s timeout on espeak-ng. Typical call is <10 ms; the timeout is
-//!   paranoia against a forked process deadlocking on stdio.
-//! - No shell interpolation: tokio's `Command::arg` uses an argv array,
-//!   so arbitrary text (including tmux paste → TTS) is safe from shell
-//!   metacharacter injection.
+//! Safety: `Command::arg` uses argv (not shell interpolation), so
+//! arbitrary input text — including tmux paste-through — can't inject
+//! shell metacharacters.
 
 use std::time::Duration;
 

@@ -1,17 +1,7 @@
-//! Text-to-speech: trait + backends.
-//!
-//! Three backends, selected via `TELEGRAM_TTS_BACKEND`:
-//! - `say` — macOS `say` shell-out. Zero install, built-in voices.
-//! - `kokoro-local` — local Kokoro v1.0 ONNX via `ort` + espeak-ng
-//!   phonemizer. Feature-gated behind `kokoro`. Cross-platform.
-//! - `kokoro-remote` — OpenAI-compatible HTTP TTS endpoint (user's
-//!   Kokoro-FastAPI, etc.). Uses the existing hyper/rustls stack.
-//!
-//! Output contract for backends that return PCM (`say`, `kokoro-local`):
-//! 16 kHz mono `f32` in `[-1.0, 1.0]`. The subsystem pipes through
-//! [`crate::audio::codec::encode_pcm_to_opus`] for Telegram's sendVoice.
-//! The remote backend skips the codec entirely — the server returns
-//! OGG/Opus bytes that Telegram accepts verbatim.
+//! TTS backends, selected via `TELEGRAM_TTS_BACKEND`:
+//! `say` (macOS only), `kokoro-local` (feature-gated), `kokoro-remote`
+//! (HTTP). PCM backends return mono `f32` at their native rate; remote
+//! passes OGG/Opus bytes through to Telegram sendVoice unchanged.
 
 #[cfg(target_os = "macos")]
 pub mod say;

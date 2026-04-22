@@ -1,20 +1,8 @@
-//! `espeak-ng` detection, package-manager probe, and interactive
-//! install flow.
+//! `espeak-ng` detection, package-manager probe, interactive install.
 //!
-//! Two audiences:
-//! - The wizard (`setup::steps::step_tts`) — interactive prompts,
-//!   streamed install output, user confirmation gates.
-//! - The audio subsystem (`audio::tts::kokoro`) — non-interactive
-//!   [`probe_espeak_ng`] at startup, to decide whether to bring up
-//!   the Kokoro local backend. On missing espeak-ng the caller
-//!   downgrades to text-only with a log warning (fail-open).
-//!
-//! Why espeak-ng specifically: it's the universal G2P (grapheme-to-
-//! phoneme) backend that Kokoro, Piper, VITS, and every other modern
-//! open-weight TTS model was trained against. A pure-Rust replacement
-//! doesn't exist as of April 2026; the Python ecosystem also just
-//! wraps espeak-ng. See `PLAN-TTS-V2.md` for the dep-discipline
-//! reasoning (shell out vs link → keeps us MIT-clean).
+//! Two callers: the wizard (`step_tts`, interactive) and the audio
+//! subsystem (startup probe, non-interactive — fail-open to text-only
+//! if missing).
 
 use std::path::PathBuf;
 use std::process::Command;

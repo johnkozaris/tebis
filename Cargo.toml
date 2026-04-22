@@ -1,12 +1,6 @@
-# The repo is a Cargo workspace. `tebis` (the daemon) is the root
-# package, and `crates/tebis-tts-kokoro/` holds the optional Kokoro
-# local TTS backend as a separate crate.
-#
-# Why a separate crate: dropping Kokoro — if we ever want to ship only
-# macOS `say` + remote HTTP — becomes a one-line change in this
-# `Cargo.toml` (remove the path dep + feature), not a surgical delete
-# across a module tree. Conversely, reusing the Kokoro backend from
-# another project is just `cargo add tebis-tts-kokoro`.
+# Root workspace. `tebis` (the daemon) is the root package;
+# `crates/tebis-tts-kokoro/` is an optional separate crate so dropping
+# Kokoro is a one-line change here.
 [workspace]
 members = [".", "crates/tebis-tts-kokoro"]
 
@@ -22,11 +16,6 @@ version = "0.1.1"
 [dependencies]
 anyhow = "1"
 bytes = "1"
-# TUI primitives for `tebis setup` — prompts, colored headers, validators.
-# Only used by the setup wizard and the run-time banner; adds ~10 small
-# crates (console+unicode-width family) to the graph. Skipped entirely
-# when building `--no-default-features`, but defaults stay on because
-# setup is the primary onboarding path.
 console = "0.16.3"
 dialoguer = {version = "0.12", default-features = false}
 http-body-util = "0.1.3"
@@ -34,10 +23,8 @@ hyper = {version = "1.9.0", default-features = false, features = ["client", "htt
 hyper-rustls = {version = "0.27.9", default-features = false, features = ["ring", "http1", "webpki-tokio", "tls12"]}
 hyper-util = {version = "0.1.20", default-features = false, features = ["client", "client-legacy", "http1", "tokio"]}
 libc = "0.2.185"
-# Direct dep so `ring::digest::SHA256` is available to the audio subsystem
-# for streaming SHA-256 verification during model downloads. `ring` is
-# already in the graph transitively via `hyper-rustls`/`rustls` (same
-# version 0.17), so this adds zero binary size — just API access.
+# Already transitive via hyper-rustls/rustls — made direct so
+# `ring::digest::SHA256` is usable without relying on re-exports.
 ring = "0.17"
 rustls = {version = "0.23.38", default-features = false, features = ["ring", "std", "tls12", "logging"]}
 secrecy = "0.10.3"
@@ -49,19 +36,10 @@ tokio = {version = "1.52.1", features = ["rt-multi-thread", "macros", "signal", 
 tokio-util = {version = "0.7.18", features = ["rt"]}
 tracing = "0.1.44"
 tracing-subscriber = {version = "0.3.23", features = ["fmt", "env-filter"]}
-
-# OGG container + Opus decode for Telegram voice messages. `ogg` is
-# pure-Rust (Xiph's OGG demuxer, RustAudio ecosystem); `opus` is a
-# safe Rust binding to libopus. libopus gets statically linked on
-# macOS/Windows by audiopus_sys and dynamically on Linux (matches
-# Homebrew / apt conventions). The actual whisper-rs input format is
-# 16 kHz mono f32; we configure the Opus decoder to emit at that
-# rate so Opus's internal resampler handles the 48 kHz → 16 kHz
-# conversion for us.
 ogg = "0.9"
 opus = "0.3"
 
-# whisper-rs is Metal-accelerated on macOS (GPU); CPU on Linux.
+# whisper-rs: Metal GPU on macOS, CPU on Linux.
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = {version = "0.16", default-features = false, features = ["metal"]}
 
@@ -70,16 +48,8 @@ whisper-rs = {version = "0.16", default-features = false}
 
 [features]
 default = []
-# Enables the local Kokoro TTS backend (`TELEGRAM_TTS_BACKEND=kokoro-local`).
-# Pulls the `tebis-tts-kokoro` crate, which transitively drags in
-# `ort` + `ndarray` + `num2words` + `regex` and requires `espeak-ng` +
-# `libonnxruntime` on the host at runtime. Leave off for a
-# remote-only / say-only binary.
 kokoro = ["dep:tebis-tts-kokoro"]
 
-# Local Kokoro backend lives in its own crate so dropping it (or
-# reusing it from another project) is a one-line dep change. See
-# `crates/tebis-tts-kokoro/` for the self-contained implementation.
 [dependencies.tebis-tts-kokoro]
 optional = true
 path = "crates/tebis-tts-kokoro"
@@ -92,7 +62,6 @@ lto = "fat"
 opt-level = 3
 panic = "abort"
 strip = "symbols"
-# Panic on arithmetic overflow in release — a network service silently
-# wrapping an integer is worse than a controlled panic that systemd
-# restarts. CVE-2018-1000810 is the canonical reason this belongs on.
+# A silently-wrapping integer in a network service is worse than a
+# controlled panic that systemd restarts. CVE-2018-1000810.
 overflow-checks = true

@@ -127,17 +127,10 @@ pub fn decode_opus_to_pcm16k(oga_bytes: &[u8]) -> Result<Vec<f32>, CodecError> {
     Ok(out)
 }
 
-/// Encode mono PCM `f32` samples to an OGG/Opus byte blob suitable
-/// for `POST /sendVoice`. 20 ms frames at `VoIP` complexity.
-///
-/// `sample_rate` must be one of Opus's native rates: 8000, 12000,
-/// 16000, 24000, or 48000 Hz. Kokoro emits 24 kHz; the macOS `say`
-/// backend emits 16 kHz. Encoding at the source rate avoids our own
-/// (previously aliasing-prone) downsample step — Opus handles the
-/// internal conversion losslessly.
-///
-/// Telegram's voice-message bubble renders OGG/Opus at any native
-/// Opus rate; higher rates / other codecs land as a file attachment.
+/// Encode mono `f32` PCM to OGG/Opus for `sendVoice`. 20 ms frames,
+/// VoIP complexity. `sample_rate` must be a native Opus rate: 8k,
+/// 12k, 16k, 24k, or 48k Hz. Encoding at the source rate dodges the
+/// aliasing we hit when we downsampled in-house.
 pub fn encode_pcm_to_opus(pcm: &[f32], sample_rate: u32) -> Result<Bytes, CodecError> {
     use opus::{Application, Encoder as OpusEncoder};
 

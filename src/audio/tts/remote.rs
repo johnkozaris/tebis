@@ -1,42 +1,13 @@
 //! OpenAI-compatible remote TTS backend.
 //!
-//! Calls `POST <base_url>/v1/audio/speech` with a JSON body:
+//! `POST <base_url>/v1/audio/speech` with `{model, input, voice,
+//! response_format: "opus"}` → `audio/ogg` bytes passed through to
+//! Telegram `sendVoice` verbatim. Duration is extracted by decoding
+//! to PCM at 16 kHz and counting samples.
 //!
-//! ```json
-//! { "model": "<model>", "input": "<text>", "voice": "<voice>",
-//!   "response_format": "opus" }
-//! ```
-//!
-//! Returns `audio/ogg` bytes (OGG-muxed Opus) — the exact container
-//! Telegram `sendVoice` expects, so the bytes passthrough untouched.
-//!
-//! Designed for Kokoro-FastAPI (`remsky/Kokoro-FastAPI`) and any other
-//! OpenAI-TTS-compatible server. Not tested against OpenAI's own hosted
-//! endpoint — that's an intentional non-goal (paid + rate-limited;
-//! see `PLAN-TTS-V2.md`).
-//!
-//! Invariant compliance:
-//! - **6 (redact network errors)**: hyper errors go through
-//!   [`redact_network_error`]; the `RemoteTts` `Debug` redacts URL +
-//!   API key.
-//! - **10 (payload cap + read timeout)**: 10 MiB response cap, 30 s
-//!   body-read timeout separate from the overall request timeout.
-//! - No retries here — audio failures bubble to the bridge's fail-open
-//!   "voice → text" fallback, which is the right layer for that policy.
-//!
-//! Runs on the same hyper + rustls + ring stack as the Telegram client,
-//! so zero new deps.
-//!
-//! The base URL is stored as `SecretString` because operators sometimes
-//! embed tokens in the URL path (e.g. a private `*.hf.space` endpoint
-//! with a shared secret in the path) — we treat it defensively.
-//!
-//! Duration is computed by decoding the response OGG/Opus to PCM and
-//! counting samples at 16 kHz. Reuses [`crate::audio::codec::decode_opus_to_pcm16k`]
-//! rather than writing a separate OGG-page duration walker — the decode
-//! cost (~10 ms for a typical reply) is negligible next to the network
-//! round-trip, and we share the same test coverage as the inbound STT
-//! path.
+//! Invariants: error strings go through [`redact_network_error`] and
+//! `Debug` redacts URL + API key (CLAUDE.md #6); 10 MiB response cap
+//! + 30 s body-read timeout (#10). No retries — caller fails open.
 
 use std::time::Duration;
 

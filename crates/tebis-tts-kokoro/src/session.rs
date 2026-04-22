@@ -1,15 +1,13 @@
-//! `ort::Session` lifecycle + the synthesis pipeline.
+//! `ort::Session` lifecycle + synthesis pipeline.
 //!
-//! One [`KokoroTts`] owns one `Session`, shared across calls via
-//! `Arc<Mutex<...>>`. ort 2.x's `Session::run` takes `&mut self`
-//! because the underlying onnxruntime C API isn't reentrant
-//! per-session; the mutex is the standard workaround, held only
-//! inside `spawn_blocking` so it never crosses an `.await`.
+//! ort 2.x's `Session::run` takes `&mut self` (onnxruntime C API isn't
+//! reentrant per-session), so we serialize synth calls behind a
+//! `std::sync::Mutex` held only inside `spawn_blocking` — never across
+//! `.await`, so no tokio deadlock risk.
 //!
-//! Speed dtype is detected once at load time — Kokoro v1.0 exports
-//! have shipped with either `int32` or `f32` for the `speed` input
-//! depending on the export script. Hard-coding a guess would silently
-//! misbehave on the other variant.
+//! `speed` dtype is detected once at load time — Kokoro v1.0 exports
+//! ship either `int32` or `f32` depending on the export script; a
+//! hard-coded guess silently misbehaves on the other variant.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

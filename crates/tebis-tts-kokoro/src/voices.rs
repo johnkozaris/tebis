@@ -1,29 +1,13 @@
-//! Voice-embedding binary loader.
+//! Voice-embedding loader.
 //!
-//! Each HuggingFace Kokoro voice file (e.g. `af_sarah.bin`) is a raw
-//! **little-endian `f32` byte blob**, shape `(N, 1, 256)` where `N`
-//! is the max sequence length the voice was trained against (510 for
-//! Kokoro v1.0). It is NOT a `.npy` file — no magic header, no shape
-//! metadata, just 130 560 `f32`s packed end-to-end.
+//! HuggingFace per-voice files (`<name>.bin`) are **headerless**
+//! little-endian `f32` blobs shaped `(N, 1, 256)` — no npy magic,
+//! no metadata, just 130_560 floats.
 //!
-//! (The `.npy`/`.npz`-style bundle called `voices-v1.0.bin` exists
-//! upstream — that's what `kokoros` / `kokoroxide` load — but the
-//! per-voice files under `onnx-community/Kokoro-82M-v1.0-ONNX/voices/`
-//! are raw arrays. We use the per-voice files because they let us
-//! download only the voices a user configures, not a 10 MB bundle.)
-//!
-//! The voice-indexing trick, confirmed in `kokoro-onnx/__init__.py`:
-//! the style vector Kokoro wants at synth time depends on the token
-//! count. Pick row `len(tokens)` (pre-boundary-pads) from the table
-//! and pass that `(1, 256)` slice as the `style` input.
-//!
-//! ```python
-//! style = voice[len(tokens)]   # shape (1, 256)
-//! ```
-//!
-//! Without the row-by-token-count indexing you get a single static
-//! style that doesn't match the utterance length — audibly wrong
-//! prosody.
+//! The style vector passed to Kokoro at synth time is row `len(tokens)`
+//! (pre-boundary-pads) from the table — matches kokoro-onnx's
+//! `voice[len(tokens)]` indexing. A static single-row embedding
+//! would give audibly wrong prosody.
 
 use std::path::Path;
 

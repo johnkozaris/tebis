@@ -1,30 +1,14 @@
-//! Text normalization for Kokoro TTS.
+//! Text normalization, runs before espeak-ng.
 //!
-//! Runs before espeak-ng so the phonemizer sees words instead of
-//! digit-strings, currency symbols, and abbreviated titles. Without
-//! this pass, "Dr. Smith's 2024 report shows $42.50 improvement" gets
-//! phonemized as "dee arr dot smith's two zero two four report shows
-//! dollar four two dot five zero improvement" — not what we want.
+//! Pass order is load-bearing — each pass consumes text that later
+//! passes would mis-handle:
+//! `titles → currency → percent → ordinals → years → decimals → cardinals → whitespace`
 //!
-//! Pipeline order matters — each pass consumes text that later passes
-//! would otherwise mis-handle:
-//!
-//! ```text
-//! titles  → currency → percent → ordinals → years → decimals → cardinals → whitespace
-//! ```
-//!
-//! Scope is deliberately narrow: the concerns that actually break
-//! assistant-reply audio quality. Not implemented (low value for our
-//! traffic pattern, ~300 LoC of extra code):
-//! - URL / email parsing (markdown-stripped assistant replies rarely
-//!   contain raw URLs)
-//! - Date parsing with ambiguous formats (12/05/2024 etc.)
-//! - Phone-number grouping
-//! - Units (kg, °F, miles)
-//!
-//! Source reference: `Kokoro-FastAPI/api/src/services/text_processing/normalizer.py`.
-//! That file is 500 LoC of Python covering every edge case; we port
-//! the 100-odd lines that matter.
+//! Scope matches the concerns that break assistant-reply audio
+//! (numbers, currency, titles). URL / date / phone / unit parsing
+//! intentionally out of scope — rare in markdown-stripped replies,
+//! adds ~300 LoC for marginal quality. Reference:
+//! `Kokoro-FastAPI/api/src/services/text_processing/normalizer.py`.
 
 use std::sync::OnceLock;
 

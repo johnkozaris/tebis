@@ -1,20 +1,6 @@
-//! macOS `say` backend. Shells out to the system TTS binary.
-//!
-//! Why shell-out vs a Rust crate:
-//! - No new Rust ML deps (Kokoro-via-ort adds ~25 MB; Candle-based
-//!   any-tts pulls `reqwest` which our `deny.toml` bans, plus candle's
-//!   full transitive graph).
-//! - macOS `say` is built into the OS since forever. Voices like
-//!   `"Ava (Premium)"` / `"Tom (Premium)"` use the same neural engine
-//!   as Siri and sound decent for a voice-note reply. No install step.
-//! - Trivial to replace if / when we add a pure-Rust backend.
-//!
-//! Command:
-//!   `say --file-format=WAVE --data-format=LEI16@16000 -v "<voice>" -o <path> "<text>"`
-//!
-//! We write to a tempfile, read back, convert LE i16 → f32 in-memory,
-//! unlink. Timeout 30 s (a 3000-char reply takes ~1 min of audio;
-//! synthesis is ~10x real-time, so ~6 s wall-clock comfortably under).
+//! macOS `say` TTS backend. Runs
+//! `say --file-format=WAVE --data-format=LEI16@16000 -v <voice> -o <tmp>`,
+//! reads the WAV back, parses LE i16 → f32, unlinks. 30 s timeout.
 
 use std::fs;
 use std::time::{Duration, Instant};

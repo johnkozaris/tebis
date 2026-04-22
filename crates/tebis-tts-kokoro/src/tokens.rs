@@ -1,18 +1,10 @@
-//! Kokoro v1.0 IPA-to-token-id vocabulary.
+//! Kokoro v1.0 IPA → token-id vocab.
 //!
-//! Source of truth: `config.json` in the `onnx-community/Kokoro-82M-v1.0-ONNX`
-//! HuggingFace repo — 114 entries, sparse integer IDs up to 177. kokoro-onnx's
-//! `tokenizer.py` (the canonical Python ONNX reference we modeled after)
-//! uses exactly this map.
-//!
-//! IDs are *sparse* (gaps are intentional — the training vocab had more
-//! slots than English uses). That rules out a dense `[i64; 256]` array:
-//! we need a `HashMap<char, i64>` so unknown chars just miss the lookup.
-//!
-//! Unknown chars are dropped at tokenize time, mirroring
-//! `phonemes = "".join(filter(lambda p: p in self.vocab, phonemes))`
-//! from `kokoro_onnx/tokenizer.py:78`. This is how kokoro-onnx tolerates
-//! punctuation and whitespace noise from espeak-ng.
+//! 114 entries, sparse IDs ≤ 177 (gaps intentional; `HashMap`, not
+//! dense array). Copied verbatim from
+//! `onnx-community/Kokoro-82M-v1.0-ONNX/config.json`. Unknown chars
+//! are dropped at tokenize time — mirrors kokoro-onnx's
+//! `"".join(filter(lambda p: p in vocab, phonemes))`.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;

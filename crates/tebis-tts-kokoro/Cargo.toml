@@ -7,47 +7,21 @@ description = "Kokoro v1.0 TTS via ONNX Runtime + espeak-ng phonemizer"
 publish = false
 rust-version = "1.95"
 
-# Self-contained: given paths to a Kokoro ONNX model and a voices
-# directory, the crate runs text → 24 kHz mono `f32` PCM. No network
-# I/O, no SHA verification, no tebis coupling. Callers (tebis, or any
-# unrelated project) handle model distribution.
-#
-# Runtime requirements (documented, not enforced):
-#   - `espeak-ng` binary on PATH (phonemizer)
-#   - `libonnxruntime` on the dynamic-library search path
-#     (ort 2.x with `load-dynamic`)
-#
-# Neither is linked — espeak-ng is shelled out, onnxruntime is loaded
-# via dlopen — so this crate stays MIT-clean regardless of those
-# tools' licenses.
+# Given paths to a Kokoro ONNX model and a voices directory, runs
+# text → 24 kHz mono f32 PCM. No network, no SHA pinning, no caller
+# coupling. Runtime prereqs (not linked): `espeak-ng` on PATH,
+# `libonnxruntime` on the dynamic-lib search path.
 
 [dependencies]
-# Tensor primitive for ort I/O. `default-features = false` avoids
-# pulling in `rayon` + `matrixmultiply` which we don't use.
 ndarray = {version = "0.16", default-features = false, features = ["std"]}
-
-# English-language number/ordinal/currency → words conversion for
-# the pre-espeak normalizer. MIT-OR-Apache-2.0.
 num2words = {version = "1", default-features = false}
-
-# ONNX Runtime Rust bindings. Pinned to rc.10 because rc.11 has a
-# broken ureq TLS config when `download-binaries` is enabled, and
-# rc.12 references a VitisAI sys field its own bindings don't expose.
-# rc.10 is what tts-rs 2026.2.3 uses in production.
+# rc.11 has a broken ureq TLS config; rc.12 references a VitisAI sys
+# field its own bindings don't expose. rc.10 is known-good.
 ort = {version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"]}
-
-# Pattern matching for titles, currency, numbers in the normalizer.
 regex = {version = "1", default-features = false, features = ["std", "unicode-perl"]}
-
-# Typed error hierarchy so callers can pattern-match on failure mode.
 thiserror = "2"
-
-# Async shell-out to espeak-ng. `process` + `time` is the minimum we
-# need; no multi-threaded runtime pulled.
 tokio = {version = "1", features = ["process", "rt", "time"]}
+tracing = "0.1"
 
 [dev-dependencies]
 tokio = {version = "1", features = ["macros", "rt"]}
-
-# Structured logging. Downstream binaries wire the subscriber.
-tracing = "0.1"

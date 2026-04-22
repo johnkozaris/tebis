@@ -1,26 +1,12 @@
-//! Post-espeak IPA normalization for Kokoro v1.
+//! Post-espeak IPA substitutions ("E2M" table for Kokoro v1).
 //!
-//! espeak-ng emits IPA that doesn't quite match what Kokoro was trained
-//! on — Kokoro was trained on `misaki`'s processed output, which applies
-//! a set of English-specific substitutions to merge diphthongs, collapse
-//! flap-T, fold rhotacization, and strip tie marks. This module is the
-//! Rust port of that substitution table.
+//! Runs after `espeak-ng --ipa=3` and before the vocab filter. Without
+//! these, Kokoro sees `a͡ɪ` where it expects `I` (its diphthong merge
+//! marker), dental `r` where it wants rhotic `ɹ`, raw flap-T where
+//! it wants `T`, etc. — produces flat, unnatural prosody.
 //!
-//! Source mapping (cross-referenced between two upstreams that agree):
-//! - `misaki/espeak.py::EspeakFallback.E2M` (the original, ~40 rules)
-//! - `Kokoro-FastAPI/api/src/services/text_processing/phonemizer.py`
-//!   lines 57-66 (the production version of the rules).
-//!
-//! We apply these *after* `espeak-ng --ipa=3` and *before* the vocab
-//! filter in `tokens::ipa_to_token_ids`. Running order is `normalize →
-//! espeak → e2m → vocab filter → token ids`.
-//!
-//! Why this matters perceptually: without E2M, Kokoro sees `a͡ɪ` (two
-//! chars with a combining tie) when it expects `I` (its merge marker).
-//! The vocab filter drops `a`, `͡`, `ɪ` all individually, or emits them
-//! as separate tokens — either way Kokoro produces flat, un-diphthonged
-//! prosody. With E2M the model receives the phonemes it was trained on
-//! and the output sounds notably more natural.
+//! Table cross-referenced with `misaki/espeak.py::EspeakFallback.E2M`
+//! and `Kokoro-FastAPI/api/src/services/text_processing/phonemizer.py`.
 
 /// E2M substitution rules.
 ///

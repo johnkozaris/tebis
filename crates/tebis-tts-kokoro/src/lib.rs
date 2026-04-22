@@ -1,57 +1,27 @@
-//! # tebis-tts-kokoro
+//! Kokoro v1.0 TTS engine.
 //!
-//! Kokoro v1.0 TTS engine in pure Rust.
+//! Pipeline: text → espeak-ng (shell-out) → E2M IPA fixups → vocab
+//! filter → ort v2 `Session::run` → 24 kHz mono `f32` PCM.
 //!
-//! - Text → phonemes via `espeak-ng` shell-out (no GPL/LGPL linking)
-//! - IPA substitution table matching what Kokoro was trained on
-//!   (diphthong merging, flap-T, rhotacization, tie-mark stripping)
-//! - Text normalization for numbers, currency, titles, years
-//! - ONNX Runtime inference via `ort` 2.x `load-dynamic`
-//! - Output: 24 kHz mono `f32` PCM
+//! Runtime deps (not linked, so the crate stays MIT-clean):
+//! - `espeak-ng` on PATH (`brew install espeak-ng` / `apt install espeak-ng`)
+//! - `libonnxruntime` on the dylib search path
+//!   (`brew install onnxruntime` / `apt install libonnxruntime-dev`)
 //!
-//! This crate is deliberately tebis-agnostic. Any project that needs
-//! Kokoro synthesis can depend on it directly — there is no network
-//! I/O, no SHA verification, no config system, no trait dependency on
-//! a specific caller.
-//!
-//! ## Minimum viable call
+//! Caller provides file paths for the model + voices; this crate does
+//! no network I/O, no SHA pinning, no caching.
 //!
 //! ```no_run
-//! use std::path::PathBuf;
+//! # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
 //! use tebis_tts_kokoro::KokoroTts;
-//!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Caller is responsible for placing these files on disk:
-//! let model = PathBuf::from("/path/to/kokoro/model.onnx");
-//! let voices_dir = PathBuf::from("/path/to/kokoro/voices");
-//!
-//! let tts = KokoroTts::load(&model, voices_dir)?;
-//! let synthesis = tts.synthesize("Hello from Kokoro.", "af_sarah").await?;
-//! // synthesis.pcm is 24 kHz f32 mono, ready for Opus / WAV encoding.
-//! # Ok(())
-//! # }
+//! let tts = KokoroTts::load(
+//!     std::path::Path::new("model.onnx"),
+//!     std::path::PathBuf::from("voices"),
+//! )?;
+//! let synth = tts.synthesize("Hello.", "af_sarah").await?;
+//! // synth.pcm is 24 kHz f32 mono
+//! # Ok(()) }
 //! ```
-//!
-//! ## Runtime requirements (not linked, discovered at runtime)
-//!
-//! - `espeak-ng` on `PATH` — American-English phonemizer. Install:
-//!   `brew install espeak-ng` (macOS) or your distro's package.
-//! - `libonnxruntime` on the dynamic-library search path. Install:
-//!   `brew install onnxruntime` (macOS) or `apt install
-//!   libonnxruntime-dev` (Debian/Ubuntu).
-//!
-//! Both are shell-out / dynamically loaded, so this crate stays
-//! MIT-clean regardless of those tools' licenses.
-//!
-//! ## What's *not* in scope
-//!
-//! - Downloading the 346 MB ONNX model or per-voice `.bin` files.
-//! - Verifying their SHA against a manifest.
-//! - Caching voice files to disk.
-//! - Streaming / chunked synthesis (< 510-phoneme limit per call).
-//! - Voice-style blending (e.g. `af_sky+af_nicole.3` syntax).
-//!
-//! All of those are caller concerns.
 
 mod e2m;
 mod normalize;

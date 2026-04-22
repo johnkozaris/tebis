@@ -445,13 +445,11 @@ async fn build_local_stt(
     Ok((backend, cfg.model.clone()))
 }
 
-/// Build the local Kokoro backend: probe espeak-ng, download model +
-/// voice from the manifest (SHA-verified), load the ONNX session.
+/// Build the local Kokoro backend end-to-end: probe espeak-ng,
+/// SHA-verified download of model + voice, ort session load.
 ///
-/// Only exists with the `kokoro` cargo feature. Error on missing
-/// espeak-ng is surfaced early (at `AudioSubsystem::new`) instead of
-/// at first-synth so users see "install espeak-ng" in the startup log
-/// rather than a cryptic process-spawn failure minutes later.
+/// espeak-ng is probed early so users see a clear install message at
+/// startup instead of a cryptic process-spawn failure at first synth.
 #[cfg(feature = "kokoro")]
 async fn build_kokoro_local(
     model_key: &str,
