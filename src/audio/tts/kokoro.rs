@@ -1,11 +1,4 @@
-//! Thin adapter over [`tebis_tts_kokoro`] — bridges the crate's
-//! types to tebis's TTS surface (`Synthesis`, `TtsError`) and impls
-//! the tebis [`super::Tts`] trait so Kokoro fits the `Backend` enum
-//! dispatch without extra match arms.
-//!
-//! The crate stays tebis-agnostic; this file is the only place that
-//! knows about both. If tebis's Tts surface ever changes, edits stop
-//! here — the Kokoro crate is unaffected.
+//! Adapter between `tebis_tts_kokoro` and tebis's Tts surface.
 
 #![cfg(feature = "kokoro")]
 
@@ -37,9 +30,6 @@ impl Tts for KokoroTts {
     }
 }
 
-/// Translate the crate's typed errors to tebis's. `Init` and
-/// `Synthesis` map one-to-one; `EmptyOutput` is the same variant name
-/// but a distinct type, so we flatten into tebis's `EmptyOutput`.
 fn err_from_crate(e: KokoroError) -> TtsError {
     match e {
         KokoroError::Init(msg) => TtsError::Init(msg),

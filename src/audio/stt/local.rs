@@ -1,22 +1,5 @@
-//! whisper-rs backend — in-process transcription.
-//!
-//! Holds an [`Arc<WhisperContext>`] (loaded once at subsystem init) and
-//! spins up a fresh [`WhisperState`] per call. State creation is cheap
-//! compared to model load (~ms vs ~300ms), and per-call state resets
-//! the KV cache — which is what we want, since each Telegram voice note
-//! is an independent utterance.
-//!
-//! Inference runs on [`tokio::task::spawn_blocking`] because whisper.cpp
-//! `full` is CPU/GPU-bound and would stall the runtime otherwise. The
-//! model is shared across concurrent calls via `Arc`, but the underlying
-//! `ctx.create_state()` serializes internally — we don't need extra
-//! locking on our side.
-//!
-//! Whisper.cpp's own log output is routed through the `tracing` bridge
-//! installed in `src/main.rs` (via
-//! [`whisper_rs::install_logging_hooks`]), so model-load warnings /
-//! tensor shape mismatches surface at `warn` in tebis's journal rather
-//! than disappearing to stderr.
+//! whisper-rs in-process. `Arc<WhisperContext>` loaded once; fresh
+//! `WhisperState` per call to reset KV. Inference on `spawn_blocking`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -30,17 +13,11 @@ use super::{SttError, Transcription};
 pub struct LocalStt {
     ctx: Arc<WhisperContext>,
     threads: i32,
-    /// Used when the per-call `lang` arg is empty.
     default_language: String,
 }
 
 impl LocalStt {
-    /// Load the model at `model_path` into memory. Blocking (~300 ms for
-    /// `base.en` on M4 with Metal; ~1 s for `small.en` on Ubuntu CPU).
-    /// Caller should run this once at subsystem init, **not** per request.
-    ///
-    /// `threads` is clamped to `i32::MAX` — whisper.cpp takes `c_int` and
-    /// any sensible config value fits anyway.
+    /// Blocking (~300 ms base.en on M4) — run once at subsystem init.
     pub fn load(
         model_path: &Path,
         threads: u32,
@@ -68,8 +45,6 @@ impl LocalStt {
 impl super::Stt for LocalStt {
     async fn transcribe(&self, pcm: &[f32], lang: &str) -> Result<Transcription, SttError> {
         let pcm = pcm.to_vec();
-        // Whisper interprets empty string as "auto" via `Some("auto")` — we
-        // normalize here so the spawn_blocking closure sees a stable value.
         let lang = if lang.trim().is_empty() {
             self.default_language.clone()
         } else {
@@ -99,19 +74,16 @@ impl LocalStt {
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(threads);
-        // Empty / "auto" both mean detect; whisper-rs takes the string via
-        // `Option<&'a str>`. We pass `None` for empty so the C side sees
-        // a null pointer rather than an empty C string.
+        // `None` for empty/"auto" — whisper-rs takes the language as `Option<&str>`.
         if !lang.is_empty() && lang != "auto" {
             params.set_language(Some(lang));
         } else {
             params.set_language(None);
         }
         params.set_translate(false);
-        // Each Telegram voice note is an independent utterance — reset KV.
+        // Each voice note is independent — reset KV.
         params.set_no_context(true);
         params.set_single_segment(false);
-        // Don't spam stderr with per-segment details; we re-emit at `debug!`.
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
@@ -122,9 +94,6 @@ impl LocalStt {
             .full(params, pcm)
             .map_err(|e| SttError::LocalInference(format!("inference: {e}")))?;
 
-        // Concatenate every segment's text (to_str_lossy replaces invalid
-        // UTF-8 with U+FFFD rather than erroring — better UX on pathological
-        // model outputs).
         let mut text = String::new();
         for seg in state.as_iter() {
             match seg.to_str_lossy() {

@@ -20,15 +20,7 @@ impl SayTts {
         Self
     }
 
-    /// Probe whether `say` is available. macOS always ships it, but a
-    /// stripped-down container (e.g. GitHub Actions macos-latest with
-    /// --no-install-recommends quirks) could conceivably lack it.
-    ///
-    /// `say` has no `--version` flag; we invoke it with `-?` which
-    /// prints usage and exits non-zero (documented behavior on every
-    /// macOS release from Snow Leopard forward). The probe only
-    /// cares that the binary exists and is runnable — the non-zero
-    /// exit is expected.
+    /// Invokes `say -?` — non-zero exit is expected; we only care it's runnable.
     pub async fn probe() -> Result<(), TtsError> {
         Command::new("say")
             .arg("-?")
@@ -54,12 +46,7 @@ impl Tts for SayTts {
                 .map_or(0, |d| d.as_nanos()),
         ));
 
-        // Pre-create the file with O_CREAT|O_EXCL mode 0600 so an
-        // attacker who races a symlink at the same path (predicting
-        // both pid AND nanosecond-scale timestamp) fails to clobber a
-        // real file. Fail-open if pre-create fails — the path is
-        // near-unguessable and `say` will still refuse to write
-        // outside what it has permission to.
+        // O_CREAT|O_EXCL mode 0600 defeats a symlink race on the tmp path.
         {
             use std::os::unix::fs::OpenOptionsExt;
             if let Err(e) = fs::OpenOptions::new()
@@ -109,10 +96,6 @@ impl Tts for SayTts {
             )));
         }
 
-        // Read the WAV file back into memory, parse the header, extract
-        // samples as i16 → f32. Small file (tens of KB) so a blocking
-        // read inside an async fn is fine; `say` already spent much
-        // more wall-clock than this.
         let wav_bytes = fs::read(&tmp)
             .map_err(|e| TtsError::Synthesis(format!("read {}: {e}", tmp.display())))?;
         let _ = fs::remove_file(&tmp);
@@ -125,30 +108,19 @@ impl Tts for SayTts {
         Ok(Synthesis {
             pcm,
             duration_ms: u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX),
-            // We explicitly ask `say` for `LEI16@16000`, so output rate
-            // is always 16 kHz here.
             sample_rate: 16_000,
         })
     }
 }
 
-/// Parse a minimal RIFF/WAVE header and extract 16-bit little-endian
-/// PCM samples as `Vec<f32>` in `[-1.0, 1.0]`.
-///
-/// We assume `say` produces the exact format we asked for (LEI16 @
-/// 16 kHz mono). Any mismatch → error. We don't need a full WAV parser
-/// because we control the producer; just enough to find `data` chunk.
+/// Minimal WAV reader — assumes `say` produced LEI16 @ 16 kHz mono (what we asked for).
 fn parse_le_i16_wav(bytes: &[u8]) -> Result<Vec<f32>, TtsError> {
-    // Minimum 12 bytes: `RIFF` + 4-byte size + `WAVE`. Real WAV files
-    // are bigger (fmt chunk adds another 24, data chunk header is 8),
-    // but we walk chunks generically — no need for a stricter minimum.
     if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err(TtsError::Synthesis(
             "not a RIFF/WAVE file — `say` output unexpected".to_string(),
         ));
     }
 
-    // Walk chunks to find "data". Skip "fmt ", "LIST", and any others.
     let mut cursor = 12;
     loop {
         if cursor + 8 > bytes.len() {
@@ -162,11 +134,7 @@ fn parse_le_i16_wav(bytes: &[u8]) -> Result<Vec<f32>, TtsError> {
             bytes[cursor + 7],
         ]) as usize;
         let body_start = cursor + 8;
-        // Checked arithmetic: a malicious or corrupted WAV with
-        // `chunk_size = u32::MAX` could otherwise overflow `usize` on
-        // 32-bit targets (release has `overflow-checks = true`, which
-        // would panic). `say` is our producer today so the risk is
-        // low, but defensive arithmetic costs nothing.
+        // Checked — release has overflow-checks on; u32::MAX chunk_size would panic.
         let Some(body_end) = body_start.checked_add(chunk_size) else {
             return Err(TtsError::Synthesis(
                 "WAV chunk size overflow — file is malformed".to_string(),
@@ -179,7 +147,6 @@ fn parse_le_i16_wav(bytes: &[u8]) -> Result<Vec<f32>, TtsError> {
             )));
         }
         if chunk_id == b"data" {
-            // 16-bit LE PCM: each pair of bytes is one i16 sample.
             if !chunk_size.is_multiple_of(2) {
                 return Err(TtsError::Synthesis(
                     "WAV data chunk has odd byte count — not i16 PCM".to_string(),
@@ -191,15 +158,11 @@ fn parse_le_i16_wav(bytes: &[u8]) -> Result<Vec<f32>, TtsError> {
                 let lo = bytes[body_start + 2 * i];
                 let hi = bytes[body_start + 2 * i + 1];
                 let sample = i16::from_le_bytes([lo, hi]);
-                // Normalize i16 → f32 in [-1.0, 1.0]. 32767 is OK;
-                // -32768 maps to -1.000030517... which is slightly out
-                // of [-1, 1] but whisper-equivalent code paths tolerate.
                 out.push(f32::from(sample) / 32768.0);
             }
             return Ok(out);
         }
         cursor = body_end;
-        // WAV chunks pad to even byte boundary.
         if !chunk_size.is_multiple_of(2) {
             cursor += 1;
         }
@@ -212,21 +175,18 @@ mod tests {
 
     #[test]
     fn parse_minimal_wav() {
-        // Construct a tiny WAV with 3 samples: 0, 1, -1.
         let mut wav = Vec::new();
         wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&0u32.to_le_bytes()); // size — don't bother for test
+        wav.extend_from_slice(&0u32.to_le_bytes());
         wav.extend_from_slice(b"WAVE");
-        // "fmt " chunk (16 bytes of fmt data for PCM).
         wav.extend_from_slice(b"fmt ");
         wav.extend_from_slice(&16u32.to_le_bytes());
-        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
-        wav.extend_from_slice(&16_000_u32.to_le_bytes()); // sample rate
-        wav.extend_from_slice(&32_000_u32.to_le_bytes()); // byte rate
-        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
-        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-        // "data" chunk.
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&16_000_u32.to_le_bytes());
+        wav.extend_from_slice(&32_000_u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&6u32.to_le_bytes());
         wav.extend_from_slice(&0i16.to_le_bytes());
@@ -253,7 +213,7 @@ mod tests {
         wav.extend_from_slice(&0u32.to_le_bytes());
         wav.extend_from_slice(b"WAVE");
         wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&3u32.to_le_bytes()); // odd
+        wav.extend_from_slice(&3u32.to_le_bytes());
         wav.extend_from_slice(&[0, 0, 0]);
         let err = parse_le_i16_wav(&wav).unwrap_err();
         assert!(err.to_string().contains("odd byte count"));

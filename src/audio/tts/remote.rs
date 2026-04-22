@@ -1,13 +1,4 @@
-//! OpenAI-compatible remote TTS backend.
-//!
-//! `POST <base_url>/v1/audio/speech` with `{model, input, voice,
-//! response_format: "opus"}` → `audio/ogg` bytes passed through to
-//! Telegram `sendVoice` verbatim. Duration is extracted by decoding
-//! to PCM at 16 kHz and counting samples.
-//!
-//! Invariants: error strings go through [`redact_network_error`] and
-//! `Debug` redacts URL + API key (CLAUDE.md #6); 10 MiB response cap
-//! + 30 s body-read timeout (#10). No retries — caller fails open.
+//! OpenAI-compatible remote TTS. Invariants 6 (redact) + 10 (cap + timeout).
 
 use std::time::Duration;
 
@@ -25,21 +16,10 @@ use tokio::time::timeout;
 use super::TtsError;
 use crate::audio::codec;
 
-/// Hard cap on response size. A voice reply needing more than 10 MiB of
-/// OGG/Opus is many minutes of audio — well past Telegram's voice-note
-/// use case. Prevents a runaway / misbehaving remote from OOMing tebis.
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-
-/// Pooled idle timeout for the per-backend connection pool.
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Per-connect timeout — the request-level timeout bounds everything
-/// else (headers, body), but the connect phase gets its own shorter
-/// deadline so a dead remote fails fast.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Body-read deadline on top of the request timeout. Covers the rare
-/// case where headers arrived quickly but the body streams slowly.
+/// Body-read deadline — covers the slow-body-after-fast-headers case.
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
@@ -62,16 +42,7 @@ struct SpeechRequest<'a> {
 }
 
 impl RemoteTts {
-    /// Construct a remote TTS client.
-    ///
-    /// **Scheme enforcement is the caller's responsibility.** `config.rs`
-    /// rejects `http://` at env-parse time unless
-    /// `TELEGRAM_TTS_REMOTE_ALLOW_HTTP=true` is set. The hyper connector
-    /// here is built with `https_or_http()` so the `RemoteTts::new`
-    /// call itself does NOT re-validate — bypassing `config::load_tts`
-    /// (e.g. tests constructing a remote client directly) will happily
-    /// accept plain http. Keep scheme validation at the config
-    /// boundary, not here.
+    /// Scheme enforcement is `config.rs`'s job — `https_or_http()` here accepts both.
     pub fn new(
         url: String,
         api_key: Option<SecretString>,
@@ -116,18 +87,15 @@ impl RemoteTts {
         })
     }
 
-    /// Currently-configured voice. Used by the dashboard / banner.
     pub fn voice(&self) -> &str {
         &self.voice
     }
 
-    /// Currently-configured model name. Used by the dashboard.
     pub fn model(&self) -> &str {
         &self.model
     }
 
-    /// Whether a Bearer token is configured. The dashboard shows `set` /
-    /// `unset` — never the value itself.
+    /// Whether a Bearer token is configured — dashboard shows `set`/`unset`, never the value.
     pub const fn has_api_key(&self) -> bool {
         self.api_key.is_some()
     }
@@ -188,8 +156,6 @@ impl RemoteTts {
 
         let status = resp.status();
         if status != StatusCode::OK {
-            // Read a small prefix of body for diagnostics. Cap at 512 B
-            // so a huge error-page HTML doesn't flood logs / replies.
             let body = match timeout(Duration::from_secs(2), resp.collect()).await {
                 Ok(Ok(c)) => c.to_bytes(),
                 _ => Bytes::new(),
@@ -217,13 +183,7 @@ impl RemoteTts {
             )));
         }
 
-        // Decode to count samples → duration. Cheap; shares coverage with
-        // the inbound STT OGG path.
-        //
-        // `MAX_RESPONSE_BYTES` (10 MiB) caps the input. The decode cap
-        // below caps the output at ~1 hour of audio @ 16 kHz — generous
-        // headroom for any legitimate remote Kokoro response, tight
-        // enough to refuse a bitrate-stuffed adversarial blob.
+        // Decode-for-duration — cap ~1 h @ 16 kHz against bitrate-stuffed blobs.
         const MAX_DECODED_SAMPLES: usize = 3600 * 16_000;
         let pcm = codec::decode_opus_to_pcm16k(&bytes, MAX_DECODED_SAMPLES)
             .map_err(|e| TtsError::Synthesis(format!("decode ogg duration: {e}")))?;
@@ -232,12 +192,7 @@ impl RemoteTts {
     }
 }
 
-/// Token-safe error string. Walks hyper's error chain to the root cause
-/// and substring-checks for URL / auth-header leakage before returning.
-///
-/// Parallels `telegram::redact_network_error` but tuned for the remote
-/// TTS surface, where the risk is an operator-provided URL path or
-/// query string that inadvertently contains a secret.
+/// Walk to root cause, redact URI/auth substrings — parallels `telegram::redact_network_error`.
 fn redact_network_error(err: &hyper_util::client::legacy::Error) -> String {
     const MAX_SOURCE_DEPTH: usize = 16;
     let mut cur: &dyn std::error::Error = err;
@@ -247,8 +202,6 @@ fn redact_network_error(err: &hyper_util::client::legacy::Error) -> String {
     }
     let kind = if err.is_connect() { "connect" } else { "request" };
     let raw = format!("{kind}: {cur}");
-    // Any URI-like substring or auth header content → wipe. Log loudly
-    // so we notice hyper regressions that start leaking URIs into errors.
     if raw.contains("://") || raw.contains("Bearer ") || raw.contains("Authorization") {
         tracing::warn!(
             "Remote-TTS network error contained URI/auth-like data; replaced with redacted placeholder"
@@ -260,9 +213,7 @@ fn redact_network_error(err: &hyper_util::client::legacy::Error) -> String {
 
 impl std::fmt::Debug for RemoteTts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `client` is intentionally omitted (hyper's Debug could leak
-        // the URI or auth headers via nested fields); `finish_non_exhaustive`
-        // signals the omission to readers and satisfies clippy.
+        // Omit `client` — hyper's Debug could leak URI/auth.
         f.debug_struct("RemoteTts")
             .field("base_url", &"<redacted>")
             .field("model", &self.model)
@@ -284,10 +235,6 @@ impl std::fmt::Debug for RemoteTts {
 mod tests {
     use super::*;
 
-    /// Install the ring crypto provider exactly once per test run. The
-    /// real `crate::telegram::install_crypto_provider` panics on repeat;
-    /// the idempotent form is fine in a test context where ordering is
-    /// arbitrary.
     fn install_crypto_provider_idempotent() {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }

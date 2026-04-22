@@ -1,0 +1,78 @@
+#!/usr/bin/expect -f
+# Debug-drive tebis setup. Feeds predefined answers and captures output.
+# Usage: expect scripts/debug-setup.exp [path-to-tebis-binary]
+#
+# Picks reasonable defaults:
+#   - empty allowlist (permissive session mode)
+#   - no autostart
+#   - no dashboard
+#   - STT enabled (small.en), but final "Exit" skips the 181 MB download
+#   - TTS Simple (→ `say` on macOS)
+#   - Save config, then Exit
+#
+# CRITICAL: dialoguer Confirm reads a single character and leaves any
+# trailing `\r` in the input buffer, which the NEXT prompt would then
+# consume as "accept default". So we send `y` / `n` WITHOUT a CR.
+# Only `Input` prompts (line-based) get a trailing `\r`.
+
+set timeout 60
+log_user 1
+
+set bin [lindex $argv 0]
+if {$bin eq ""} { set bin "./target/debug/tebis" }
+spawn $bin setup
+
+# Step 1 — bot token (Input, needs \r)
+expect {
+    timeout { puts stderr "TIMEOUT waiting for bot-token prompt"; exit 1 }
+    -re "Keep the current bot token" {
+        send -- "n"
+        exp_continue
+    }
+    -re "Bot token\[^\r\n]*" {}
+}
+send -- "<TEST_BOT_TOKEN>\r"
+
+# Step 2 — user id (Input, needs \r)
+expect -re "Your numeric Telegram id"
+send -- "<TEST_USER_ID>\r"
+
+# Step 3 — session allowlist (Confirm, single char, no \r)
+expect -re "Restrict to specific session names"
+send -- "n"
+
+# Step 4 — autostart (Confirm)
+expect -re "Set a default agent"
+send -- "n"
+
+# Step 5 — hooks: auto-skipped (no autostart).
+
+# Step 6 — inspect dashboard (Confirm)
+expect -re "Enable dashboard"
+send -- "n"
+
+# Step 7 — voice / STT (Confirm)
+expect -re "Enable voice-to-text"
+send -- "y"
+
+# Step 7b — Whisper model (Select). Default is top of list; just Enter.
+expect -re "Whisper model"
+send -- "\r"
+
+# Step 8 — TTS Setup mode (Select). Default top is "Simple"; Enter.
+expect -re "Setup mode"
+send -- "\r"
+
+# Review → Save this config? (Confirm, default yes — Enter works)
+expect -re "Save this config"
+send -- "y"
+
+# How do you want to run tebis? (Select). 3 choices, pick index 2 = Exit.
+# Down-arrow ×2, then Enter.
+expect -re "How do you want to run tebis"
+send -- "\033\[B"
+send -- "\033\[B"
+send -- "\r"
+
+expect eof
+puts "\n--- wizard exited cleanly ---"

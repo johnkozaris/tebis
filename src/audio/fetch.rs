@@ -1,27 +1,5 @@
-//! HTTP GET with streaming SHA-256 verification and atomic-rename-on-success.
-//!
-//! Used to fetch model files from Hugging Face on first run. Each byte
-//! read from the network is tee'd into both the destination file and a
-//! running `ring::digest::SHA256` hasher. On EOF the hash is compared
-//! against the manifest-pinned value; mismatch deletes the `.tmp` and
-//! returns [`FetchError::ChecksumMismatch`]. On match, the file is
-//! `fsync`ed and atomically renamed into place via [`cache::install_model_atomic`].
-//!
-//! Cancellation: the outer caller passes a [`CancellationToken`]. On
-//! shutdown mid-download, the future yields after the current chunk and
-//! the `.tmp` file is removed in the error cleanup path. Next startup's
-//! [`cache::reap_stale_tmps`] sweeps up any file left behind by a crash.
-//!
-//! Invariant compliance:
-//! - **6 (redact network errors)**: all hyper errors routed through
-//!   [`crate::telegram::redact_network_error`]. HF URLs don't carry
-//!   secrets, but we keep the redaction path uniform so a future URL
-//!   scheme that does can't leak.
-//! - **10 (payload cap + read timeout)**: hard cap of 1 GiB per download
-//!   (catches runaway transfers); per-operation deadline of 10 minutes.
-//! - **12 (`TaskTracker` for background)**: `download_verified` is
-//!   cancel-safe so callers can spawn it on the shared tracker and
-//!   have shutdown drain cleanly.
+//! HTTP GET + streaming SHA-256 + atomic rename. For HF model downloads.
+//! Invariants 6 (network error redaction), 10 (cap + timeout), 12 (cancel-safe).
 
 use std::fs;
 use std::io::{self, Write};
@@ -40,23 +18,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::cache;
 
-/// Hard ceiling on a single download. Our biggest shipped asset is
-/// `ggml-small.en.bin` at ~488 MB; 1 GiB is comfortable headroom and
-/// defends against a runaway / malicious response that streams forever.
 const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Overall deadline per `download_verified` call. Pitched for a slow
-/// home-network downloading the 488 MB small model — ~8 Mbps still
-/// finishes inside this.
+/// 10 min — ~8 Mbps finishes a 488 MB model comfortably.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Maximum redirect hops before we give up. Hugging Face serves model
-/// blobs from their CDN via a single 302 from `huggingface.co/.../resolve/main/…`
-/// to `cas-bridge.xethub.hf.co/…`, so one hop is the common case; allow
-/// 5 for peace of mind without opening a redirect-chain attack vector.
 const MAX_REDIRECTS: u8 = 5;
 
 type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
@@ -101,9 +70,7 @@ impl FetchError {
     }
 }
 
-/// HTTP client sized for model downloads — HTTPS-only, small idle pool,
-/// separate from the Telegram client so our redaction rules and TLS
-/// config stay decoupled.
+/// HTTPS-only client, decoupled from Telegram's so redaction/TLS can diverge.
 pub struct FetchClient {
     client: HyperClient,
 }
@@ -115,8 +82,7 @@ impl Default for FetchClient {
 }
 
 impl FetchClient {
-    /// Build a client. `install_crypto_provider` must have run first
-    /// (it's called by `main.rs` on startup so tebis-wide rustls is live).
+    /// Build a client. `install_crypto_provider` must have run first.
     pub fn new() -> Self {
         let tls = ClientConfig::builder()
             .with_webpki_roots()
@@ -143,12 +109,7 @@ impl FetchClient {
         Self { client }
     }
 
-    /// Download `url` to `tmp_path`, verify against `expected_sha256_hex`
-    /// (lowercase hex, 64 chars), then atomically rename to `final_path`.
-    ///
-    /// `progress(bytes_so_far, content_length_opt)` is invoked after each
-    /// chunk; callers should rate-limit their output (the inner loop can
-    /// fire thousands of times per second on a fast link).
+    /// Download → SHA verify → atomic rename. Callers should rate-limit `progress` output.
     pub async fn download_verified(
         &self,
         url: &str,
@@ -174,8 +135,6 @@ impl FetchClient {
         let outcome = result.unwrap_or(Err(FetchError::Timeout));
 
         if outcome.is_err() {
-            // Best-effort cleanup — the fs::remove_file can itself fail
-            // (file already gone, perms), but we don't care.
             let _ = fs::remove_file(tmp_path);
         }
         outcome
@@ -190,9 +149,7 @@ impl FetchClient {
         progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
         cancel: CancellationToken,
     ) -> Result<(), FetchError> {
-        // Hugging Face serves via a 302 from huggingface.co → their CDN
-        // (xethub). We follow up to MAX_REDIRECTS hops manually because
-        // hyper-util's legacy Client doesn't do auto-redirect.
+        // hyper-util's legacy Client doesn't auto-redirect — follow manually.
         let mut current_url = url.to_string();
         let mut hops: u8 = 0;
         let response = loop {
@@ -214,9 +171,7 @@ impl FetchClient {
                 .body(Full::<Bytes>::new(Bytes::new()))
                 .map_err(|e| FetchError::Network(e.to_string()))?;
 
-            // Listen for cancel here too, not just during body streaming:
-            // a misbehaving server that emits MAX_REDIRECTS 302s would
-            // otherwise burn ~5× connect_timeout before drain.
+            // Cancel during redirects too — a chain would burn ~5× connect_timeout otherwise.
             let resp = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(FetchError::Cancelled),
@@ -263,7 +218,6 @@ impl FetchClient {
             return Err(FetchError::ResponseTooLarge);
         }
 
-        // Ensure parent dir exists + open tmp with 0644.
         if let Some(parent) = tmp_path.parent() {
             cache::ensure_dir_0700(parent).map_err(FetchError::from_io)?;
         }
@@ -273,23 +227,14 @@ impl FetchClient {
         let mut body = response.into_body();
         loop {
             tokio::select! {
-                // `biased`: poll the cancel branch first every iteration.
-                // On a saturated network, random-scheduled select could
-                // consume thousands of chunks before observing cancel,
-                // delaying shutdown by seconds. Biased flips the priority
-                // so SIGTERM drains promptly; the cost is negligible
-                // because `cancel.cancelled()` returns immediately to
-                // `Pending` when not yet fired.
+                // `biased` — saturated network could consume thousands of chunks before cancel.
                 biased;
                 () = cancel.cancelled() => return Err(FetchError::Cancelled),
                 frame = body.frame() => {
                     match frame {
-                        None => break,  // clean EOF
+                        None => break,
                         Some(Err(e)) => {
-                            // Body-frame errors from hyper can in theory carry URIs
-                            // in their cause chain. HF URLs don't have secrets, but
-                            // invariant 6 is uniform — route through the same
-                            // substring-redaction used for request-level errors.
+                            // invariant 6 — uniform redaction even for HF URLs.
                             return Err(FetchError::Network(redact_hyper_error_string(
                                 &e.to_string(),
                             )));
@@ -302,15 +247,12 @@ impl FetchClient {
                                 tee.write_all(&chunk).map_err(FetchError::from_io)?;
                                 progress(tee.bytes_written, content_length);
                             }
-                            // else: trailer frame — ignore; Body::frame yields
-                            // Frame::Trailers after Frame::Data, not audio bytes.
                         }
                     }
                 }
             }
         }
 
-        // If server advertised a length, enforce we got all of it.
         if let Some(len) = content_length
             && tee.bytes_written < len
         {
@@ -339,9 +281,7 @@ impl FetchClient {
     }
 }
 
-/// A `std::io::Write` that fans each chunk into both a file and a SHA-256
-/// hasher. No extra buffering — the caller's `write_all` calls are
-/// forwarded verbatim, and the hasher sees exactly what lands on disk.
+/// Tees each chunk into both the file and a SHA-256 hasher.
 struct TeeWriter {
     file: fs::File,
     hasher: Sha256Ctx,
@@ -375,13 +315,7 @@ impl Write for TeeWriter {
     }
 }
 
-/// Generic-string equivalent of `telegram::redact_network_error` — matches
-/// the same shapes (`/bot<digit>`, `api.telegram.org`) that indicate a
-/// leaked bot-token URL and swaps them for a placeholder. The real
-/// `redact_network_error` consumes a `hyper_util::client::legacy::Error`;
-/// body-frame errors come through as `hyper::Error`, which has no
-/// `.source()` chain compatible with that helper. This shim keeps
-/// invariant 6 uniform.
+/// String-input shim for invariant 6 — `hyper::Error` can't feed `redact_network_error`.
 fn redact_hyper_error_string(s: &str) -> String {
     if contains_bot_token_shape(s) || s.contains("api.telegram.org") {
         return "<redacted network error>".to_string();
@@ -389,9 +323,7 @@ fn redact_hyper_error_string(s: &str) -> String {
     s.to_string()
 }
 
-/// True when `s` contains `/bot` immediately followed by an ASCII digit.
-/// Duplicates `telegram::contains_bot_token_shape` so this module stays
-/// free of inbound coupling on the telegram module.
+/// Duplicates `telegram::contains_bot_token_shape` to avoid inbound coupling.
 fn contains_bot_token_shape(s: &str) -> bool {
     let bytes = s.as_bytes();
     let needle = b"/bot";
@@ -401,8 +333,7 @@ fn contains_bot_token_shape(s: &str) -> bool {
         .any(|(i, w)| w == needle && bytes.get(i + needle.len()).is_some_and(u8::is_ascii_digit))
 }
 
-/// Lowercase hex of bytes. 32-byte SHA-256 digest → 64 hex chars.
-/// Hand-rolled to avoid a `hex` crate dep.
+/// Lowercase hex — hand-rolled to avoid a `hex` crate dep.
 fn hex_encode(bytes: &[u8]) -> String {
     const LUT: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -450,7 +381,6 @@ mod tests {
         let (file, digest) = tee.finalize();
         file.sync_all().unwrap();
 
-        // Known SHA-256 of "hello world".
         let expected = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
         assert_eq!(hex_encode(digest.as_ref()), expected);
         assert_eq!(fs::read(&path).unwrap(), b"hello world");

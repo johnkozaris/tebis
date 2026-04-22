@@ -559,12 +559,15 @@ impl TelegramClient {
     }
 }
 
-/// Install rustls's process-wide crypto provider. Panics if another is already installed
-/// — that means a dep silently picked a different backend.
+/// Install rustls's process-wide crypto provider. Idempotent — the
+/// setup wizard's `prepare_audio_downloads` installs one, then the
+/// foreground-run path installs again. `install_default` returns
+/// `Err(existing)` on the second call, which we swallow because
+/// `ring` is the only provider we ever register (no risk of a dep
+/// silently picking a different backend). Verified by the
+/// `aws-lc-rs = deny` rule in `deny.toml`.
 pub fn install_crypto_provider() {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("rustls default crypto provider already installed — unexpected");
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 /// Build a `multipart/form-data` body for `sendVoice`. CRLF per RFC 7578.
