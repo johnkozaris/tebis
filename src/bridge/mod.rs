@@ -243,11 +243,11 @@ async fn react_ok(ctx: &HandlerContext, chat_id: i64, message_id: i64) {
 }
 
 /// Maximum transcript **bytes** (not chars) we'll feed into
-/// `handler::parse`. Matches `TELEGRAM_MAX_OUTPUT_CHARS`'s upper bound
-/// — a noisy long recording should not be able to paste 100 KiB of text
-/// into tmux and bypass the existing plumbing limits (proposed
-/// invariant 19). Named "BYTES" because `text.len()` is bytes; the
-/// config key uses "CHARS" for historical reasons.
+/// `handler::parse`. Matches `TELEGRAM_MAX_OUTPUT_CHARS`'s upper
+/// bound — a noisy long recording should not be able to paste 100+
+/// KiB of text into tmux and bypass the existing plumbing limits
+/// (CLAUDE.md invariant 19). Named "BYTES" because `text.len()` is
+/// bytes; the config key uses "CHARS" for historical reasons.
 const MAX_TRANSCRIPT_BYTES: usize = 4000;
 
 /// Samples per second the Opus decoder emits (we configure it at 16 kHz

@@ -108,6 +108,20 @@ discussion.
     on every accepted connection, rejecting any uid ≠ our euid. The cred
     check is the only authenticated gate — (a) and (b) close the TOCTOU
     window between bind and chmod. Do not remove any layer independently.
+18. **`send_keys` text → sleep → Enter happens under a single mutex
+    acquisition.** The sequence is three commands (`send-keys -l`,
+    Ink-render sleep, `send-keys -H 0d`), but the per-session
+    `tokio::Mutex` is held across all three — otherwise a concurrent
+    `/send` could interleave its text before our Enter, and both
+    messages land on the wrong agent turn. `tmux::send_keys` owns the
+    whole sequence; don't split it or wrap it in a cancel `select!`.
+19. **STT transcripts are byte-capped at `MAX_TRANSCRIPT_BYTES` (4000)
+    before entering `handler::parse`.** Matches
+    `TELEGRAM_MAX_OUTPUT_CHARS`'s upper bound. Without this, a long
+    noisy voice recording could paste 100+ KiB of transcribed text
+    into tmux and bypass every text-message size limit. The cap is in
+    bytes (not chars) because `text.len()` is bytes; the config key
+    uses "CHARS" for historical reasons.
 
 ## Architectural rules
 

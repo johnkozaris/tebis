@@ -7,7 +7,7 @@ before filing a PR.
 
 ## Ground rules
 
-1. **Read `CLAUDE.md`.** It enumerates security invariants (1–17) and
+1. **Read `CLAUDE.md`.** It enumerates security invariants (1–19) and
    architectural rules that must not be weakened without explicit
    discussion. Most of them have been reached after a concrete bug, CVE,
    or misbehaving client.
