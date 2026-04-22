@@ -1,11 +1,5 @@
-//! tmux subprocess wrapper.
-//!
-//! Every public method validates the session name against
-//! [`is_valid_session_name`], serializes operations on the same session
-//! via a per-session lock, and classifies tmux stderr into [`TmuxError`]
-//! so callers can recover from stale state without matching on free-form
-//! strings. Two modes: strict (pre-declared allowlist) or permissive (any
-//! regex-valid name, slot allocated on first use).
+//! tmux subprocess wrapper. Validates session names, serializes per-session
+//! ops via mutex, classifies errors. Strict or permissive allowlist.
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -16,29 +10,21 @@ use tokio::sync::Mutex;
 
 use crate::sanitize;
 
-/// Gap between the text and the Enter keystroke. Ink/React TUIs
-/// (Claude Code) treat Enter that arrives too close to text as a newline
-/// inside the input rather than a submit. 300 ms is safe; 100 ms was not.
+/// 300 ms is safe; Ink/React TUIs drop Enter that arrives too close to text.
 const SUBMIT_GAP: Duration = Duration::from_millis(300);
 
 pub struct Tmux {
     strict: HashMap<String, Arc<SessionSlot>>,
-    /// Lazy slots (permissive mode). Never shrinks — key is a bounded,
-    /// regex-validated name, so growth is driven by real user traffic.
     dynamic: std::sync::Mutex<HashMap<String, Arc<SessionSlot>>>,
     permissive: bool,
     max_output_chars: usize,
 }
 
-/// `exact_target` is the precomputed `=NAME` argv value; `Mutex` serializes
-/// per-session operations.
 struct SessionSlot {
     exact_target: String,
     lock: Mutex<()>,
 }
 
-/// Display strings never leak the internal `=NAME` exact-match prefix —
-/// that's tmux wire syntax, not something users should paste back.
 #[derive(Debug, thiserror::Error)]
 pub enum TmuxError {
     #[error("session '{0}' not found")]
@@ -53,7 +39,6 @@ pub enum TmuxError {
     #[error("session '{session}' is not in the allowlist. Allowed: {allowed}")]
     NotAllowed { session: String, allowed: String },
 
-    /// Sanitization stripped the entire message (pure control / bidi).
     #[error("message is empty (nothing to send after sanitization)")]
     EmptyInput,
 
@@ -77,8 +62,7 @@ impl TmuxError {
 pub type Result<T> = std::result::Result<T, TmuxError>;
 
 impl Tmux {
-    /// Empty `allowed` enables **permissive mode** — any regex-valid name
-    /// resolves, slots allocated on first reference.
+    /// Empty `allowed` → permissive mode.
     pub fn new(allowed: Vec<String>, max_output_chars: usize) -> Self {
         let permissive = allowed.is_empty();
         let strict = allowed
@@ -107,12 +91,7 @@ impl Tmux {
         self.permissive
     }
 
-    /// Count of lazily-allocated slots in permissive mode. Used by the
-    /// dashboard so operators can see the `dynamic` HashMap's size —
-    /// it never shrinks by design (allocation is driven by bounded,
-    /// regex-validated session names), but a runaway bot provisioning
-    /// hundreds of ad-hoc sessions would surface here before it
-    /// becomes a memory concern.
+    /// Lazily-allocated slot count (permissive mode). Exposed for the dashboard.
     #[must_use]
     pub fn dynamic_slot_count(&self) -> usize {
         self.dynamic
@@ -143,17 +122,8 @@ impl Tmux {
         Ok(sessions)
     }
 
-    /// Sends text with `-l` (literal, bypasses key-name lookup), a
-    /// `SUBMIT_GAP` pause, then Enter as raw hex `0d`. Per-session lock
-    /// keeps the text+Enter pair atomic against concurrent calls.
-    ///
-    /// **Invariant**: the `text` send → sleep → Enter send triple must
-    /// run under a single acquisition of the per-session mutex. Adding
-    /// an `.await` between the three sub-steps that isn't on the lock
-    /// itself is the bug — cancellation at an intermediate point can
-    /// leave characters in the pane without the submit Enter, which
-    /// then prepends onto the next command. Matches CLAUDE.md invariant
-    /// 3 (don't cancel mid-`send_keys`).
+    /// Text → sleep → Enter, atomic under the per-session lock (CLAUDE.md
+    /// invariants 3, 18: cancellation mid-sequence strands chars without Enter).
     pub async fn send_keys(&self, session: &str, text: &str) -> Result<()> {
         let slot = self.slot(session)?;
         let _guard = slot.lock.lock().await;
@@ -182,7 +152,6 @@ impl Tmux {
         Ok(())
     }
 
-    /// `has-session` is a pure query — no per-session lock taken.
     pub async fn has_session(&self, session: &str) -> Result<bool> {
         let slot = self.slot(session)?;
         let output = run_tmux("has-session", &["has-session", "-t", &slot.exact_target]).await?;
@@ -224,8 +193,6 @@ impl Tmux {
         }
     }
 
-    /// `-J` joins wrapped lines deterministically. Holds the per-session
-    /// lock so a concurrent `send_keys` can't interleave.
     pub async fn capture_pane(&self, session: &str, lines: usize) -> Result<String> {
         let slot = self.slot(session)?;
         let _guard = slot.lock.lock().await;
@@ -254,7 +221,6 @@ impl Tmux {
         self.slot(session).map(|_| ())
     }
 
-    /// Strict allowlist snapshot. Empty in permissive mode.
     pub fn allowlisted_sessions(&self) -> Vec<String> {
         self.strict.keys().cloned().collect()
     }
@@ -273,8 +239,7 @@ impl Tmux {
                 allowed,
             });
         }
-        // Lazy alloc + cache; re-check under the lock so concurrent first
-        // references share one slot (and one mutex).
+        // Double-check under the lock so concurrent first references share one slot.
         let fresh = {
             let mut map = self.dynamic.lock().expect("dynamic slots poisoned");
             if let Some(slot) = map.get(session) {
@@ -291,8 +256,7 @@ impl Tmux {
     }
 }
 
-/// Shell-metachar / path-traversal defense. Enforced at config load and
-/// at every public `Tmux` method via `slot`.
+/// Shell-metachar / path-traversal defense. Invariant 2.
 #[must_use]
 pub fn is_valid_session_name(name: &str) -> bool {
     !name.is_empty()

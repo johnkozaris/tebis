@@ -92,10 +92,16 @@ pub fn wrap_and_truncate(escaped_body: &str, open: &str, close: &str) -> String 
     let target = MAX_MSG.saturating_sub(overhead + TRUNC_SUFFIX.len());
     let mut cut = escaped_body.floor_char_boundary(target);
 
-    // Don't cut inside an HTML entity (`&amp;` is 5 chars; window of 6).
+    // Don't cut inside an HTML entity. `escape_html` currently emits
+    // only `&amp;` `&lt;` `&gt;` `&quot;` `&#39;` — longest is 6 chars
+    // (`&quot;`), so a window of 6 suffices. If a future change adds a
+    // longer entity (e.g. numeric `&#x1F600;` at 9 chars), BUMP THIS
+    // BOUND. Without the bump, tail-truncate could slice mid-entity
+    // and emit malformed HTML that Telegram rejects.
+    const MAX_ENTITY_LEN: usize = 6;
     if let Some(amp) = escaped_body[..cut].rfind('&') {
         let tail = &escaped_body[amp..cut];
-        if !tail.contains(';') && tail.len() < 6 {
+        if !tail.contains(';') && tail.len() < MAX_ENTITY_LEN {
             cut = amp;
         }
     }

@@ -12,16 +12,20 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
 pub(super) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    // Process-id + nanosecond-unique tmp name so two concurrent
-    // tebis processes materializing the same target file don't race
-    // on each other's `.tebis.tmp` — each atomically renames its own
-    // private tmp, and only the second write wins the rename,
-    // leaving no stale tmp behind.
+    // Process-id + nanosecond + monotonic-counter unique tmp name.
+    // Two concurrent tasks within the same process hitting the same
+    // nanosecond tick would otherwise pick the same tmp name; both
+    // would "succeed" via `File::create` (truncate-open) and the
+    // later's content could overwrite the earlier mid-flight. The
+    // counter guarantees uniqueness even at sub-nanosecond spacing.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
     let tmp_name = format!(
-        "{}.tebis.tmp.{}.{}",
+        "{}.tebis.tmp.{}.{}.{seq}",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("unnamed"),
         std::process::id(),
         nanos,

@@ -267,13 +267,20 @@ async fn new(deps: &Deps<'_>, session: &str) -> HandleResult {
 }
 
 async fn kill(deps: &Deps<'_>, session: &str) -> HandleResult {
-    let result = deps.tmux.kill_session(session).await;
+    // Validate + execute first, mutate state only on success. `kill_session`
+    // is idempotent (NotFound → Ok), so "already gone" still reaches the
+    // clear + unmark below. Mutating before validation was a no-op for
+    // invalid-name input (both helpers are no-ops on non-matches), but
+    // side-effects-before-check is a fragile pattern.
+    deps.tmux
+        .kill_session(session)
+        .await
+        .map_err(|e| e.to_string())?;
     deps.session.clear_target_if(session);
     // Forget that this session was hooked — if the user later
     // `/new`s a bare session with the same name, pane-settle should
     // apply, not the stale "hooks will deliver" assumption.
     deps.session.unmark_hooked(session);
-    result.map_err(|e| e.to_string())?;
     Ok(Response::ReactSuccess)
 }
 

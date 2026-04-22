@@ -27,12 +27,25 @@ pub(super) fn expected_origins_for(port: u16) -> Vec<String> {
     ]
 }
 
+/// Host-header values a legitimate same-host request could carry.
+/// Used to defeat DNS rebinding: the dashboard binds to 127.0.0.1,
+/// but an attacker site (`evil.example`) that rebinds to 127.0.0.1
+/// still arrives with `Host: evil.example`. Rejecting any Host not in
+/// this list confines the dashboard to direct-loopback access.
+pub(super) fn expected_hosts_for(port: u16) -> Vec<String> {
+    vec![
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+    ]
+}
+
 pub(super) async fn accept_loop(
     listener: TcpListener,
     shutdown: CancellationToken,
     snapshot: Arc<Snapshot>,
     live: Arc<LiveContext>,
     expected_origins: Arc<Vec<String>>,
+    expected_hosts: Arc<Vec<String>>,
     _tracker: TaskTracker,
 ) {
     loop {
@@ -53,6 +66,7 @@ pub(super) async fn accept_loop(
         let snapshot = snapshot.clone();
         let live = live.clone();
         let expected_origins = expected_origins.clone();
+        let expected_hosts = expected_hosts.clone();
         let conn_shutdown = shutdown.clone();
         // Per-connection tasks are NOT tracked: a browser with the
         // dashboard open holds a keep-alive connection that would stall
@@ -65,7 +79,10 @@ pub(super) async fn accept_loop(
                 let snapshot = snapshot.clone();
                 let live = live.clone();
                 let expected_origins = expected_origins.clone();
-                async move { handle(req, snapshot, live, expected_origins).await }
+                let expected_hosts = expected_hosts.clone();
+                async move {
+                    handle(req, snapshot, live, expected_origins, expected_hosts).await
+                }
             });
             let serve = http1::Builder::new()
                 .timer(TokioTimer::new())
@@ -94,7 +111,18 @@ async fn handle(
     snapshot: Arc<Snapshot>,
     live: Arc<LiveContext>,
     expected_origins: Arc<Vec<String>>,
+    expected_hosts: Arc<Vec<String>>,
 ) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
+    // DNS-rebinding defense, applied to EVERY request (GET and POST).
+    // An attacker domain that rebinds to 127.0.0.1 still arrives with
+    // its own name in the Host header; our bind is loopback-only, but
+    // a browser tricked by rebinding would happily send `GET /status`
+    // with `Host: evil.example`. Refusing any Host not in the allowed
+    // set confines the dashboard to direct-loopback use. The Origin
+    // check below stays — CSRF and DNS-rebinding are distinct attacks.
+    if !host_is_trusted(&req, &expected_hosts) {
+        return Ok(text_response(StatusCode::FORBIDDEN, "forbidden\n"));
+    }
     let path = req.uri().path().to_string();
     match (req.method(), path.as_str()) {
         (&Method::GET, "/" | "/index.html") => {
@@ -277,10 +305,20 @@ fn parse_config_form(
                 if decoded.chars().any(char::is_control) {
                     return Err("autostart_dir must not contain control characters\n");
                 }
-                if !Path::new(&decoded).is_dir() {
+                // Canonicalize so `.` / `..` / trailing `/` normalize to
+                // a single shape. Without this, an operator paste like
+                // `~/project/.` writes a literal unresolved path that
+                // survives restart and reads differently than the wizard
+                // would write it.
+                let canon = std::fs::canonicalize(&decoded)
+                    .map_err(|_| "autostart_dir must be an existing directory\n")?;
+                if !canon.is_dir() {
                     return Err("autostart_dir must be an existing directory\n");
                 }
-                autostart_dir = Some(decoded);
+                autostart_dir = Some(
+                    canon.into_os_string().into_string()
+                        .map_err(|_| "autostart_dir must be valid UTF-8\n")?,
+                );
             }
             _ => {}
         }
@@ -371,6 +409,24 @@ fn origin_is_trusted(req: &Request<Incoming>, expected: &[String]) -> bool {
     expected.iter().any(|e| e == origin_str)
 }
 
+/// Host-header check for DNS-rebinding defense. Unlike Origin (which
+/// is absent on many GETs), Host is required by HTTP/1.1 and set by
+/// every browser to the name the user typed. A rebind-to-127.0.0.1
+/// attack still carries the attacker's hostname in `Host:`, so
+/// rejecting any Host not in the expected set blocks the attack.
+///
+/// Missing Host = malformed HTTP/1.1 → reject; attackers have no
+/// reason to omit it, and legit clients always send it.
+fn host_is_trusted(req: &Request<Incoming>, expected: &[String]) -> bool {
+    let Some(host) = req.headers().get(hyper::header::HOST) else {
+        return false;
+    };
+    let Ok(host_str) = host.to_str() else {
+        return false;
+    };
+    expected.iter().any(|e| e == host_str)
+}
+
 // ---------- response constructors ----------
 
 fn html_response(body: String) -> Response<Full<Bytes>> {
@@ -419,6 +475,46 @@ mod tests {
         let origins = expected_origins_for(8080);
         assert!(origins.contains(&"http://127.0.0.1:8080".to_string()));
         assert!(origins.contains(&"http://localhost:8080".to_string()));
+    }
+
+    #[test]
+    fn expected_hosts_strip_scheme_from_origins() {
+        let hosts = expected_hosts_for(8080);
+        assert!(hosts.contains(&"127.0.0.1:8080".to_string()));
+        assert!(hosts.contains(&"localhost:8080".to_string()));
+        // Explicit negative: the Host header shape must not carry scheme.
+        assert!(!hosts.iter().any(|h| h.starts_with("http")));
+    }
+
+    // `host_is_trusted` takes `Request<Incoming>`, which stable hyper
+    // doesn't let us construct in unit tests (Incoming is crate-private).
+    // Exercise the set-membership predicate via `expected_hosts_for`
+    // directly — the function's real logic is "header string ∈ list";
+    // that's what these two tests cover.
+    #[test]
+    fn host_trusted_accepts_exact_loopback_and_localhost() {
+        let hosts = expected_hosts_for(8080);
+        for ok in ["127.0.0.1:8080", "localhost:8080"] {
+            assert!(hosts.iter().any(|h| h == ok), "missing allowed host {ok}");
+        }
+    }
+
+    #[test]
+    fn host_trusted_rejects_rebind_attacker_names() {
+        let hosts = expected_hosts_for(8080);
+        for bad in [
+            "evil.example",
+            "evil.example:8080",
+            "127.0.0.1:8081",    // wrong port
+            "127.0.0.2:8080",    // wrong octet
+            "localhost",         // port omitted
+            "",
+        ] {
+            assert!(
+                !hosts.iter().any(|h| h == bad),
+                "expected_hosts contains unexpected value {bad:?}"
+            );
+        }
     }
 
     #[test]

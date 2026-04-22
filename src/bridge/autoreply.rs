@@ -125,7 +125,19 @@ pub async fn watch_and_forward(
                 }
             }
             Err(e) => {
-                tracing::debug!(session = %session, err = %e, "autoreply: capture failed, aborting");
+                // Mid-watch capture failure (session killed externally,
+                // tmux server died). The user's keystroke already landed
+                // — we owe them *some* ack or they see only the fading
+                // "typing…" dots. Fall back to 👍 like the empty-tail
+                // branch below; don't swallow silently.
+                tracing::debug!(session = %session, err = %e, "autoreply: capture failed, falling back to 👍");
+                typing.cancel();
+                if let Err(re) = tg.set_message_reaction(chat_id, message_id, "👍").await {
+                    tracing::warn!(
+                        err = %re, session = %session,
+                        "autoreply: fallback reaction after capture failure also failed"
+                    );
+                }
                 return;
             }
         }
@@ -154,7 +166,16 @@ pub async fn watch_and_forward(
     }
     let body = format_pane_reply(&tail);
     if let Err(e) = tg.send_message(chat_id, &body).await {
-        tracing::warn!(err = %e, session = %session, "autoreply: send_message failed");
+        // send_message failed — the user still deserves an ack that
+        // the command landed. Try 👍 as a last resort so the client's
+        // typing indicator doesn't just fade without any signal.
+        tracing::warn!(err = %e, session = %session, "autoreply: send_message failed, trying 👍 fallback");
+        if let Err(re) = tg.set_message_reaction(chat_id, message_id, "👍").await {
+            tracing::warn!(
+                err = %re, session = %session,
+                "autoreply: send_message + reaction both failed — user gets no ack"
+            );
+        }
     }
 }
 
@@ -196,7 +217,14 @@ fn extract_new(baseline: Option<&str>, after: &str) -> String {
         .rev()
         .collect::<Vec<_>>()
         .join("\n");
-    after.rfind(&anchor).map_or_else(
+    // Use `find` (first match), NOT `rfind`. The baseline's last lines
+    // appear near the top of `after` (the pane grows downward as the
+    // agent replies). If the agent echoes the anchor verbatim in its
+    // new output (quoting the prompt, repeating an error, etc.),
+    // `rfind` would land inside the reply and strip the real content
+    // that preceded it. `find` anchors to the earlier occurrence —
+    // the one in the baseline portion — so everything after is new.
+    after.find(&anchor).map_or_else(
         || after.to_string(),
         |pos| after[pos + anchor.len()..].to_string(),
     )
@@ -337,5 +365,25 @@ mod tests {
         let new = extract_new(Some(baseline), after);
         assert!(new.contains("the reply"));
         assert!(!new.contains("last real line"));
+    }
+
+    /// Regression: if the agent's reply echoes the anchor verbatim
+    /// (e.g. quoting the prompt back), `rfind` would land inside the
+    /// reply and truncate real content. `find` anchors to the earlier
+    /// (baseline) occurrence so all the reply is returned.
+    #[test]
+    fn extract_new_survives_anchor_echoed_in_reply() {
+        let baseline = "prompt> run the thing\n> ";
+        // Reply quotes the "prompt> run the thing" line back.
+        let after = "prompt> run the thing\n> \
+                     Sure, running the thing.\n\
+                     prompt> run the thing\n\
+                     Done!\n> ";
+        let new = extract_new(Some(baseline), after);
+        assert!(
+            new.contains("Sure, running the thing"),
+            "early content must not be stripped; got: {new:?}"
+        );
+        assert!(new.contains("Done!"), "tail must be included; got: {new:?}");
     }
 }

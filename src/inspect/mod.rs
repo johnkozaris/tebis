@@ -180,6 +180,7 @@ pub fn spawn(
 
     let live = Arc::new(live);
     let expected_origins = Arc::new(server::expected_origins_for(port));
+    let expected_hosts = Arc::new(server::expected_hosts_for(port));
     let tracker_for_conns = tracker.clone();
     tracker.spawn(server::accept_loop(
         listener,
@@ -187,6 +188,7 @@ pub fn spawn(
         snapshot,
         live,
         expected_origins,
+        expected_hosts,
         tracker_for_conns,
     ));
     Ok(())

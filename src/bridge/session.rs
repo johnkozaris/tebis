@@ -161,10 +161,18 @@ impl SessionState {
             return Err(ResolveError::AutostartCommandDied(auto.command.clone()));
         }
 
-        // Mark hooked before publishing the target so no observer ever
-        // sees `target == auto.session` with `is_hooked == false`.
+        // Mark or unmark hooked before publishing the target so no
+        // observer ever sees an inconsistent `(target, is_hooked)`
+        // pair. The `else` branch is load-bearing: on a re-provision
+        // after a failed hook install (disk full, EACCES,
+        // `TELEGRAM_HOOKS_MODE=off` after a prior `auto` run), a stale
+        // `is_hooked == true` would make `bridge::mod::handle_sent`
+        // suppress pane-settle and only show 20 s of `HOOK_TYPING_CAP`
+        // before silence.
         if hooked {
             self.mark_hooked(&auto.session);
+        } else {
+            self.unmark_hooked(&auto.session);
         }
         self.set_target(auto.session.clone());
         Ok(auto.session.clone())

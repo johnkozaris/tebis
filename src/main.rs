@@ -83,17 +83,13 @@ fn main() -> Result<()> {
     }
 }
 
-/// Dispatch what the wizard asked for — foreground run / service install /
-/// nothing (already printed instructions).
 fn handle_setup() -> Result<()> {
     match setup::run()? {
         setup::Next::Exit => Ok(()),
         setup::Next::Install => service::install(),
         setup::Next::RunForeground => {
             let env_path = setup::env_file_path()?;
-            // SAFETY: we're still in `main` before any async runtime or
-            // thread is spawned. `run_bridge` below creates the tokio
-            // runtime; env is loaded strictly before that.
+            // SAFETY: still in `main` before any runtime/thread spawn.
             unsafe { config::load_env_file(&env_path) }
                 .with_context(|| format!("loading env file {}", env_path.display()))?;
             run_bridge()
@@ -101,8 +97,6 @@ fn handle_setup() -> Result<()> {
     }
 }
 
-/// Make bare `tebis` Just Work after `tebis setup`. If the env vars are
-/// already present (systemd / launchd path), this is a no-op.
 fn ensure_env_loaded() -> Result<()> {
     if env::var("TELEGRAM_BOT_TOKEN").is_ok_and(|v| !v.is_empty()) {
         return Ok(());
@@ -113,15 +107,12 @@ fn ensure_env_loaded() -> Result<()> {
     if !path.exists() {
         nudge_to_setup();
     }
-    // SAFETY: called from `main` before the tokio runtime is built.
+    // SAFETY: called from `main` before any runtime/thread spawn.
     unsafe { config::load_env_file(&path) }
         .with_context(|| format!("loading env file {}", path.display()))?;
     Ok(())
 }
 
-/// `auto` / `off` — the user-facing name for `HooksMode`. Inline
-/// rather than adding an `impl Display` on `HooksMode` because the
-/// dashboard row is the only consumer.
 const fn hooks_mode_label(mode: tebis::agent_hooks::HooksMode) -> &'static str {
     match mode {
         tebis::agent_hooks::HooksMode::Auto => "auto",
@@ -137,10 +128,6 @@ fn nudge_to_setup() -> ! {
     process::exit(2);
 }
 
-/// Translate a 401 from Telegram into an operator-actionable anyhow error.
-/// Returned from `run_bridge` so launchd / systemd still see a failure
-/// exit, but the user gets a clear "re-run setup" message instead of a
-/// cryptic `API error 401: Unauthorized` crash loop.
 fn unauthorized_dead_end(err: &telegram::TelegramError) -> anyhow::Error {
     eprintln!();
     eprintln!(
@@ -156,8 +143,6 @@ fn unauthorized_dead_end(err: &telegram::TelegramError) -> anyhow::Error {
 
 use bridge::MAX_CONCURRENT_HANDLERS;
 
-/// Acquire the single-instance lock. On conflict, tell the user exactly
-/// who holds it — the background service, a foreground run, or unknown.
 fn acquire_instance_lock() -> Result<lockfile::LockFile> {
     let path = lockfile::default_path();
     match lockfile::acquire(&path) {
@@ -203,12 +188,9 @@ fn acquire_instance_lock() -> Result<lockfile::LockFile> {
 async fn run_bridge() -> Result<()> {
     print_startup_banner();
 
-    // Single-instance guard. Held for the lifetime of the daemon; dropped
-    // at function exit, which releases the flock and removes the file.
     let _lock = acquire_instance_lock()?;
 
-    // HTTP/TLS crates pinned at warn so bot tokens embedded in request URLs
-    // never appear at debug level in the journal.
+    // Pin HTTP/TLS crates at warn — bot tokens live in request URLs.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -218,8 +200,14 @@ async fn run_bridge() -> Result<()> {
         .init();
 
     std::panic::set_hook(Box::new(|info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&'static str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string payload>");
         tracing::error!(
-            "PANIC at {}: panicked",
+            "PANIC at {}: {msg}",
             info.location()
                 .map_or_else(|| "unknown".to_string(), ToString::to_string)
         );
@@ -234,9 +222,8 @@ async fn run_bridge() -> Result<()> {
         "Config loaded"
     );
 
-    // Build the shutdown token + signal listener BEFORE the Telegram
-    // startup so a SIGTERM during a Telegram outage breaks out of the
-    // getMe / deleteWebhook retry budget (up to ~50s without this race).
+    // Shutdown token built before Telegram startup so SIGTERM during
+    // a getMe/deleteWebhook outage breaks out of the retry budget.
     let shutdown = CancellationToken::new();
     let tracker = TaskTracker::new();
     {
@@ -285,18 +272,7 @@ async fn run_bridge() -> Result<()> {
 
     let autoreply_cfg = config.autoreply.take().map(Arc::new);
 
-    // Audio subsystem: constructed lazily. With STT off (the
-    // public-release default) `new` touches nothing — no download, no
-    // memory. When STT is on, this is the blocking model-download path
-    // (~53 s on first run for `base.en`); we run it on the current
-    // task so startup waits for a cached-and-ready subsystem before
-    // the bridge accepts messages.
-    //
-    // Fail-open: if model download or whisper-rs load fails we log a
-    // warn and continue text-only. Bot token problems are different
-    // (handled by `unauthorized_dead_end` above); audio problems are
-    // recoverable by unsetting TELEGRAM_STT or fixing the underlying
-    // cause, so we shouldn't crash.
+    // Fail-open: STT/TTS init problems log and continue text-only.
     let audio = if config.audio.any_enabled() {
         match audio::AudioSubsystem::new(&config.audio, &tracker, shutdown.clone()).await {
             Ok(a) => {
@@ -318,16 +294,10 @@ async fn run_bridge() -> Result<()> {
         None
     };
 
-    // Snapshot is built AFTER the audio subsystem so the dashboard's
-    // Voice section can reflect real initialization state (model loaded
-    // vs download failed) rather than guessing from config alone.
+    // Built after the audio subsystem so the Voice section reflects
+    // real init state (model loaded vs download failed).
     let inspect_snapshot = if inspect_port.is_some() {
         let tmux_ver = inspect::tmux_version().await;
-        // Voice section reflects ACTUAL runtime state, not config
-        // intent. On Linux with TELEGRAM_TTS=on, TTS init fails with
-        // UnsupportedPlatform and the subsystem continues STT-only —
-        // the dashboard should say "TTS disabled" for that user, not
-        // dangle a voice name that isn't actually synthesizing.
         let voice_info = if config.audio.any_enabled() {
             Some(inspect::VoiceInfo {
                 stt_model: config.audio.stt.as_ref().map(|s| s.model.clone()),
@@ -401,9 +371,7 @@ async fn run_bridge() -> Result<()> {
         );
     }
 
-    // Snapshot everything `print_ready_status` needs BEFORE we move
-    // `config.autostart` into `SessionState`. Reading from env vars at
-    // print time would work but drifts from the validated Config.
+    // Snapshot before `config.autostart` is moved into `SessionState`.
     let ready_allowlist = config.allowed_sessions.clone();
     let ready_autostart = config
         .autostart
@@ -438,8 +406,7 @@ async fn run_bridge() -> Result<()> {
 
     let mut offset: Option<i64> = None;
     let mut backoff = Duration::from_secs(1);
-    // 409 Conflict → another poller holds the long-poll. Wait at least
-    // `poll_timeout + 5s` so the prior long-poll expires before we retry.
+    // 409: wait poll_timeout+5s so the other poller's long-poll expires.
     let conflict_backoff = Duration::from_secs(u64::from(config.poll_timeout) + 5);
 
     tracing::info!(
@@ -448,7 +415,6 @@ async fn run_bridge() -> Result<()> {
         "Bridge ready"
     );
 
-    // Human-friendly status block — complements the structured log above.
     print_ready_status(
         &me,
         config.allowed_user_id,
@@ -503,9 +469,7 @@ async fn run_bridge() -> Result<()> {
                             size_bytes: v.file_size,
                         }
                     } else if let Some(a) = message.audio {
-                        // Music-file upload, same code path as voice.
-                        // The codec only accepts OGG/Opus; MP3/M4A uploads
-                        // will be rejected downstream with a clear error.
+                        // Audio uploads share the voice path; codec only accepts OGG/Opus.
                         tracing::debug!(
                             chat_id,
                             duration_sec = a.duration,
@@ -519,9 +483,6 @@ async fn run_bridge() -> Result<()> {
                             size_bytes: a.file_size,
                         }
                     } else {
-                        // No handled content (sticker, photo, …). Drop
-                        // silently — different from voice-with-STT-off
-                        // which gets a user-facing reply.
                         continue;
                     };
 
@@ -554,11 +515,7 @@ async fn run_bridge() -> Result<()> {
                     () = shutdown.cancelled() => break,
                 }
             }
-            // 401 at runtime means the bot token was revoked mid-session.
-            // The poll loop would otherwise retry with exponential backoff
-            // forever, spamming the journal. Exit with a clean error so
-            // the operator sees the paste-a-fresh-token message on next
-            // launch (startup re-runs `get_me` which also dead-ends 401).
+            // 401 mid-session: token was revoked. Exit clean instead of retry-spamming.
             Err(e) if e.is_unauthorized() => {
                 metrics.record_poll_error();
                 return Err(unauthorized_dead_end(&e));
@@ -592,8 +549,6 @@ async fn run_bridge() -> Result<()> {
     Ok(())
 }
 
-/// One-line identity banner. Suppressed when stdout isn't a terminal so
-/// systemd / launchd logs stay clean.
 fn print_startup_banner() {
     let term = console::Term::stdout();
     if !term.is_term() {
@@ -608,8 +563,6 @@ fn print_startup_banner() {
     );
 }
 
-/// Human-readable "what's running" block. Printed after the bridge reaches
-/// ready, only when stdout is a tty (systemd / launchd logs stay structured).
 fn print_ready_status(
     me: &tebis::telegram::types::BotUser,
     allowed: i64,

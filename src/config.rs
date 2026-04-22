@@ -1,10 +1,5 @@
-//! Env-var parsing + validation.
-//!
-//! Config types live with the subsystems that consume them:
-//! `AutostartConfig` in `bridge::session`, `NotifyConfig` in `notify`,
-//! `AutoreplyConfig` in `bridge::autoreply`, `HooksMode` in
-//! `agent_hooks`. This module is just a "populate from env" adapter
-//! that knows which env vars map to which consumer type.
+//! Env → `Config`. Each subsystem owns its own config struct; this module
+//! just maps env vars onto them.
 
 use anyhow::{Context, Result, bail};
 use secrecy::{ExposeSecret, SecretString};
@@ -28,24 +23,13 @@ pub struct Config {
     pub allowed_sessions: Vec<String>,
     pub poll_timeout: u32,
     pub max_output_chars: usize,
-    /// Outbound-notify listener. Enabled by default (`chat_id` defaults
-    /// to `allowed_user_id`). Opt out with `TELEGRAM_NOTIFY=off`.
     pub notify: Option<NotifyConfig>,
-    /// `Some` only when all three `TELEGRAM_AUTOSTART_*` env vars are set.
     pub autostart: Option<AutostartConfig>,
-    /// TUI-agnostic auto-reply. Default on; opt out via
-    /// `TELEGRAM_AUTOREPLY=off`.
     pub autoreply: Option<AutoreplyConfig>,
-    /// How tebis handles agent hooks at autostart time.
     pub hooks_mode: HooksMode,
-    /// STT / TTS settings. `stt: None` and `tts: None` inside means the
-    /// audio subsystem is dormant — no model downloads, no memory cost.
     pub audio: AudioConfig,
 }
 
-/// Parse an env-var toggle with a default when unset or empty.
-/// Wraps [`env_file::parse_toggle`] so operators see which `TELEGRAM_*`
-/// var failed when they pass a typo'd value.
 fn parse_toggle_env(key: &str, default: bool) -> Result<bool> {
     let raw = env::var(key).unwrap_or_default();
     env_file::parse_toggle(&raw)
@@ -72,7 +56,7 @@ impl Config {
             bail!("TELEGRAM_ALLOWED_USER must be positive");
         }
 
-        // Unset or empty → permissive mode (any regex-valid name resolves).
+        // Empty → permissive mode.
         let allowed_sessions: Vec<String> = env::var("TELEGRAM_ALLOWED_SESSIONS")
             .unwrap_or_default()
             .split(',')
@@ -93,7 +77,6 @@ impl Config {
             .unwrap_or_else(|_| "30".to_string())
             .parse()
             .context("TELEGRAM_POLL_TIMEOUT must be a valid integer")?;
-        // 0 busy-loops getUpdates; 900 matches the dashboard slider range.
         if !(1..=900).contains(&poll_timeout) {
             bail!("TELEGRAM_POLL_TIMEOUT must be 1..=900 (0 busy-loops)");
         }
@@ -102,7 +85,6 @@ impl Config {
             .unwrap_or_else(|_| "4000".to_string())
             .parse()
             .context("TELEGRAM_MAX_OUTPUT_CHARS must be a valid integer")?;
-        // Mirrors the dashboard Settings-panel bounds.
         if !(100..=20_000).contains(&max_output_chars) {
             bail!("TELEGRAM_MAX_OUTPUT_CHARS must be 100..=20000");
         }
@@ -130,25 +112,12 @@ impl Config {
     }
 }
 
-/// Build [`AudioConfig`] from `TELEGRAM_{STT,TTS}_*` env. Both
-/// branches are independent; default for both is off.
 fn load_audio_config() -> Result<AudioConfig> {
     let stt = load_stt_config()?;
     let tts = load_tts_config()?;
     Ok(AudioConfig { stt, tts })
 }
 
-/// Resolve the TTS configuration from `TELEGRAM_TTS_*` env vars.
-///
-/// Selection order:
-/// 1. `TELEGRAM_TTS_BACKEND=none` (or `off`) → `None`, no TTS.
-/// 2. `TELEGRAM_TTS_BACKEND=<say|kokoro-local|kokoro-remote>` → load
-///    that backend's specific config.
-/// 3. `TELEGRAM_TTS_BACKEND` unset but legacy `TELEGRAM_TTS=on` → fall
-///    back to the platform's historical default (`say` on macOS;
-///    hard error on other platforms so existing macOS env files keep
-///    working across upgrades without silently enabling something).
-/// 4. Neither set → `None`.
 fn load_tts_config() -> Result<Option<TtsConfig>> {
     let backend_raw = env::var("TELEGRAM_TTS_BACKEND").ok();
     let legacy_on = parse_toggle_env("TELEGRAM_TTS", false)?;
@@ -158,9 +127,6 @@ fn load_tts_config() -> Result<Option<TtsConfig>> {
             if !legacy_on {
                 return Ok(None);
             }
-            // Legacy fallback: TELEGRAM_TTS=on with no explicit backend
-            // means "the Phase-4a default" — `say` on macOS, refuse
-            // elsewhere so operators notice the new env-var contract.
             #[cfg(target_os = "macos")]
             {
                 "say".to_string()
@@ -177,7 +143,6 @@ fn load_tts_config() -> Result<Option<TtsConfig>> {
         Some(s) => s.to_ascii_lowercase(),
     };
 
-    // Short-circuit disabled.
     if matches!(backend_kind.as_str(), "none" | "off" | "false" | "0") {
         return Ok(None);
     }
@@ -203,12 +168,6 @@ fn load_tts_config() -> Result<Option<TtsConfig>> {
         "kokoro-local" | "kokoro_local" | "local" => {
             let voice =
                 env::var("TELEGRAM_TTS_VOICE").unwrap_or_else(|_| "af_sarah".to_string());
-            // Defensive shape check. Manifest validation at audio-init
-            // time also rejects unknown voices, but a `/` or `..` in
-            // the string would otherwise reach
-            // `voices_dir.join(format!("{voice}.bin"))` in the Kokoro
-            // crate — path traversal surface if manifest validation
-            // ever reorders. Same bar as `is_valid_session_name`.
             ensure_safe_voice_name(&voice)?;
             let model = env::var("TELEGRAM_TTS_MODEL").ok().unwrap_or_else(|| {
                 crate::audio::manifest::get()
@@ -323,9 +282,8 @@ fn load_stt_config() -> Result<Option<SttConfig>> {
     }))
 }
 
-/// Half of logical CPUs, clamped to `[2, 8]`. Whisper.cpp scales well up
-/// to ~8 threads on small models; past that it's contention. Half-of-all
-/// leaves headroom for tokio + the rest of tebis.
+/// Half of logical CPUs clamped to `[2, 8]`. Whisper scales to ~8 threads
+/// on small models; past that it's contention.
 fn default_threads() -> u32 {
     let total = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
     let half = (total / 2).clamp(2, 8);
