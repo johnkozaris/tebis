@@ -51,6 +51,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all-targets
+      # Kokoro-gated tests live in the separate `tebis-tts-kokoro`
+      # crate. Without `--features kokoro` the tebis adapter + the
+      # crate itself still compile, but the crate's 49 unit tests
+      # never exercise. Run them explicitly.
+      - run: cargo test --locked --workspace --features tebis/kokoro
 
   build:
     name: cargo build --release
@@ -62,6 +67,20 @@ jobs:
       - run: cargo build --release --locked
       - name: Report binary size
         run: ls -lh target/release/tebis
+
+  # Push/PR-time dep-graph audit. Fixes the class of "banned crate
+  # introduced in a PR and only caught by the nightly audit.yml the
+  # following day." Inputs here are all hard-coded — no untrusted
+  # user content reaches any `run:` shell.
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
 
   # The hook scripts are embedded via `include_str!` and ship inside
   # the release binary; a shell-level regression caught only at runtime

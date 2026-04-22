@@ -245,18 +245,36 @@ impl TelegramClient {
     /// transient TCP hiccups is the right shape — full `post_with_timeout`
     /// backoff is overkill and slows the user feedback loop.
     pub async fn download_file(&self, file_path: &str) -> Result<Bytes> {
-        // Defensive: Telegram's API currently never returns `file_path`
-        // with a leading slash, but if it ever did we'd build
-        // `/file/bot<TOKEN>//voice/…`. Most servers normalize, some
-        // don't; strip to be safe.
+        // Strip leading slash defensively — Telegram doesn't send one
+        // today, but builds `//voice/…` if they ever do.
         let file_path = file_path.trim_start_matches('/');
 
-        // `base_url` is `https://api.telegram.org/bot<TOKEN>` — swap
-        // `/bot<TOKEN>` for `/file/bot<TOKEN>` to reach the file-serving
-        // endpoint. The token stays wrapped in `SecretString` so `Debug`
-        // redaction keeps working.
+        // Defence in depth against a hostile/bugged server response.
+        // The Bot API documents `file_path` as a relative path like
+        // `voice/file_123.oga`. Reject anything that tries to break
+        // out — `..` segments (path traversal) or `://` (full-URL
+        // injection that'd redirect the request).
+        if file_path.split('/').any(|seg| seg == "..")
+            || file_path.contains("://")
+        {
+            return Err(TelegramError::Network {
+                method: "download_file".to_string(),
+                description: "rejected file_path with suspicious content".to_string(),
+                retryable: false,
+            });
+        }
+
+        // `base_url` = `https://api.telegram.org/bot<TOKEN>`. Swap
+        // `/bot<TOKEN>` for `/file/bot<TOKEN>`. Token stays wrapped in
+        // `SecretString` for `Debug` redaction.
         let url = {
             let base = self.base_url.expose_secret();
+            // The constant URL must start with this — if ever changed
+            // it's a coupled edit. Fail fast at test time.
+            debug_assert!(
+                base.starts_with("https://api.telegram.org/bot"),
+                "base_url shape invariant broken"
+            );
             let Some(token) = base.strip_prefix("https://api.telegram.org/bot") else {
                 return Err(TelegramError::Network {
                     method: "download_file".to_string(),
@@ -513,8 +531,26 @@ impl TelegramClient {
         let body_bytes = Bytes::from(body_bytes);
 
         let mut backoff = Duration::from_secs(1);
+        // Wall-clock cap across the whole retry loop. Individual
+        // requests get `request_timeout`, but `MAX_RETRIES` + worst-case
+        // 429 `retry_after` could stretch to ~25 minutes otherwise —
+        // and the caller (bridge handler) holds its semaphore permit
+        // the entire time. 3 minutes is plenty for real transient
+        // outages and bounds permit-starvation under a Telegram-side
+        // incident.
+        const TOTAL_RETRY_BUDGET: Duration = Duration::from_mins(3);
+        let start = std::time::Instant::now();
 
         for attempt in 0..=MAX_RETRIES {
+            if start.elapsed() > TOTAL_RETRY_BUDGET {
+                return Err(TelegramError::Network {
+                    method: method.into(),
+                    description: format!(
+                        "exceeded {TOTAL_RETRY_BUDGET:?} retry budget"
+                    ),
+                    retryable: false,
+                });
+            }
             let deadline = tokio::time::Instant::now() + request_timeout;
 
             let (status, body_bytes_resp) = match self

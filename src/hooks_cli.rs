@@ -106,6 +106,18 @@ fn uninstall(args: &[String]) -> Result<()> {
     let parsed = parse_args(args)?;
     let dir = resolve_dir(parsed.dir.as_deref())?;
 
+    // Non-existent project dir → bail loudly. Otherwise the per-agent
+    // `status()` call below would return empty defaults and we'd
+    // report "no tebis hooks installed" — technically correct but
+    // misleading.
+    if !dir.is_dir() {
+        anyhow::bail!(
+            "directory does not exist: {} — pass a valid project path or \
+             `cd` into the project and re-run without args",
+            dir.display()
+        );
+    }
+
     // Only run an agent's uninstaller when its status reports
     // something installed. Avoids destructive side-effects (e.g. the
     // Copilot installer pruning an empty `.github/` that the user

@@ -59,16 +59,32 @@ pub trait Forwarder: Send + Sync + 'static {
 pub struct TelegramForwarder {
     tg: Arc<TelegramClient>,
     chat_id: i64,
+    /// Caps concurrent in-flight forwards so a hook storm (Claude +
+    /// several SubagentStops landing within seconds) can't pin
+    /// Telegram's retry budget in every connection handler at once.
+    /// Two permits: enough for one in-flight + one queued — new
+    /// events above that wait their turn, which is fine because
+    /// notify is best-effort asynchronous.
+    send_sem: Arc<tokio::sync::Semaphore>,
 }
 
 impl TelegramForwarder {
-    pub const fn new(tg: Arc<TelegramClient>, chat_id: i64) -> Self {
-        Self { tg, chat_id }
+    pub fn new(tg: Arc<TelegramClient>, chat_id: i64) -> Self {
+        Self {
+            tg,
+            chat_id,
+            send_sem: Arc::new(tokio::sync::Semaphore::new(2)),
+        }
     }
 }
 
 impl Forwarder for TelegramForwarder {
     async fn forward(&self, payload: Payload) -> Result<(), ForwardError> {
+        let _permit = self
+            .send_sem
+            .acquire()
+            .await
+            .map_err(|e| ForwardError::Delivery(format!("semaphore closed: {e}")))?;
         let body = format::body(&payload);
         self.tg
             .send_message(self.chat_id, &body)

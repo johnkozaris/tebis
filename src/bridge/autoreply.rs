@@ -74,12 +74,17 @@ impl Default for AutoreplyConfig {
 /// runs on the shared `TaskTracker` (CLAUDE.md invariant 12):
 /// shutdown drains every outstanding typing loop alongside in-flight
 /// handlers.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "wires together tracker + tg + tmux + identifiers + baseline + cfg; a context struct adds more code than it saves"
+)]
 pub async fn watch_and_forward(
     tracker: TaskTracker,
     tg: Arc<TelegramClient>,
     tmux: Arc<Tmux>,
     session: String,
     chat_id: i64,
+    message_id: i64,
     baseline: Option<String>,
     cfg: Arc<AutoreplyConfig>,
 ) {
@@ -132,7 +137,16 @@ pub async fn watch_and_forward(
     let new_content = extract_new(baseline.as_deref(), &latest_pane);
     let tail = tail_chars(new_content.trim(), cfg.tail_chars);
     if tail.trim().is_empty() {
-        tracing::debug!(session = %session, "autoreply: nothing new to send");
+        // Nothing new in the pane — but the user's command still
+        // landed (we're here because the keystroke send succeeded).
+        // Fall back to the 👍 reaction so (a) the user gets an
+        // acknowledgement, (b) the residual "typing…" indicator
+        // on the client is replaced by the reaction animation
+        // instead of silently fading after 5 s.
+        tracing::debug!(session = %session, "autoreply: nothing new; reacting 👍");
+        if let Err(e) = tg.set_message_reaction(chat_id, message_id, "👍").await {
+            tracing::warn!(err = %e, session = %session, "autoreply: fallback reaction failed");
+        }
         return;
     }
     let body = format_pane_reply(&tail);

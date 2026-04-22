@@ -82,7 +82,11 @@ pub async fn handle_update(
     if let Err(retry_after) = ctx.rate_limiter.check(chat_id) {
         ctx.metrics.record_rate_limited();
         let secs = retry_after.as_secs().max(1);
-        let reply = format!("Rate limited. Try again in {secs}s.");
+        // Literal text is safe, but `send_message` sets parse_mode=HTML,
+        // so every body should route through escape_html defensively
+        // — if a future change drops in a formatted variable, it won't
+        // accidentally enable HTML injection on the rate-limit path.
+        let reply = sanitize::escape_html(&format!("Rate limited. Try again in {secs}s."));
         let _ = ctx.tg.send_message(chat_id, &reply).await;
         return;
     }
@@ -140,23 +144,26 @@ pub async fn handle_update(
 
     match response {
         Response::Text(body) => {
-            if let Err(e) = ctx.tg.send_message(chat_id, &body).await {
-                ctx.metrics.record_handler_error();
-                tracing::error!(err = %e, "Failed to send response");
-            }
-            // TTS path runs detached on the tracker so the handler
-            // releases its permit immediately — `say` + sendVoice can
-            // take seconds; we don't want to stall the next reply.
-            // Best-effort: failure only warns, the user already has
-            // the text.
-            if let Some(audio) = ctx.audio.as_ref()
+            let send_ok = match ctx.tg.send_message(chat_id, &body).await {
+                Ok(_) => true,
+                Err(e) => {
+                    ctx.metrics.record_handler_error();
+                    tracing::error!(err = %e, "Failed to send response");
+                    false
+                }
+            };
+            // TTS only fires when the text reply actually landed —
+            // otherwise the user sees "voice succeeded but text failed"
+            // which is confusing. Also detached on the tracker so the
+            // handler releases its permit immediately (synth + sendVoice
+            // can take seconds).
+            if send_ok
+                && let Some(audio) = ctx.audio.as_ref()
                 && audio.should_tts_reply(inbound_was_voice)
             {
                 let tg = ctx.tg.clone();
                 let metrics = ctx.metrics.clone();
                 let audio = audio.clone();
-                // `body` moves into the task — no clone, since we've
-                // already awaited the text send above.
                 ctx.tracker.spawn(async move {
                     synthesize_and_send_voice_detached(
                         &tg, &metrics, &audio, chat_id, &body,
@@ -182,14 +189,18 @@ pub async fn handle_update(
                 // message, the user investigates via /read or /status.
                 typing::spawn_with_cap(&ctx.tracker, ctx.tg.clone(), chat_id, HOOK_TYPING_CAP);
             } else if let Some(cfg) = ctx.autoreply.clone() {
-                // Auto-reply IS the ack — skip the 👍 so the user isn't
-                // getting a reaction plus a reply plus typing dots.
+                // Auto-reply IS the ack when it produces content —
+                // skip the 👍 up front. If the pane has nothing new,
+                // `watch_and_forward` falls back to the 👍 on
+                // `message_id` itself, so the user always gets one
+                // of: reply / reaction / failure log.
                 ctx.tracker.spawn(autoreply::watch_and_forward(
                     ctx.tracker.clone(),
                     ctx.tg.clone(),
                     ctx.tmux.clone(),
                     session,
                     chat_id,
+                    message_id,
                     baseline,
                     cfg,
                 ));

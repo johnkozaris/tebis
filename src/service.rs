@@ -104,7 +104,19 @@ fn install_binary(src: &Path, dst: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn install_macos() -> Result<()> {
-    let user = env::var("USER").context("USER env var not set")?;
+    // Derive the installing user from `$HOME`'s final path component,
+    // not from `$USER`. Under `sudo -E tebis install` / similar, `$USER`
+    // and `$HOME` can disagree (e.g. `$USER=root`, `$HOME=/Users/USERNAME`)
+    // which ends up writing a plist with the wrong username — launchd
+    // then loads it into root's domain instead of john's login
+    // session. `$HOME` is what drives the env-file + binary paths, so
+    // using its final component keeps everything internally consistent.
+    let home = env::var("HOME").context("HOME env var not set")?;
+    let user = std::path::Path::new(&home)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("HOME has no final path component — is $HOME malformed?")?
+        .to_string();
     let plist = MACOS_PLIST_TEMPLATE.replace("USERNAME", &user);
     let plist_path = plist_path()?;
     let plist_dir = plist_path
