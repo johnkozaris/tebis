@@ -1,3 +1,15 @@
+# The repo is a Cargo workspace. `tebis` (the daemon) is the root
+# package, and `crates/tebis-tts-kokoro/` holds the optional Kokoro
+# local TTS backend as a separate crate.
+#
+# Why a separate crate: dropping Kokoro — if we ever want to ship only
+# macOS `say` + remote HTTP — becomes a one-line change in this
+# `Cargo.toml` (remove the path dep + feature), not a surgical delete
+# across a module tree. Conversely, reusing the Kokoro backend from
+# another project is just `cargo add tebis-tts-kokoro`.
+[workspace]
+members = [".", "crates/tebis-tts-kokoro"]
+
 [package]
 description = "Telegram-tmux bridge for driving AI coding agents from a phone"
 edition = "2024"
@@ -49,34 +61,7 @@ tracing-subscriber = {version = "0.3.23", features = ["fmt", "env-filter"]}
 ogg = "0.9"
 opus = "0.3"
 
-# Phase 4b-v2 TTS: three backends.
-# - `say` (macOS) — shell-out, no deps, already shipped.
-# - `kokoro-remote` (cross-platform) — HTTP POST to an
-#   OpenAI-compatible TTS endpoint (Kokoro-FastAPI etc.). Uses the
-#   existing hyper + hyper-rustls stack, so zero new crates. Always
-#   compiled in.
-# - `kokoro-local` (cross-platform, optional) — ort + ndarray +
-#   shelling out to espeak-ng for phonemization. Opt-in via the
-#   `kokoro` cargo feature (adds ~20 MB of ONNX Runtime static libs).
-#   Feature is declared below but the deps are not yet wired in; the
-#   runtime surface returns `TtsError::Init("not yet implemented")`
-#   until `src/audio/tts/kokoro/` lands.
-#
-# Why we stopped trying to wrap third-party crates: kokoroxide,
-# kokoro-tiny, tts-rs, any-tts, and kitten_tts_rs each had a blocking
-# issue (yanked ort pin, non-feature-gated server deps, banned
-# transitive crates, etc.). The Rust Kokoro ecosystem isn't ready;
-# a direct ort integration in ~500 LoC is cleaner than vendoring a
-# partial fork. See PLAN-TTS-V2.md for the full reasoning.
-
-# Local STT — whisper.cpp Rust bindings, linked in-process. Inference
-# runs inside the tebis daemon, no subprocess / server / network hop.
-# Models are downloaded on first use (see src/audio/fetch.rs) and
-# kept under $XDG_DATA_HOME/tebis/models/. On macOS we enable Metal
-# so inference uses the GPU; Core ML would add another tier of
-# acceleration but requires a separate `.mlmodelc` download per
-# model — deferred to a later phase. On Linux the default build is
-# pure CPU (OpenBLAS can be layered later via a cargo feature).
+# whisper-rs is Metal-accelerated on macOS (GPU); CPU on Linux.
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = {version = "0.16", default-features = false, features = ["metal"]}
 
@@ -86,78 +71,18 @@ whisper-rs = {version = "0.16", default-features = false}
 [features]
 default = []
 # Enables the local Kokoro TTS backend (`TELEGRAM_TTS_BACKEND=kokoro-local`).
-# Pulls `ort` (ONNX Runtime) + `ndarray` + `ndarray-npy` (voice .bin
-# loader) + `num2words` + `regex` (text normalization for numbers /
-# titles / currency so Kokoro doesn't pronounce "2024" as "two zero
-# two four"). Users who only want remote TTS or macOS `say` should
-# leave this off.
-kokoro = [
-    "dep:ndarray",
-    "dep:num2words",
-    "dep:ort",
-    "dep:regex",
-]
+# Pulls the `tebis-tts-kokoro` crate, which transitively drags in
+# `ort` + `ndarray` + `num2words` + `regex` and requires `espeak-ng` +
+# `libonnxruntime` on the host at runtime. Leave off for a
+# remote-only / say-only binary.
+kokoro = ["dep:tebis-tts-kokoro"]
 
-# Local Kokoro TTS deps. Declared optional so the default build doesn't
-# link ONNX Runtime (adds ~20 MB of static libs). Only pulled in when
-# the `kokoro` feature is on.
-#
-# - `ort` 2.0.0-rc.x — maintained Rust bindings to Microsoft's ONNX
-#   Runtime. 2.0 line dropped the legacy `onnxruntime-sys` shim in favor
-#   of `ort-sys`, which is what current Kokoro Rust integrations use
-#   (tts-rs, kokoro-tts, kitten_tts_rs as of Q1 2026). We use
-#   `download-binaries` so cargo fetches the right onnxruntime static
-#   lib for the host — same story whisper-rs uses for its bindings.
-# - `ndarray` is the array primitive `ort` hands back; we own it too
-#   for shaping input_ids / style / speed.
-# - The per-voice `<name>.bin` files from HuggingFace are raw LE f32
-#   arrays of shape `(N, 1, 256)` — no `.npy` header, no container.
-#   `voices.rs` parses them by hand, so we don't pull in `ndarray-npy`.
-[dependencies.ndarray]
+# Local Kokoro backend lives in its own crate so dropping it (or
+# reusing it from another project) is a one-line dep change. See
+# `crates/tebis-tts-kokoro/` for the self-contained implementation.
+[dependencies.tebis-tts-kokoro]
 optional = true
-version = "0.16"
-default-features = false
-features = ["std"]
-
-[dependencies.ort]
-optional = true
-# Pinned to rc.10 because rc.11 + rc.12 have compile-time breakage
-# against `ort-sys` as of 2026-04: rc.11 pulls a broken ureq TLS
-# config via `download-binaries`, rc.12 references a VitisAI sys
-# field that its generated bindings don't expose. rc.10 is what
-# tts-rs 2026.2.3 uses in production and is known-good on Rust 1.95.
-version = "=2.0.0-rc.10"
-default-features = false
-# `load-dynamic` — load `libonnxruntime` at runtime from the system.
-# Mac: `brew install onnxruntime`. Linux: `apt install libonnxruntime-dev`.
-# Same pattern we use for espeak-ng (shell-out, not linked) and jq/nc
-# in `tebis hooks install` — we PATH-probe at startup and fail-open to
-# text replies when the shared library is missing.
-#
-# We explicitly avoid `download-binaries`: as of ort 2.0.0-rc.12 it
-# pulls `ureq` with a broken `rustls` TLS config that fails to build
-# against our workspace. `load-dynamic` also cuts ~20 MB of prebuilt
-# ONNX Runtime out of our release artifact.
-features = ["std", "load-dynamic"]
-
-# English-language number / ordinal / currency → words conversion for
-# the Kokoro text-normalization pass. Covers the pile of boundary rules
-# (hundred-thousand-million, hyphenation for 21-99, year-reading like
-# 1900 vs 2024) we'd otherwise reinvent. MIT-OR-Apache-2.0.
-[dependencies.num2words]
-optional = true
-version = "1"
-default-features = false
-
-# Pattern matching for titles (Dr., Mr., Mrs.), currency ($3.50), and
-# number extraction in the Kokoro normalizer. Already transitive via
-# other deps; promoted to a direct dep so upgrades aren't silently
-# coupled to unrelated crates' pins.
-[dependencies.regex]
-optional = true
-version = "1"
-default-features = false
-features = ["std", "unicode-perl"]
+path = "crates/tebis-tts-kokoro"
 
 [profile.release]
 codegen-units = 1

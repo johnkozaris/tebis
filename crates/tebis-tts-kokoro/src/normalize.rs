@@ -26,8 +26,6 @@
 //! That file is 500 LoC of Python covering every edge case; we port
 //! the 100-odd lines that matter.
 
-#![cfg(feature = "kokoro")]
-
 use std::sync::OnceLock;
 
 use num2words::{Currency, Lang, Num2Words};

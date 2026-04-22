@@ -857,24 +857,34 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "libc",
- "ndarray",
- "num2words",
  "ogg",
  "opus",
- "ort",
- "regex",
  "ring",
  "rustls",
  "secrecy",
  "serde",
  "serde_json",
  "strip-ansi-escapes",
+ "tebis-tts-kokoro",
  "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
  "whisper-rs",
+]
+
+[[package]]
+name = "tebis-tts-kokoro"
+version = "0.1.0"
+dependencies = [
+ "ndarray",
+ "num2words",
+ "ort",
+ "regex",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

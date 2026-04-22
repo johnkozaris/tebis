@@ -25,13 +25,11 @@
 //! style that doesn't match the utterance length — audibly wrong
 //! prosody.
 
-#![cfg(feature = "kokoro")]
-
 use std::path::Path;
 
 use ndarray::{Array2, Array3, Axis};
 
-use super::super::TtsError;
+use crate::KokoroError;
 
 /// Per-row inner dim. Fixed by the Kokoro v1.0 model signature.
 const STYLE_DIM: usize = 256;
@@ -51,22 +49,22 @@ pub struct Voice {
 impl Voice {
     /// Load a per-voice raw-f32 `.bin` file from disk.
     ///
-    /// Errors with [`TtsError::Init`] if:
+    /// Errors with [`KokoroError::Init`] if:
     /// - file doesn't exist / unreadable
     /// - byte count isn't a multiple of 1024 (= 1 × 256 × 4 bytes)
     /// - the implied outer dim is zero
-    pub fn load(path: &Path) -> Result<Self, TtsError> {
+    pub fn load(path: &Path) -> Result<Self, KokoroError> {
         let bytes = std::fs::read(path)
-            .map_err(|e| TtsError::Init(format!("read voice `{}`: {e}", path.display())))?;
+            .map_err(|e| KokoroError::Init(format!("read voice `{}`: {e}", path.display())))?;
 
         if bytes.is_empty() {
-            return Err(TtsError::Init(format!(
+            return Err(KokoroError::Init(format!(
                 "voice `{}` is empty",
                 path.display()
             )));
         }
         if !bytes.len().is_multiple_of(BYTES_PER_ROW) {
-            return Err(TtsError::Init(format!(
+            return Err(KokoroError::Init(format!(
                 "voice `{}` size {} bytes not divisible by {BYTES_PER_ROW} (1×256 f32 per row)",
                 path.display(),
                 bytes.len(),
@@ -86,7 +84,7 @@ impl Voice {
         }
 
         let table = Array3::from_shape_vec((n_rows, 1, STYLE_DIM), floats).map_err(|e| {
-            TtsError::Init(format!(
+            KokoroError::Init(format!(
                 "voice `{}` reshape to ({n_rows}, 1, {STYLE_DIM}): {e}",
                 path.display(),
             ))
@@ -167,7 +165,7 @@ mod tests {
         std::fs::write(&tmp, b"").expect("write empty");
         let err = Voice::load(&tmp).expect_err("must reject empty");
         match err {
-            TtsError::Init(msg) => assert!(msg.contains("empty")),
+            KokoroError::Init(msg) => assert!(msg.contains("empty")),
             other => panic!("unexpected: {other:?}"),
         }
         let _ = std::fs::remove_file(&tmp);
@@ -183,7 +181,7 @@ mod tests {
         std::fs::write(&tmp, vec![0_u8; 1025]).expect("write misaligned");
         let err = Voice::load(&tmp).expect_err("must reject misaligned");
         match err {
-            TtsError::Init(msg) => assert!(
+            KokoroError::Init(msg) => assert!(
                 msg.contains("not divisible"),
                 "wrong error: {msg}"
             ),

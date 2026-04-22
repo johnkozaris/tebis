@@ -91,9 +91,16 @@ struct SpeechRequest<'a> {
 }
 
 impl RemoteTts {
-    /// Construct a remote TTS client. `url` must already be
-    /// scheme-validated by the caller (`config.rs` rejects `http://`
-    /// unless the allow-http opt-in is set).
+    /// Construct a remote TTS client.
+    ///
+    /// **Scheme enforcement is the caller's responsibility.** `config.rs`
+    /// rejects `http://` at env-parse time unless
+    /// `TELEGRAM_TTS_REMOTE_ALLOW_HTTP=true` is set. The hyper connector
+    /// here is built with `https_or_http()` so the `RemoteTts::new`
+    /// call itself does NOT re-validate — bypassing `config::load_tts`
+    /// (e.g. tests constructing a remote client directly) will happily
+    /// accept plain http. Keep scheme validation at the config
+    /// boundary, not here.
     pub fn new(
         url: String,
         api_key: Option<SecretString>,

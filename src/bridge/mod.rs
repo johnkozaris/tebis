@@ -501,4 +501,26 @@ mod strip_html_tests {
             "plain text with & and < intact"
         );
     }
+
+    /// Contract test: every text that goes through `escape_html` (for
+    /// Telegram HTML mode) must come back out of `strip_html_for_tts`
+    /// as the original string. If someone adds a new entity to
+    /// `escape_html` without updating the decoder here, Kokoro will
+    /// read the raw `&newent;` tokens aloud — catches that early.
+    #[test]
+    fn escape_then_strip_is_identity() {
+        for input in [
+            "plain",
+            "a & b",
+            "1 < 2 > 0",
+            "\"quote\" and 'apos'",
+            "mixed & < > \" ' all",
+            "",
+            "long-ish text with multiple & characters & repeats",
+        ] {
+            let escaped = crate::sanitize::escape_html(input);
+            let round = strip_html_for_tts(&escaped);
+            assert_eq!(round, input, "round-trip failed for {input:?}");
+        }
+    }
 }

@@ -56,8 +56,8 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use super::super::TtsError;
-use super::{e2m, normalize};
+use crate::KokoroError;
+use crate::{e2m, normalize};
 
 /// Phonemize timeout. espeak-ng should finish in <50 ms for typical
 /// reply lengths; 10 s is the handler-level fail-safe.
@@ -67,21 +67,21 @@ const PHONEMIZE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Kokoro-ready IPA phoneme string.
 ///
 /// Errors:
-/// - [`TtsError::Init`] if `espeak-ng` isn't on `PATH` — the caller
+/// - [`KokoroError::Init`] if `espeak-ng` isn't on `PATH` — the caller
 ///   should already have probed via `setup::phonemizer::probe_espeak_ng`
 ///   at startup, but the runtime guard catches the apt-remove-mid-run
 ///   edge case.
-/// - [`TtsError::Synthesis`] for non-zero exits, timeouts, empty output,
+/// - [`KokoroError::Synthesis`] for non-zero exits, timeouts, empty output,
 ///   or if normalization collapses the input to whitespace.
-pub async fn phonemize(text: &str) -> Result<String, TtsError> {
+pub async fn phonemize(text: &str) -> Result<String, KokoroError> {
     if text.trim().is_empty() {
-        return Err(TtsError::Synthesis("empty input to phonemize".to_string()));
+        return Err(KokoroError::Synthesis("empty input to phonemize".to_string()));
     }
 
     // Pre-espeak text normalization (numbers, currency, titles, etc.).
     let normalized = normalize::preprocess(text);
     if normalized.trim().is_empty() {
-        return Err(TtsError::Synthesis(
+        return Err(KokoroError::Synthesis(
             "input collapsed to whitespace after normalization".to_string(),
         ));
     }
@@ -97,7 +97,7 @@ pub async fn phonemize(text: &str) -> Result<String, TtsError> {
     let output = match timeout(PHONEMIZE_TIMEOUT, run).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(TtsError::Init(
+            return Err(KokoroError::Init(
                 "espeak-ng not found on PATH — install it (macOS: `brew install \
                  espeak-ng`, Linux: your distro's package manager) or set \
                  TELEGRAM_TTS_BACKEND=none"
@@ -105,10 +105,10 @@ pub async fn phonemize(text: &str) -> Result<String, TtsError> {
             ));
         }
         Ok(Err(e)) => {
-            return Err(TtsError::Synthesis(format!("espeak-ng spawn: {e}")));
+            return Err(KokoroError::Synthesis(format!("espeak-ng spawn: {e}")));
         }
         Err(_) => {
-            return Err(TtsError::Synthesis(format!(
+            return Err(KokoroError::Synthesis(format!(
                 "espeak-ng timed out after {PHONEMIZE_TIMEOUT:?}"
             )));
         }
@@ -116,7 +116,7 @@ pub async fn phonemize(text: &str) -> Result<String, TtsError> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(TtsError::Synthesis(format!(
+        return Err(KokoroError::Synthesis(format!(
             "espeak-ng exited {:?}: {stderr}",
             output.status.code()
         )));
@@ -126,7 +126,7 @@ pub async fn phonemize(text: &str) -> Result<String, TtsError> {
         .trim_matches(|c: char| c.is_whitespace() || c == '\n')
         .to_string();
     if raw_ipa.is_empty() {
-        return Err(TtsError::Synthesis(
+        return Err(KokoroError::Synthesis(
             "espeak-ng returned empty phonemes".to_string(),
         ));
     }
@@ -160,7 +160,7 @@ mod tests {
     async fn empty_text_rejected_without_spawn() {
         // Cheap check before we fork a process.
         let err = phonemize("   ").await.unwrap_err();
-        matches!(err, TtsError::Synthesis(_));
+        matches!(err, KokoroError::Synthesis(_));
     }
 
     /// Full-pipeline integration test — requires espeak-ng on PATH.
