@@ -49,6 +49,20 @@ tracing-subscriber = {version = "0.3.23", features = ["fmt", "env-filter"]}
 ogg = "0.9"
 opus = "0.3"
 
+# Cross-platform neural TTS is deferred pending Rust ecosystem maturity.
+# The three crates.io Kokoro crates as of 2026-04-22 all fail to build
+# in this workspace:
+#   - kokoroxide 0.1.5          pins ort ^1.16 which has been yanked
+#   - kokoro-tiny 0.1.0         Cursor import bug without `playback`
+#   - tts-rs 2026.2.3           type mismatch against current ort
+#   - any-tts 0.1.1             transitively pulls aws-lc-rs (banned
+#                               in our deny.toml) via reqwest →
+#                               rustls-platform-verifier, plus a
+#                               Zlib-licensed `foldhash`
+# TTS stays on macOS `say` shell-out; Linux returns
+# UnsupportedPlatform until one of these stabilizes or an espeak-ng
+# fallback is shipped.
+
 # Local STT — whisper.cpp Rust bindings, linked in-process. Inference
 # runs inside the tebis daemon, no subprocess / server / network hop.
 # Models are downloaded on first use (see src/audio/fetch.rs) and
