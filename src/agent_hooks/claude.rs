@@ -1,26 +1,4 @@
-//! Claude Code hook installer.
-//!
-//! Writes to `<project>/.claude/settings.local.json` — the lowest-
-//! precedence config level, typically `.gitignore`d. We merge into the
-//! existing `hooks` block (if any), de-duping our own entries by
-//! sentinel path so re-install is idempotent.
-//!
-//! Schema reminder (from Claude Code docs):
-//!
-//! ```jsonc
-//! {
-//!   "hooks": {
-//!     "Stop": [
-//!       {
-//!         "hooks": [
-//!           { "type": "command", "command": "/path/to/hook.sh", "timeout": 15 }
-//!         ]
-//!       }
-//!     ],
-//!     // ...
-//!   }
-//! }
-//! ```
+//! Claude Code hook installer — merges into `<project>/.claude/settings.local.json`.
 
 use std::path::{Path, PathBuf};
 
@@ -32,30 +10,16 @@ use super::jsonfile;
 
 pub struct ClaudeHooks;
 
-/// Events we install + their timeouts (seconds). Every event here is
-/// documented in the Claude Code hooks reference
-/// (<https://code.claude.com/docs/en/hooks>). Claude's default hook
-/// timeout is 600 s; our shorter caps are deliberate — a hook that
-/// doesn't finish in a few seconds is broken and we'd rather time
-/// out and fall back to pane-settle than hang the turn.
+/// Installed events + timeouts (seconds). Shorter than Claude's 600s default
+/// — a slow hook should fall back to pane-settle, not hang the turn.
+/// SessionStart/SessionEnd deliberately omitted: one is noise, the other
+/// doesn't fire on tmux `kill-session`.
 const EVENTS: &[(&str, u64)] = &[
-    // Inject "conclude with a summary" context into every prompt.
     ("UserPromptSubmit", 5),
-    // Primary per-turn reply signal.
     ("Stop", 15),
     ("SubagentStop", 15),
-    // Permission prompts, idle signals, elicitation dialogs.
     ("Notification", 10),
 ];
-// NOTE: SessionStart and SessionEnd are intentionally NOT installed.
-// - SessionStart on source=startup fires AT provisioning time, i.e.
-//   right after the user's first-message-since-restart triggered the
-//   autostart. The reply itself is proof of life; an extra `[up]`
-//   ping is pure noise.
-// - SessionEnd on reason=logout only fires for `/logout` inside
-//   Claude's TUI, which tebis users essentially never do (the session
-//   dies via tmux `kill-session`, which can't emit a hook). Installing
-//   it pays no bill.
 
 fn settings_path(project_dir: &Path) -> PathBuf {
     project_dir.join(".claude/settings.local.json")
@@ -77,9 +41,7 @@ impl super::HookManager for ClaudeHooks {
             .context("`.hooks` in settings.local.json must be an object")?;
 
         for (event, timeout) in EVENTS {
-            // Claude Code accepts both `Stop` and lowercase `stop` in
-            // the same doc. Reuse whatever key already exists (any
-            // case) so we don't end up with two arrays that both fire.
+            // Reuse whatever case the user already has so we don't double-fire.
             let canonical = (*event).to_string();
             let key = hooks_obj
                 .keys()
@@ -90,8 +52,6 @@ impl super::HookManager for ClaudeHooks {
             let arr = entries
                 .as_array_mut()
                 .with_context(|| format!("`.hooks.{event}` must be an array"))?;
-            // Drop any pre-existing tebis entry for this event, then
-            // append a fresh one. Leaves user-owned entries untouched.
             arr.retain(|e| !entry_points_at(e, script_path));
             arr.push(json!({
                 "hooks": [
@@ -120,17 +80,10 @@ impl super::HookManager for ClaudeHooks {
     }
 
     fn uninstall(&self, project_dir: &Path) -> Result<super::UninstallReport> {
-        // Probe data_dir up front — is_our_script silently returns
-        // false when it can't resolve, which would make us think every
-        // entry is user-authored and leave our own hooks installed
-        // while reporting success. Fail loudly instead.
+        // Fail loud if data_dir is unresolvable — otherwise is_our_script silently
+        // returns false and we report success while leaving entries in place.
         super::data_dir().context("resolving tebis data dir for ownership check")?;
-        // Drop the manifest entry unconditionally — even when the
-        // settings file is already gone, a stale manifest row would
-        // make `tebis hooks list` lie. Log on failure (NFS flakes,
-        // ManifestLock acquire timeouts) so that staleness is
-        // diagnosable; don't bail — we still want to uninstall the
-        // hook entries below.
+        // Drop manifest row unconditionally; a stale row would make `tebis hooks list` lie.
         if let Err(e) = super::manifest::record_uninstall(AgentKind::Claude, project_dir) {
             tracing::warn!(
                 err = %e,
@@ -153,10 +106,7 @@ impl super::HookManager for ClaudeHooks {
                 if let Some(arr) = entries.as_array_mut() {
                     let before = arr.len();
                     arr.retain(|e| !is_tebis_entry(e));
-                    // Drop dangling wrappers whose inner `hooks: []`
-                    // would otherwise trip "must be an array" on next
-                    // install. These are rare (user-authored empty
-                    // entries), but keeping them is dead weight.
+                    // Drop wrappers with empty inner hooks — dead weight.
                     arr.retain(|e| {
                         e.get("hooks")
                             .and_then(Value::as_array)
@@ -167,9 +117,7 @@ impl super::HookManager for ClaudeHooks {
                     }
                 }
             }
-            // Drop now-empty event arrays so the JSON stays tidy.
             hooks.retain(|_, v| !v.as_array().is_some_and(Vec::is_empty));
-            // If `hooks` itself is empty, drop the key.
             let hooks_empty = hooks.is_empty();
             if hooks_empty {
                 root.remove("hooks");
@@ -245,11 +193,7 @@ const fn type_name(v: &Value) -> &'static str {
     }
 }
 
-/// True when a Claude hook-array entry's inner `command` resolves to
-/// `script_path`. Canonicalizes both sides so symlinks, trailing
-/// slashes, and case-insensitive filesystems don't cause false
-/// negatives. Falls back to byte-equal compare if canonicalize fails
-/// (e.g., the target doesn't exist yet at install-time).
+/// True when an entry's inner `command` resolves to `script_path` (via `paths_eq`).
 fn entry_points_at(entry: &Value, script_path: &Path) -> bool {
     let Some(inner) = entry.get("hooks").and_then(Value::as_array) else {
         return false;
@@ -261,9 +205,7 @@ fn entry_points_at(entry: &Value, script_path: &Path) -> bool {
     })
 }
 
-/// True when an entry points at *any* tebis-owned script (i.e. any path
-/// under the tebis data dir). Used by uninstall to sweep entries even
-/// across future script renames.
+/// True when an entry points at any path under our data dir — sweep tolerant to renames.
 fn is_tebis_entry(entry: &Value) -> bool {
     let Some(inner) = entry.get("hooks").and_then(Value::as_array) else {
         return false;

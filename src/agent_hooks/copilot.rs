@@ -1,59 +1,5 @@
-//! GitHub Copilot CLI hook installer.
-//!
-//! Writes to `<project>/.github/hooks/tebis.json` — a single file owned
-//! entirely by tebis. Copilot loads every `*.json` in `.github/hooks/`
-//! and merges them, so a sentinel filename lets us co-exist cleanly
-//! with user-authored files.
-//!
-//! Schema (docs.github.com/en/copilot/reference/hooks-configuration,
-//! verified against CLI v1.0.32, April 2026):
-//!
-//! ```jsonc
-//! {
-//!   "version": 1,
-//!   "hooks": {
-//!     "notification": [
-//!       {
-//!         "type": "command",
-//!         "bash": "/path/to/hook.sh",
-//!         "timeoutSec": 10
-//!       }
-//!     ]
-//!   }
-//! }
-//! ```
-//!
-//! Event-name casing: camelCase is the native CLI form. `PascalCase`
-//! keys (`SessionStart`, etc.) are accepted and activate a
-//! `VS Code`-compatible payload variant with ISO timestamps.
-//!
-//! ## Events we install (verified against v1.0.32 changelog)
-//!
-//! - `userPromptSubmitted` — inject the "end with a summary" context
-//!   (same pattern as our Claude install). `additionalContext` output
-//!   is honored (v1.0.24+).
-//! - `agentStop` — primary per-turn reply signal. Added in v0.0.401
-//!   (2026-02-03); the CLI's main "agent completed this turn" hook.
-//! - `subagentStop` — same as above for task-tool subagents.
-//! - `sessionStart` — one-shot "agent is ready" notification. Fires
-//!   once per session (v1.0.22+). Can inject `additionalContext`
-//!   (v1.0.18+) with a tebis banner. Passes `source=new|resume|...`.
-//! - `sessionEnd` — clean-exit signal so the phone can distinguish
-//!   "agent quit" from silent death.
-//! - `notification` — async catch-all: permission prompts, shell
-//!   completion, elicitation dialogs (v1.0.18+).
-//!
-//! Event-name casing: we use camelCase throughout. `PascalCase` keys
-//! (`SessionStart`, etc.) are accepted and activate a
-//! `VS Code`-compatible payload variant with ISO timestamps and
-//! `hook_event_name` / `session_id` (v1.0.21+); the script handles
-//! both forms for compat.
-//!
-//! Events we intentionally skip: `preToolUse` / `postToolUse` are
-//! noisy and not part of the reply-forwarding contract;
-//! `PermissionRequest` (v1.0.16+) is a phase-2 feature (bidirectional
-//! approve/deny from Telegram); `preCompact` is a phase-2 feature
-//! (pre-compaction summary save).
+//! GitHub Copilot CLI hook installer — writes sentinel `<project>/.github/hooks/tebis.json`.
+//! Copilot loads every `*.json` in that dir and merges them.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -66,25 +12,15 @@ use super::jsonfile;
 
 pub struct CopilotHooks;
 
-/// Events we install + their timeout seconds. Every entry is confirmed
-/// in the Copilot CLI changelog (v0.0.401 for `agentStop`/`subagentStop`,
-/// v1.0.18 for `notification`, v1.0.22 for `sessionStart` hot-reload).
-/// Adding unsupported events writes dead JSON entries that the CLI
-/// silently ignores and trip up `tebis hooks status` accuracy — only
-/// add events you've confirmed in the changelog.
+/// Events + timeouts. Only events confirmed in the Copilot CLI changelog.
+/// `sessionStart`/`sessionEnd` are omitted — same rationale as Claude.
 const EVENTS: &[(&str, u64)] = &[
     ("userPromptSubmitted", 5),
     ("agentStop", 15),
     ("subagentStop", 15),
     ("notification", 10),
 ];
-// NOTE: sessionStart / sessionEnd are intentionally NOT installed —
-// same rationale as Claude. The first agent reply proves the session
-// is up; explicit "[up]" / "[end]" pings are UX noise on a single-user
-// bot where the user drives the whole lifecycle.
 
-/// Sentinel file name. Nothing else in `.github/hooks/` is ours; we own
-/// this file outright.
 const TEBIS_HOOKS_FILE: &str = "tebis.json";
 
 fn hooks_dir(project_dir: &Path) -> PathBuf {
@@ -105,11 +41,7 @@ impl super::HookManager for CopilotHooks {
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
         let path = hooks_file(project_dir);
-        // If the file already exists, it must be a tebis-owned doc —
-        // i.e. `{version:1, hooks:{…}}` where every hook entry points
-        // at a tebis script. Anything else is a user-authored file that
-        // coincidentally collided with our sentinel name, and we'd
-        // rather fail loudly than silently overwrite it.
+        // Fail loud if the sentinel already exists but isn't ours.
         if path.exists() {
             let existing = jsonfile::load_or_empty(&path)?;
             if !looks_like_tebis_owned(&existing) {
@@ -153,9 +85,7 @@ impl super::HookManager for CopilotHooks {
     }
 
     fn uninstall(&self, project_dir: &Path) -> Result<super::UninstallReport> {
-        // Probe data_dir first — see the Claude uninstaller for the
-        // same invariant. We also use data_dir via looks_like_tebis_owned
-        // in install; this keeps the behavior symmetric.
+        // See Claude uninstaller for rationale.
         super::data_dir().context("resolving tebis data dir for ownership check")?;
         if let Err(e) = super::manifest::record_uninstall(AgentKind::Copilot, project_dir) {
             tracing::warn!(
@@ -170,9 +100,7 @@ impl super::HookManager for CopilotHooks {
         if !path.exists() {
             return Ok(super::UninstallReport::default());
         }
-        // Report only events that were actually in the file (not the
-        // EVENTS constant — users on older tebis versions might have
-        // a subset).
+        // Report only what's actually in the file — older tebis versions had fewer events.
         let events_removed: Vec<String> = jsonfile::load_or_empty(&path)
             .ok()
             .and_then(|doc| {
@@ -184,10 +112,7 @@ impl super::HookManager for CopilotHooks {
 
         fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
 
-        // Prune empty dirs we created (never remove user dirs that
-        // still contain other files). `.github` predates tebis in most
-        // repos — only prune it when it's entirely empty AND hooks_dir
-        // is now gone, i.e. we're the reason it exists at all.
+        // Prune empty dirs we may have created. `.github` only when hooks_dir is gone too.
         prune_if_empty(&hooks_dir(project_dir))?;
         if !hooks_dir(project_dir).exists() {
             prune_if_empty(&project_dir.join(".github"))?;
@@ -218,8 +143,7 @@ impl super::HookManager for CopilotHooks {
     }
 }
 
-/// Remove a directory only if it's empty. Never touches a dir we didn't
-/// plausibly create. `NotFound` is fine; anything else bubbles up.
+/// Remove `dir` only if empty. `NotFound` is fine.
 fn prune_if_empty(dir: &Path) -> Result<()> {
     if !dir.exists() {
         return Ok(());
@@ -234,10 +158,7 @@ fn prune_if_empty(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Shape check: the doc must be an object with `hooks` and, if present,
-/// every hook command points at a tebis-owned script. Prevents the
-/// installer from overwriting a hand-written `tebis.json` that happens
-/// to live at our sentinel path.
+/// True when every `bash` in the doc points at a tebis-owned script.
 fn looks_like_tebis_owned(doc: &Value) -> bool {
     let Some(obj) = doc.as_object() else {
         return false;

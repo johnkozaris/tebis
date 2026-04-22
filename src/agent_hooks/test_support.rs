@@ -1,29 +1,17 @@
-//! Shared test helpers. Exists only at `cfg(test)`; production code
-//! never sees it.
-//!
-//! The `agent_hooks` tests mutate `XDG_DATA_HOME` + `HOME` to redirect
-//! `data_dir()` away from the developer's real home. Rust runs `#[test]`
-//! functions in parallel, so two tests racing on env vars would leak
-//! one's scratch dir into the other's view. We serialize all
-//! env-touching tests through a process-wide `Mutex`.
+//! Test-only helpers. Env-mutating tests serialize on a process-wide `Mutex`.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use super::{AgentKind, HookManager};
 
-/// Exclusive guard held for the duration of an env-mutating test body.
-/// Acquire via [`with_scratch_data_home`].
 fn env_lock() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Run `f` with `XDG_DATA_HOME` pointing at a fresh scratch dir and
-/// `HOME` pointing somewhere innocuous (so `data_dir` never escapes into
-/// the developer's actual `~/.local/share/tebis`). Restores both on
-/// return, including panics.
+/// Point `XDG_DATA_HOME` + `HOME` at a fresh scratch dir for `f`, restore afterwards.
 pub fn with_scratch_data_home<R>(tag: &str, f: impl FnOnce() -> R) -> R {
     let _guard = env_lock();
     let scratch = std::env::temp_dir().join(format!(
@@ -43,8 +31,6 @@ pub fn with_scratch_data_home<R>(tag: &str, f: impl FnOnce() -> R) -> R {
     // observe the intermediate state. We restore on every exit path.
     unsafe {
         std::env::set_var("XDG_DATA_HOME", &scratch);
-        // Neutralise HOME too, so the fallback branch of `data_dir`
-        // can't ever point at the real filesystem.
         std::env::set_var("HOME", &scratch);
     }
 
@@ -69,8 +55,7 @@ pub fn with_scratch_data_home<R>(tag: &str, f: impl FnOnce() -> R) -> R {
     }
 }
 
-/// Temporary directory to write project-side fixtures into. Cleaned up
-/// after `f` returns (or panics).
+/// Temporary project dir, cleaned up on return or panic.
 pub fn with_scratch_project<R>(tag: &str, f: impl FnOnce(&Path) -> R) -> R {
     let dir = std::env::temp_dir().join(format!(
         "tebis-proj-{tag}-{}-{:x}",
@@ -89,8 +74,7 @@ pub fn with_scratch_project<R>(tag: &str, f: impl FnOnce(&Path) -> R) -> R {
     }
 }
 
-/// Full harness: fresh `XDG_DATA_HOME`, fresh project dir, a
-/// `HookManager` for `kind`, and the materialized script path.
+/// Fresh scratch env + project + `HookManager` + materialized script.
 pub fn with_hook_fixtures<R>(
     tag: &str,
     kind: AgentKind,

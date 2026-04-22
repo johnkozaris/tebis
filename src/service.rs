@@ -175,7 +175,7 @@ fn install_linux() -> Result<()> {
     Ok(())
 }
 
-pub fn uninstall() -> Result<()> {
+pub fn uninstall(purge: bool) -> Result<()> {
     println!();
     println!(
         "{}  Removing tebis background service…",
@@ -189,20 +189,128 @@ pub fn uninstall() -> Result<()> {
     bail!("unsupported platform");
     let bin = home_dir()?.join(".local/bin/tebis");
     let env_dir = home_dir()?.join(".config/tebis");
+    let data_dir = crate::agent_hooks::data_dir().ok();
+
+    if purge {
+        purge_user_state(&bin, &env_dir, data_dir.as_deref())?;
+    } else {
+        println!();
+        println!("{}  Service removed.", style("✓").green().bold());
+        println!();
+        println!(
+            "    {}",
+            style("Left in place (remove manually if desired):").dim()
+        );
+        if bin.exists() {
+            println!("    {}", short(&bin));
+        }
+        if env_dir.exists() {
+            println!("    {}", short(&env_dir));
+        }
+        if let Some(d) = data_dir.as_deref()
+            && d.exists()
+        {
+            println!("    {}", short(d));
+        }
+        println!();
+        println!(
+            "    {}",
+            style("  (pass `--purge` to remove everything above in one go.)").dim()
+        );
+    }
     println!();
-    println!("{}  Service removed.", style("✓").green().bold());
+    Ok(())
+}
+
+/// Remove all tebis-owned on-disk state: binary, env, model cache,
+/// hook manifest, materialized hook scripts. Per-project hook entries
+/// in `.claude/settings.local.json` / `.github/hooks/tebis.json` are
+/// NOT touched — we don't know which projects the user still cares
+/// about. The post-print suggests `tebis hooks uninstall <dir>` for
+/// those.
+///
+/// System packages (`espeak-ng`, installed via `brew`/`apt`/etc.
+/// during the setup wizard's Simple TTS step) stay. Auto-removing
+/// system packages is hostile; we print the one-liner at the end.
+fn purge_user_state(bin: &Path, env_dir: &Path, data_dir: Option<&Path>) -> Result<()> {
+    println!();
+    println!(
+        "{}  Purging user state…",
+        style("▶").cyan().bold()
+    );
+
+    let mut removed: Vec<PathBuf> = Vec::new();
+    for p in [bin, env_dir] {
+        if p.exists() {
+            if p.is_dir() {
+                fs::remove_dir_all(p)
+                    .with_context(|| format!("removing {}", p.display()))?;
+            } else {
+                fs::remove_file(p).with_context(|| format!("removing {}", p.display()))?;
+            }
+            removed.push(p.to_path_buf());
+        }
+    }
+    if let Some(d) = data_dir
+        && d.exists()
+    {
+        fs::remove_dir_all(d).with_context(|| format!("removing {}", d.display()))?;
+        removed.push(d.to_path_buf());
+    }
+
+    println!();
+    if removed.is_empty() {
+        println!(
+            "{}  Nothing to purge — user state was already clean.",
+            style("·").dim()
+        );
+    } else {
+        println!(
+            "{}  Purged {} path{}:",
+            style("✓").green().bold(),
+            removed.len(),
+            if removed.len() == 1 { "" } else { "s" }
+        );
+        for p in &removed {
+            println!("    {}", style(p.display()).dim());
+        }
+    }
+
     println!();
     println!(
         "    {}",
-        style("Left in place (remove manually if desired):").dim()
+        style("Per-project agent hooks (if any) stay — remove with:").dim()
     );
-    if bin.exists() {
-        println!("    {}", short(&bin));
-    }
-    if env_dir.exists() {
-        println!("    {}", short(&env_dir));
-    }
+    println!(
+        "    {}",
+        style("    tebis hooks list       # see which dirs have hooks").dim()
+    );
+    println!(
+        "    {}",
+        style("    tebis hooks uninstall <dir>").dim()
+    );
     println!();
+    println!(
+        "    {}",
+        style("System packages (espeak-ng) stay. Remove manually if unused:").dim()
+    );
+    #[cfg(target_os = "macos")]
+    println!("    {}", style("    brew uninstall espeak-ng").dim());
+    #[cfg(target_os = "linux")]
+    {
+        println!(
+            "    {}",
+            style("    sudo apt remove espeak-ng     # Debian/Ubuntu").dim()
+        );
+        println!(
+            "    {}",
+            style("    sudo dnf remove espeak-ng     # Fedora").dim()
+        );
+        println!(
+            "    {}",
+            style("    sudo pacman -R espeak-ng      # Arch").dim()
+        );
+    }
     Ok(())
 }
 

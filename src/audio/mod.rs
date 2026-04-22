@@ -1,21 +1,4 @@
-//! Voice bridge subsystem: STT (inbound) and TTS (outbound, Phase 4).
-//!
-//! Current state (2026-04-22): STT is local-only via `whisper-rs`
-//! (cross-platform). TTS is macOS-only via `say` shell-out; Linux
-//! currently returns `TtsError::UnsupportedPlatform`. Cross-platform
-//! Kokoro TTS is blocked on Rust ecosystem maturity (see `Cargo.toml`
-//! comment block and `PLAN.md`).
-//!
-//! - `manifest.rs` — embedded JSON of pinned asset URLs + SHAs.
-//! - `cache.rs` — `$XDG_DATA_HOME/tebis/models/` filesystem layout,
-//!   atomic model install, stale-tmp reaping.
-//! - `fetch.rs` — HTTPS streaming download with SHA-256 verification.
-//! - `codec.rs` — OGG/Opus ↔ PCM for Telegram voice.
-//! - `stt/` — whisper-rs in-process. The only STT backend.
-//! - `tts/` — macOS `say` shell-out (the only shipped backend today).
-//!
-//! See `/PLAN-VOICE.md` for the end-to-end design, including invariant
-//! compliance (CLAUDE.md 4, 5, 6, 9, 10, 12) and the rollout phases.
+//! Voice bridge subsystem. STT via whisper-rs; TTS via `say` / Kokoro.
 
 pub mod cache;
 pub mod codec;
@@ -37,30 +20,20 @@ use self::stt::{Stt as _, SttConfig, SttError, Transcription};
 use self::tts::Tts as _;
 use self::tts::{TtsConfig, TtsError};
 
-/// Composite config consumed by [`AudioSubsystem::new`]. Built from env
-/// in `config::load_audio_config`.
+/// Built from env in `config::load_audio_config`.
 #[derive(Debug, Clone)]
 pub struct AudioConfig {
-    /// `None` means STT is disabled (the master flag `TELEGRAM_STT=off`).
     pub stt: Option<SttConfig>,
-    /// `None` means TTS is disabled. Default off — voice replies are
-    /// low-value for Claude's typical multi-line output.
     pub tts: Option<TtsConfig>,
 }
 
 impl AudioConfig {
-    /// Quick check used by main.rs to decide whether to bother constructing
-    /// the subsystem at all — if both branches are off, the whole subsystem
-    /// stays uninitialized.
     pub const fn any_enabled(&self) -> bool {
         self.stt.is_some() || self.tts.is_some()
     }
 }
 
-/// Unified error surface for the audio subsystem. Sub-modules keep their
-/// own typed errors (`FetchError`, `CodecError`, `SttError`) for
-/// pattern-matching; this enum is the one we expose to `bridge`, which
-/// flattens to an HTML-escaped reply string.
+/// Unified error surface for `bridge`. Sub-modules keep typed errors internally.
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
     #[error(transparent)]
@@ -83,29 +56,17 @@ pub enum AudioError {
 }
 
 pub struct AudioSubsystem {
-    /// `None` when STT is disabled. Local whisper.cpp is the only
-    /// backend tebis ships — no cloud / LAN escape hatches.
     stt: Option<stt::local::LocalStt>,
-    /// `None` when TTS is disabled or failed to initialize.
     tts: Option<tts::Backend>,
     stt_model_name: Option<String>,
-    /// Snapshot of STT runtime caps. `None` when STT is off. The bridge
-    /// reads these to enforce duration/size limits before downloading.
     stt_limits: Option<SttLimits>,
-    /// ISO-639-1 hint to pass to whisper; `None` means auto-detect.
+    /// ISO-639-1 for whisper; `None` means auto-detect.
     stt_language: Option<String>,
-    /// TTS voice name — what the backend uses. `None` when TTS is off.
     tts_voice: Option<String>,
-    /// Whether TTS applies to every outbound reply or only replies to
-    /// inbound voice messages.
     tts_respond_to_all: bool,
-    /// Backend kind for display — `"none"`, `"say"`, `"kokoro-local"`,
-    /// or `"kokoro-remote"`. Static-lifetime since the variants are
-    /// fixed at compile time.
+    /// `"none"`, `"say"`, `"kokoro-local"`, or `"kokoro-remote"`.
     tts_backend_kind: &'static str,
-    /// Backend-specific display detail. For `kokoro-remote` this is the
-    /// redacted host (`"kokoro.example.com"`); for `kokoro-local` it's
-    /// the manifest model key; `None` for `say` / `none`.
+    /// Redacted host for remote, manifest model key for local.
     tts_detail: Option<String>,
 }
 

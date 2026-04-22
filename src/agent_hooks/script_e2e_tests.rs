@@ -1,22 +1,5 @@
-//! End-to-end tests for the embedded hook scripts.
-//!
-//! These drive the real shell script (pre-installed via `materialize`)
-//! with a captured JSON fixture on stdin, and assert that the expected
-//! `{text, kind, cwd, session}` payload lands on a `UnixListener` that
-//! plays the bridge's notify socket.
-//!
-//! Why this file exists: the scripts ship embedded via `include_str!`.
-//! A silent schema drift in Claude Code's `Stop` payload (they renamed
-//! `type` → `role` once) would make `jq` emit empty, and without an
-//! e2e test the regression would only surface in a user's "why is
-//! tebis silently not forwarding?" support ticket.
-//!
-//! Requirements: `bash`, `jq`, `nc` on `$PATH`. CI preinstalls both.
-//! Local runs without them skip with a single log line.
-//!
-//! Serialization: every test goes through `with_scratch_data_home`,
-//! which holds the env-lock mutex — safe to run in parallel with the
-//! rest of the test suite because `XDG_DATA_HOME` isolation is tight.
+//! E2E tests for embedded hook scripts — catch Claude/Copilot payload schema drift.
+//! Skip when `bash`/`jq`/`nc` aren't on PATH.
 
 #![cfg(test)]
 
@@ -29,9 +12,6 @@ use std::time::Duration;
 use super::test_support::with_scratch_data_home;
 use super::{AgentKind, materialize};
 
-/// Returns `true` iff every tool the hook script calls is on `PATH`.
-/// When false, the e2e tests skip — they'd fail spuriously on a
-/// minimal runner that doesn't have `nc`.
 fn shell_tools_available() -> bool {
     ["bash", "jq", "nc"].iter().all(|tool| {
         Command::new("which")
@@ -43,9 +23,7 @@ fn shell_tools_available() -> bool {
     })
 }
 
-/// A minimal Unix listener on a tempdir socket. Accepts one connection,
-/// reads one newline-terminated line, returns the raw bytes. Blocks on
-/// accept so the test is deterministic.
+/// Blocking UDS listener — accept one connection, read one line.
 struct FakeBridge {
     path: PathBuf,
     listener: UnixListener,
@@ -61,11 +39,9 @@ impl FakeBridge {
         Self { path, listener }
     }
 
-    /// Accept exactly one connection and read one line. 5s wall-clock cap.
+    /// Accept one connection, read one line, 5s timeout.
     fn receive(&self) -> String {
         use std::io::{BufRead, BufReader};
-        // macOS: set_read_timeout needs Tokio or SO_RCVTIMEO via socket2.
-        // Simpler: spawn a dedicated thread with a join timeout.
         let listener = self.listener.try_clone().expect("clone listener");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -86,15 +62,11 @@ impl Drop for FakeBridge {
     }
 }
 
-/// Spawn `bash <script>` with `NOTIFY_SOCKET_PATH=<socket>` and
-/// `stdin=<fixture>`. Returns the exit status so callers can assert
-/// success (exit 0 always, per the script's fail-open contract).
+/// Spawn `bash <script>` with socket + fixture. Asserts fail-open (exit 0).
 fn run_hook(script: &std::path::Path, socket: &std::path::Path, stdin_fixture: &str) {
     let mut child = Command::new("bash")
         .arg(script)
         .env("NOTIFY_SOCKET_PATH", socket)
-        // Keep the agent's own XDG away from the fake bridge — the hook
-        // resolves socket explicitly via NOTIFY_SOCKET_PATH first.
         .env_remove("XDG_RUNTIME_DIR")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -115,8 +87,6 @@ fn run_hook(script: &std::path::Path, socket: &std::path::Path, stdin_fixture: &
     );
 }
 
-/// Extract `{kind, text}` from the JSON line the script writes to
-/// the socket. Uses `serde_json` via the crate so tests stay hermetic.
 fn parse_forwarded(line: &str) -> (String, String) {
     let v: serde_json::Value = serde_json::from_str(line.trim())
         .unwrap_or_else(|e| panic!("bridge received non-JSON line: {line:?} ({e})"));
@@ -148,10 +118,7 @@ fn claude_notification_forwards_message_with_kind_tag() {
 
 #[test]
 fn claude_session_events_are_not_dispatched() {
-    // SessionStart / SessionEnd are deliberately NOT installed (see
-    // src/agent_hooks/claude.rs EVENTS comment). Even if someone
-    // hand-installs them, our shell script no longer dispatches —
-    // the events fall through to the `*)` no-op arm.
+    // SessionStart/End fall through to `*)` no-op arm even if hand-installed.
     if !shell_tools_available() {
         eprintln!("skipping: bash/jq/nc not on PATH");
         return;
@@ -176,9 +143,7 @@ fn claude_session_events_are_not_dispatched() {
 
 #[test]
 fn claude_user_prompt_submit_writes_hookspecificoutput_stdout() {
-    // This is the one event whose CONTRACT is stdout, not socket.
-    // We assert the script emits valid JSON with the documented
-    // hookSpecificOutput.additionalContext field.
+    // This event's contract is stdout, not socket.
     if !shell_tools_available() {
         eprintln!("skipping: bash/jq/nc not on PATH");
         return;
@@ -221,13 +186,8 @@ fn claude_user_prompt_submit_writes_hookspecificoutput_stdout() {
 
 #[test]
 fn copilot_agent_stop_branch_forwards_something() {
-    // Copilot's `agentStop` payload historically has varied across
-    // versions. We only assert that the branch dispatches without
-    // crashing and reaches the socket with a "stop" kind when a
-    // transcript path is provided — drift in the transcript schema
-    // itself would return empty, which the script exits 0 for
-    // (fail-open). Treat "no socket traffic" as an acceptable outcome
-    // for a missing transcript.
+    // Copilot's `agentStop` payload varies by version. Accept either
+    // forwarded → kind must be "stop", or silent (fail-open).
     if !shell_tools_available() {
         eprintln!("skipping: bash/jq/nc not on PATH");
         return;
@@ -235,7 +195,6 @@ fn copilot_agent_stop_branch_forwards_something() {
     with_scratch_data_home("copilot_agent_stop", || {
         let script = materialize(AgentKind::Copilot).expect("materialize");
         let bridge = FakeBridge::new("copilot-agent-stop");
-        // Write a minimal JSONL transcript the script can tail.
         let transcript = std::env::temp_dir().join(format!(
             "tebis-copilot-transcript-{}.jsonl",
             std::process::id()
@@ -250,9 +209,6 @@ fn copilot_agent_stop_branch_forwards_something() {
             transcript.display()
         );
         run_hook(&script, &bridge.path, &fixture);
-        // The script might succeed in forwarding (transcript schema
-        // matched) or not (schema mismatch). Accept either — but if
-        // it DID forward, the kind must be "stop".
         let listener = bridge.listener.try_clone().unwrap();
         listener.set_nonblocking(true).unwrap();
         if let Ok((stream, _)) = listener.accept() {

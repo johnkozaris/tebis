@@ -1,8 +1,4 @@
-//! Shared atomic-write and JSON load/save for hook config files.
-//!
-//! Atomic = write to `<path>.tebis.tmp`, fsync, then `rename` over the
-//! target. A crash at any point leaves either the old or new file
-//! intact — never a torn JSON that would make Claude refuse the file.
+//! Atomic-write + JSON load/save for hook config files.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -12,12 +8,7 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
 pub(super) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    // Process-id + nanosecond + monotonic-counter unique tmp name.
-    // Two concurrent tasks within the same process hitting the same
-    // nanosecond tick would otherwise pick the same tmp name; both
-    // would "succeed" via `File::create` (truncate-open) and the
-    // later's content could overwrite the earlier mid-flight. The
-    // counter guarantees uniqueness even at sub-nanosecond spacing.
+    // pid + nanos + counter → unique tmp name even for concurrent same-tick writers.
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -53,9 +44,7 @@ pub(super) fn atomic_write_json(path: &Path, value: &Value) -> Result<()> {
     atomic_write_bytes(path, &bytes)
 }
 
-/// Load JSON, returning `Value::Object(empty)` if the file doesn't exist.
-/// Errors on a present-but-malformed file so callers can refuse to
-/// clobber user-authored data.
+/// Load JSON or empty object if missing. Errors on malformed — caller refuses to clobber.
 pub(super) fn load_or_empty(path: &Path) -> Result<Value> {
     match fs::read_to_string(path) {
         Ok(s) if s.trim().is_empty() => Ok(Value::Object(Map::default())),
@@ -100,8 +89,6 @@ mod tests {
     fn atomic_tempfile_is_gone_after_success() {
         let p = tmp_path("tempclean");
         atomic_write_bytes(&p, b"x").unwrap();
-        // tmp name is `<name>.tebis.tmp.<pid>.<nanos>` — check nothing
-        // matching that pattern survives alongside the target.
         if let Some(parent) = p.parent() {
             let stem = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
             let prefix = format!("{stem}.tebis.tmp.");

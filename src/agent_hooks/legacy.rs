@@ -1,22 +1,9 @@
-//! Detect pre-Phase-2 hook entries in a project's settings file.
-//!
-//! Users who hand-installed the hook script from a tebis repo checkout
-//! (path like `/Users/me/Repos/tebis/contrib/claude/claude-hook.sh`)
-//! before the Phase-2 auto-install landed will, on upgrade + `HOOKS_MODE=auto`,
-//! end up with a SECOND entry pointing at `$XDG_DATA_HOME/tebis/claude-hook.sh`.
-//! Both fire → double delivery. This module returns the offending lines so
-//! every install site (CLI + autostart) can warn consistently.
+//! Detect hand-installed hook entries that would otherwise fire alongside ours.
 
 use std::path::Path;
 
-/// Returns the verbatim lines in `.claude/settings.local.json` that
-/// reference `claude-hook.sh` under a path NOT inside the current
-/// tebis data dir. Empty vec when the settings file is missing, when
-/// the data dir is unresolvable, or when no legacy lines are present.
-///
-/// Crude substring match on purpose — false positives are benign
-/// (we're only warning), and a proper JSON walk would miss the "user
-/// hand-edited their file into an invalid shape" case.
+/// Substring match on purpose — false positives are benign (warnings only)
+/// and a JSON walk would miss invalid-shape user edits.
 pub fn scan_claude(project_dir: &Path) -> Vec<String> {
     let settings = project_dir.join(".claude/settings.local.json");
     let Ok(content) = std::fs::read_to_string(&settings) else {

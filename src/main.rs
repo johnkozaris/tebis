@@ -23,7 +23,12 @@ Usage:
   tebis                 Run in foreground (auto-loads ~/.config/tebis/env).
   tebis setup           Interactive first-run config wizard.
   tebis install         Install as a background service (launchd / systemd user).
-  tebis uninstall       Remove the background service.
+  tebis uninstall [--purge]
+                        Remove the background service. `--purge` also
+                        deletes ~/.local/bin/tebis, ~/.config/tebis/,
+                        ~/.local/share/tebis/ (env + model cache + hook
+                        manifest). Per-project hooks and system
+                        packages (espeak-ng) are left alone.
   tebis start           Start the installed background service.
   tebis stop            Stop the installed background service.
   tebis restart         Stop + start the installed service (e.g. after config edit).
@@ -66,7 +71,10 @@ fn main() -> Result<()> {
         }
         Some("setup" | "init") => handle_setup(),
         Some("install") => service::install(),
-        Some("uninstall") => service::uninstall(),
+        Some("uninstall") => {
+            let purge = env::args().any(|a| a == "--purge");
+            service::uninstall(purge)
+        }
         Some("start") => service::start(),
         Some("stop") => service::stop(),
         Some("restart") => service::restart(),
@@ -84,17 +92,71 @@ fn main() -> Result<()> {
 }
 
 fn handle_setup() -> Result<()> {
-    match setup::run()? {
-        setup::Next::Exit => Ok(()),
-        setup::Next::Install => service::install(),
-        setup::Next::RunForeground => {
-            let env_path = setup::env_file_path()?;
+    let next = setup::run()?;
+    // Eager-download audio models so the first daemon boot doesn't hit
+    // a 346 MB wait. No-op when STT + TTS are both off; also no-op when
+    // the wizard ended with Next::Exit (user bailed before finalizing).
+    if !matches!(next, setup::Next::Exit) {
+        let env_path = setup::env_file_path()?;
+        if env_path.exists() {
             // SAFETY: still in `main` before any runtime/thread spawn.
             unsafe { config::load_env_file(&env_path) }
                 .with_context(|| format!("loading env file {}", env_path.display()))?;
-            run_bridge()
+            prepare_audio_downloads()?;
         }
     }
+    match next {
+        setup::Next::Exit => Ok(()),
+        setup::Next::Install => service::install(),
+        setup::Next::RunForeground => run_bridge(),
+    }
+}
+
+/// Download STT + TTS model files now (during setup) rather than on
+/// first daemon start. Discards the loaded subsystem — we only wanted
+/// the SHA-pinned downloads on disk. Failures log-and-continue so a
+/// wizard completion isn't held hostage to Hugging Face availability;
+/// the daemon's first-start path retries.
+fn prepare_audio_downloads() -> Result<()> {
+    let config = match config::Config::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(err = %e, "prepare_audio_downloads: config load failed, skipping");
+            return Ok(());
+        }
+    };
+    if config.audio.stt.is_none() && config.audio.tts.is_none() {
+        return Ok(());
+    }
+    println!();
+    println!(
+        "{}  Preparing audio models (one-time download)…",
+        console::style("▶").cyan().bold()
+    );
+    telegram::install_crypto_provider();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("prepare_audio_downloads: tokio runtime")?;
+    rt.block_on(async {
+        let shutdown = CancellationToken::new();
+        let tracker = TaskTracker::new();
+        match audio::AudioSubsystem::new(&config.audio, &tracker, shutdown).await {
+            Ok(_sub) => {
+                println!(
+                    "{}  Audio models ready.",
+                    console::style("✓").green().bold()
+                );
+            }
+            Err(e) => {
+                println!(
+                    "{}  Audio prep failed — the daemon will retry on first run. ({e})",
+                    console::style("⚠").yellow().bold(),
+                );
+            }
+        }
+    });
+    Ok(())
 }
 
 fn ensure_env_loaded() -> Result<()> {
