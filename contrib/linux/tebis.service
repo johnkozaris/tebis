@@ -41,9 +41,19 @@ RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-# `ProtectHome=read-only` blocks writes to %h/. The inspect dashboard
-# Settings panel writes to the env file; carve out exactly that dir.
-ReadWritePaths=%h/.config/tebis
+# `ProtectHome=read-only` blocks writes to %h/. Carve out the dirs
+# the daemon writes to at runtime:
+#  - %h/.config/tebis          — env file (inspect dashboard edits)
+#  - %h/.local/share/tebis     — STT/TTS model cache, hook scripts,
+#                                hooks-manifest (installed.json). This
+#                                is the XDG_DATA_HOME fallback path;
+#                                if you set XDG_DATA_HOME= to a
+#                                non-default location, adjust here too.
+# Autostart + agent-native hooks (TELEGRAM_HOOKS_MODE=auto) also write
+# into the project dir at %h/<your-project>/.claude/. If you use those,
+# either add that path to ReadWritePaths, or drop ProtectHome= entirely
+# and rely on Linux DAC + NoNewPrivileges for isolation.
+ReadWritePaths=%h/.config/tebis %h/.local/share/tebis
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
