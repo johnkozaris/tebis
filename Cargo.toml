@@ -53,6 +53,7 @@ kokoro = ["dep:tebis-tts-kokoro"]
 [dependencies.tebis-tts-kokoro]
 optional = true
 path = "crates/tebis-tts-kokoro"
+version = "0.1"
 
 [profile.release]
 codegen-units = 1
