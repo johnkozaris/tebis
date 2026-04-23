@@ -1,10 +1,10 @@
-//! Atomic write of a private file (mode 0600 on Unix, DACL-restricted
+//! Atomic write of a private file (mode 0600 on Unix, owner-only DACL
 //! on Windows).
 //!
 //! # Threat model
 //!
 //! The target file holds user-private state — typically secrets (bot
-//! tokens, OAuth credentials in `~/.config/tebis/env`). The write must
+//! tokens, OAuth credentials in the tebis env file). The write must
 //! be atomic (no partial file visible on crash) and the resulting file
 //! must not be readable by other local users.
 //!
@@ -21,16 +21,22 @@
 //!    for rename durability; NFS/tmpfs may reject it).
 //!
 //! ## Windows
-//! **This backend is Phase-3 incomplete.** It currently writes with
-//! default permissions inherited from the containing directory. That's
-//! safe when the caller places the target in a user-scoped location
-//! (`%APPDATA%`, `%LOCALAPPDATA%` — both have owner-only DACLs by
-//! default on modern Windows).
+//! 1. Tmp file is created via `CreateFileW` with a `SECURITY_ATTRIBUTES`
+//!    whose `SECURITY_DESCRIPTOR` comes from
+//!    `owner_only_sddl(&sid, "FA")` — `D:P(A;;FA;;;<OUR_SID>)`:
+//!    - `D:P` — protected DACL; parent inheritance cannot widen access.
+//!    - `A;;FA;;;<SID>` — single Allow ACE granting `FILE_ALL_ACCESS`
+//!      to the current user's SID; no other principals.
+//! 2. The handle is wrapped as a `std::fs::File` via
+//!    `File::from_raw_handle`, so standard `write_all` + `sync_all`
+//!    give us fsynced durable content.
+//! 3. Atomic replace via `MoveFileExW(tmp, target,
+//!    MOVEFILE_REPLACE_EXISTING)`. Per MSDN, this is atomic on NTFS.
 //!
-//! Phase 3 of the Windows port will replace this with an explicit DACL
-//! (owner-only ACE, `SE_DACL_PROTECTED` so parent inheritance can't
-//! widen access) via the `windows` crate. Do **not** write secrets
-//! through this function on Windows to a shared path until that lands.
+//! The DACL is explicit rather than relying on `%APPDATA%`
+//! inheritance, so a caller placing the target in an unusual path
+//! (test harness, user-overridden config dir, etc.) still gets
+//! owner-only protection.
 
 #[cfg(unix)]
 mod unix {
@@ -86,7 +92,29 @@ mod unix {
 mod windows {
     use std::fs;
     use std::io::{self, Write as _};
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
     use std::path::Path;
+
+    use windows::Win32::Foundation::GENERIC_WRITE;
+    use windows::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows::Win32::Storage::FileSystem::{
+        CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE,
+        MOVEFILE_REPLACE_EXISTING, MoveFileExW,
+    };
+    use windows::core::PCWSTR;
+
+    use crate::platform::windows_auth::{
+        OwnedSecurityDescriptor, current_user_sid, owner_only_sddl, sid_to_string, to_io,
+    };
+
+    fn to_wide(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
 
     pub fn atomic_write_private(path: &Path, content: &[u8]) -> io::Result<()> {
         if let Some(parent) = path.parent() {
@@ -97,48 +125,82 @@ mod windows {
             path.file_name().and_then(|n| n.to_str()).unwrap_or("env")
         ));
 
+        // Build an owner-only SECURITY_ATTRIBUTES. `FA` = FILE_ALL_ACCESS
+        // — the narrowest grant that covers read+write+delete for the
+        // owner. Protected DACL (`D:P`) prevents parent dir inheritance
+        // from ever widening the ACL.
+        let our_sid = current_user_sid().map_err(to_io)?;
+        let sid_str = sid_to_string(&our_sid).map_err(to_io)?;
+        let sddl = owner_only_sddl(&sid_str, "FA");
+        let descriptor = OwnedSecurityDescriptor::from_sddl(&sddl).map_err(to_io)?;
+
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.as_ptr(),
+            bInheritHandle: windows::Win32::Foundation::BOOL(0),
+        };
+
+        let tmp_wide = to_wide(&tmp);
+
+        // CreateFileW with our SA sets the DACL at creation — no
+        // race between create-with-default-perms and set-security.
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(tmp_wide.as_ptr()),
+                GENERIC_WRITE.0,
+                FILE_SHARE_MODE(0), // no sharing while we write
+                Some(&sa),
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        }
+        .map_err(to_io)?;
+
         {
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)?;
-            f.write_all(content)?;
-            f.sync_all()?;
+            // SAFETY: `handle` is a valid kernel object just returned
+            // from CreateFileW; `File::from_raw_handle` takes ownership
+            // and closes it on drop.
+            let mut file = unsafe { File::from_raw_handle(handle.0 as _) };
+            file.write_all(content)?;
+            file.sync_all()?;
         }
-        // Windows has no rename-over-existing-file guarantee from
-        // `fs::rename`; if the target exists, remove it first. This
-        // is NOT atomic — Phase 3 will switch to `MoveFileEx` with
-        // `MOVEFILE_REPLACE_EXISTING`.
-        if path.exists() {
-            let _ = fs::remove_file(path);
+
+        let dst_wide = to_wide(path);
+        // MOVEFILE_REPLACE_EXISTING is atomic on NTFS — either the
+        // target points to the new inode or it doesn't; no window
+        // where the path is absent.
+        unsafe {
+            MoveFileExW(
+                PCWSTR(tmp_wide.as_ptr()),
+                PCWSTR(dst_wide.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING,
+            )
         }
-        fs::rename(&tmp, path)?;
+        .map_err(to_io)?;
+
         Ok(())
     }
 
     pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
         fs::create_dir_all(path)
-        // Phase-3 TODO: set an explicit DACL (owner-only ACE +
-        // SE_DACL_PROTECTED so parent inheritance can't widen access)
-        // via the `windows` crate's Win32_Security_Authorization.
-        // Until then the directory inherits DACLs from %LOCALAPPDATA%,
-        // which is user-owned on modern Windows — acceptable for
-        // personal-daemon deployments but not for shared hosts.
+        // Dirs inherit their DACL from the parent. On a normal tebis
+        // install that parent is `%LOCALAPPDATA%\tebis\` (per-user,
+        // owner-only on modern Windows), so inheritance suffices.
+        // If that turns out to be insufficient (e.g. a test override
+        // pointing somewhere shared), extend this with
+        // SetNamedSecurityInfoW + a DACL identical to the one
+        // atomic_write_private uses.
     }
 
     /// No-op on Windows. Hook scripts on Windows are `.ps1` files
     /// invoked via `powershell.exe` (or `pwsh.exe`); they don't need
-    /// an executable bit and the Phase-2 Windows hook writer emits
-    /// them with default DACLs inheriting from `%LOCALAPPDATA%`.
+    /// an executable bit.
     pub fn set_owner_executable(_path: &Path) -> io::Result<()> {
         Ok(())
     }
 }
 
-/// Atomic write of a file whose contents should only be readable by the
-/// owner. See module docs for the per-platform contract and the Windows
-/// Phase 3 caveat.
 #[cfg(unix)]
 pub use unix::{atomic_write_private, ensure_private_dir, set_owner_executable};
 #[cfg(windows)]
