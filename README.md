@@ -18,7 +18,7 @@ That's the whole product. A small Rust daemon, one user, one bot, no cloud.
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 2024](https://img.shields.io/badge/rust-edition%202024-orange?logo=rust)](Cargo.toml)
 [![MSRV 1.95](https://img.shields.io/badge/MSRV-1.95-blue?logo=rust)](Cargo.toml)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#run-in-the-background)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#run-in-the-background)
 [![No OpenSSL](https://img.shields.io/badge/deps-no%20OpenSSL-critical)](deny.toml)
 
 </div>
@@ -51,21 +51,43 @@ available (Claude Code, Copilot CLI) and via pane-watching otherwise.
 
 ## Get started
 
+### macOS / Linux
+
 ```sh
 cargo build --release
 ./target/release/tebis setup     # interactive wizard → ~/.config/tebis/env
-./target/release/tebis install   # run as a background service
+./target/release/tebis install   # run as a background service (launchd / systemd user)
 ```
+
+**You'll need:** Rust 1.95+, `tmux` 3.x, a C++ toolchain (Xcode CLT on
+macOS, `build-essential cmake` on Linux).
+
+### Windows
+
+```powershell
+cargo build --release
+.\target\release\tebis.exe setup     # interactive wizard → %APPDATA%\tebis\env
+.\target\release\tebis.exe install   # register as a Task Scheduler at-logon task
+```
+
+**You'll need:** Rust 1.95+, [psmux][psmux] (tmux-compatible multiplexer),
+Visual Studio Build Tools (C++ workload, for `ring`'s C compile), and
+PowerShell 5.1+ (built into Windows). Claude Code and Copilot CLI both
+have native Windows installers as of 2026; install whichever you want to
+drive from Telegram.
 
 The wizard walks through creating a bot on [`@BotFather`][botfather],
 finding your numeric ID via [`@userinfobot`][userinfobot], and picking
 which project Claude should start in when you first message the bot.
 
-**You'll need:** Rust 1.95+, `tmux` 3.x, a C++ toolchain (Xcode CLT on
-macOS, `build-essential cmake` on Linux).
+Tebis is a genuinely cross-platform daemon: same code, same security
+invariants, per-OS primitives behind a single `platform::` abstraction
+(UDS → Named Pipe, launchd/systemd → Task Scheduler, tmux → psmux, 0600
+→ DACL). See [`CLAUDE.md`](CLAUDE.md) §Layout for the module map.
 
 [botfather]: https://t.me/BotFather
 [userinfobot]: https://t.me/userinfobot
+[psmux]: https://github.com/psmux/psmux
 
 ## Using it
 

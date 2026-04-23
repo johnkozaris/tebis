@@ -31,6 +31,12 @@ allow = [
   # disclaimer). OSI-approved and FSF-Free. Pulled in transitively by
   # `whisper-rs-sys` — the actual whisper.cpp C source it wraps is MIT.
   "Unlicense",
+  # MPL-2.0 is weak (file-level) copyleft: OSI + FSF approved, and
+  # merely linking against an MPL-2.0 crate does not copyleft our
+  # own source. Pulled in transitively by `option-ext` via
+  # `dirs-sys` via `directories` — the cross-platform standard-dirs
+  # helper we rely on for Windows Known Folder resolution.
+  "MPL-2.0",
 ]
 confidence-threshold = 0.93
 version = 2
