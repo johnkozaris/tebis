@@ -112,7 +112,7 @@ pub fn decode_opus_to_pcm16k(
     Ok(out)
 }
 
-/// Mono `f32` PCM → OGG/Opus for `sendVoice`. 20 ms frames, VoIP.
+/// Mono `f32` PCM → OGG/Opus for `sendVoice`. 20 ms frames, `VoIP`.
 /// `sample_rate` ∈ {8k, 12k, 16k, 24k, 48k} Hz.
 pub fn encode_pcm_to_opus(pcm: &[f32], sample_rate: u32) -> Result<Bytes, CodecError> {
     use opus::{Application, Encoder as OpusEncoder};

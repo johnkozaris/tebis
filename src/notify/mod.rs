@@ -50,7 +50,7 @@ pub trait Forwarder: Send + Sync + 'static {
 pub struct TelegramForwarder {
     tg: Arc<TelegramClient>,
     chat_id: i64,
-    /// 2 permits cap fan-out under hook storms (Stop + several SubagentStops).
+    /// 2 permits cap fan-out under hook storms (Stop + several `SubagentStops`).
     send_sem: Arc<tokio::sync::Semaphore>,
 }
 

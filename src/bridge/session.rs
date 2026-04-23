@@ -67,7 +67,7 @@ impl SessionState {
         *self.lock_target() = Some(session);
     }
 
-    /// Compare-and-clear so a NotFound handler doesn't stomp a concurrent `/target`.
+    /// Compare-and-clear so a `NotFound` handler doesn't stomp a concurrent `/target`.
     pub fn clear_target_if(&self, session: &str) {
         let mut guard = self.lock_target();
         if guard.as_deref() == Some(session) {

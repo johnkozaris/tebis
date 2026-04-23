@@ -50,7 +50,7 @@ pub struct HandlerContext {
     pub audio: Option<Arc<AudioSubsystem>>,
     /// `BRIDGE_ENV_FILE` — required for runtime config writes
     /// (`/tts`, inspect Settings). `None` → mutative commands reply
-    /// with a "set BRIDGE_ENV_FILE" error instead of silently
+    /// with a "set `BRIDGE_ENV_FILE`" error instead of silently
     /// accepting a no-op.
     pub env_file_path: Option<std::path::PathBuf>,
 }

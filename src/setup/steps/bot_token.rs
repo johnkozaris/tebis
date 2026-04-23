@@ -1,4 +1,4 @@
-//! Step 1 — BotFather token prompt.
+//! Step 1 — `BotFather` token prompt.
 
 use anyhow::{Context, Result};
 use console::style;

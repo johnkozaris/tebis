@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use crate::sanitize;
 
 /// Escape → translate, falling back to escape-only on unbalanced output
-/// so a pathological `***foo***` can't break HTML parse_mode delivery.
+/// so a pathological `***foo***` can't break HTML `parse_mode` delivery.
 pub fn to_html(text: &str) -> String {
     // NUL is the translator's placeholder sentinel — strip from user input.
     let mut escaped = sanitize::escape_html(text);
