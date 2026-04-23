@@ -119,3 +119,13 @@ jobs:
       - run: cargo check --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
+      # PowerShell syntax-parse the embedded hook scripts. `[scriptblock]::Create`
+      # parses without executing, so this is the PowerShell sibling of
+      # shellcheck on the `.sh` scripts. windows-latest ships PowerShell
+      # 5.1 as `powershell.exe` and (since 2024) PowerShell 7 as `pwsh.exe`;
+      # either works here.
+      - name: Parse-check embedded .ps1 hook scripts
+        shell: pwsh
+        run: |
+          $null = [ScriptBlock]::Create((Get-Content -Raw contrib/claude/claude-hook.ps1))
+          $null = [ScriptBlock]::Create((Get-Content -Raw contrib/copilot/copilot-hook.ps1))
