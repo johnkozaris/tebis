@@ -1,14 +1,17 @@
-//! UDS bind, accept, per-connection protocol.
+//! Accept loop + per-connection protocol. Platform-specific bind /
+//! peer-auth lives in `crate::platform::peer_listener`; this file is
+//! pure protocol: newline-framed JSON (invariant 11), byte-capped
+//! (invariant 10), forwarded through the `Forwarder` trait.
 
 use anyhow::{Context, Result};
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+
+use crate::platform::peer_listener::{Conn, Listener};
 
 use super::{Forwarder, Payload};
 
@@ -23,17 +26,17 @@ pub fn spawn<F: Forwarder>(
     socket_path: PathBuf,
     forwarder: Arc<F>,
 ) -> Result<()> {
-    let listener = bind(&socket_path)?;
+    let listener = Listener::bind(&socket_path)
+        .with_context(|| format!("binding notify listener at {}", socket_path.display()))?;
 
     tracing::info!(
         path = %socket_path.display(),
-        "Notify listener bound (UDS, mode 0600)"
+        "Notify listener bound (platform::peer_listener)"
     );
 
     let tracker_for_conns = tracker.clone();
     tracker.spawn(accept_loop(
         listener,
-        socket_path,
         forwarder,
         tracker_for_conns,
         shutdown,
@@ -41,53 +44,15 @@ pub fn spawn<F: Forwarder>(
     Ok(())
 }
 
-/// Invariant 17: three-layer defense — umask(0177) + chmod 0600 + peer_cred.
-/// Pre-bind unlink is symlink-safe (unlink doesn't follow symlinks; /tmp
-/// sticky bit blocks clobbering attacker-owned files).
-fn bind(path: &Path) -> Result<UnixListener> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(e)
-                .with_context(|| format!("failed to unlink stale socket at {}", path.display()));
-        }
-    }
-
-    // SAFETY: `umask(2)` is async-signal-safe; prior mask restored below.
-    let prior_umask = unsafe { libc::umask(0o177) };
-    let listener_result = UnixListener::bind(path);
-    unsafe { libc::umask(prior_umask) };
-
-    let listener = listener_result
-        .with_context(|| format!("failed to bind notify socket at {}", path.display()))?;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to chmod socket to 0600 at {}", path.display()))?;
-
-    Ok(listener)
-}
-
-/// RAII: unlink on drop so a panicking accept loop doesn't leave a stale socket.
-struct SocketCleanup(PathBuf);
-
-impl Drop for SocketCleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 /// Cooldown between failed accepts — sticky EMFILE etc. would otherwise spin.
 const ACCEPT_ERROR_COOLDOWN: Duration = Duration::from_millis(100);
 
 async fn accept_loop<F: Forwarder>(
-    listener: UnixListener,
-    socket_path: PathBuf,
+    listener: Listener,
     forwarder: Arc<F>,
     tracker: TaskTracker,
     shutdown: CancellationToken,
 ) {
-    let _cleanup = SocketCleanup(socket_path);
     loop {
         let accept = tokio::select! {
             a = listener.accept() => a,
@@ -98,10 +63,15 @@ async fn accept_loop<F: Forwarder>(
         };
 
         match accept {
-            Ok((stream, _)) => {
+            Ok(conn) => {
+                if !listener.is_trusted_peer(&conn) {
+                    // Warning already logged by is_trusted_peer.
+                    tracker.spawn(reject_connection(conn));
+                    continue;
+                }
                 let f = forwarder.clone();
                 tracker.spawn(async move {
-                    handle_connection(stream, f).await;
+                    handle_connection(conn, f).await;
                 });
             }
             Err(e) => {
@@ -115,14 +85,17 @@ async fn accept_loop<F: Forwarder>(
     }
 }
 
-async fn handle_connection<F: Forwarder>(mut stream: UnixStream, forwarder: Arc<F>) {
-    if !peer_is_self(&stream) {
-        let _ = stream
-            .write_all(b"{\"ok\":false,\"error\":\"forbidden\"}\n")
-            .await;
-        return;
-    }
+async fn reject_connection(mut conn: Conn) {
+    let _ = conn
+        .write_all(b"{\"ok\":false,\"error\":\"forbidden\"}\n")
+        .await;
+}
 
+async fn handle_connection<S, F>(mut stream: S, forwarder: Arc<F>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: Forwarder,
+{
     let payload = match read_payload(&mut stream).await {
         Ok(p) => p,
         Err(e) => {
@@ -156,7 +129,10 @@ async fn handle_connection<F: Forwarder>(mut stream: UnixStream, forwarder: Arc<
     }
 }
 
-async fn read_payload(stream: &mut UnixStream) -> Result<Payload> {
+async fn read_payload<S>(stream: &mut S) -> Result<Payload>
+where
+    S: AsyncRead + Unpin,
+{
     let mut reader = BufReader::with_capacity(4096, stream);
     let mut buf = Vec::with_capacity(2048);
 
@@ -212,31 +188,10 @@ fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
     haystack.iter().position(|&b| b == needle)
 }
 
-/// Kernel-auth peer check. `peer_cred`'s pid is racy, so only trust `uid`.
-/// `peer_cred` failure rejects — don't let a misbehaving stack bypass the gate.
-fn peer_is_self(stream: &UnixStream) -> bool {
-    // SAFETY: `geteuid` is async-signal-safe, infallible.
-    let our_euid = unsafe { libc::geteuid() };
-    match stream.peer_cred() {
-        Ok(cred) if cred.uid() == our_euid => true,
-        Ok(cred) => {
-            tracing::warn!(
-                peer_uid = cred.uid(),
-                our_euid,
-                "Notify: rejecting connection from different uid"
-            );
-            false
-        }
-        Err(e) => {
-            tracing::warn!(err = %e, "Notify: peer_cred failed, rejecting connection");
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    //! Protocol tests via `UnixStream::pair()` + a recording `Forwarder`.
+    //! Protocol tests via `tokio::io::duplex()` — cross-platform;
+    //! peer-auth lives in `platform::peer_listener` and is tested there.
 
     use super::super::{ForwardError, Forwarder, Payload};
     use super::*;
@@ -278,8 +233,8 @@ mod tests {
         }
     }
 
-    async fn drive(forwarder: Arc<impl Forwarder>, write: &[u8]) -> Vec<u8> {
-        let (server, mut client) = UnixStream::pair().expect("UnixStream::pair");
+    async fn drive(forwarder: Arc<impl Forwarder + 'static>, write: &[u8]) -> Vec<u8> {
+        let (server, mut client) = tokio::io::duplex(4096);
         let handle = tokio::spawn(handle_connection(server, forwarder));
 
         client.write_all(write).await.unwrap();
@@ -290,12 +245,6 @@ mod tests {
         client.read_to_end(&mut response).await.unwrap();
         handle.await.unwrap();
         response
-    }
-
-    #[tokio::test]
-    async fn peer_is_self_accepts_same_process_socketpair() {
-        let (a, _b) = UnixStream::pair().expect("UnixStream::pair");
-        assert!(peer_is_self(&a));
     }
 
     #[tokio::test]
