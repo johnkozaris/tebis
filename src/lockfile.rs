@@ -1,12 +1,11 @@
-//! Single-instance guard via advisory `flock` + pidfile.
+//! Single-instance guard via advisory lock + pidfile.
+//!
+//! `File::try_lock` is `flock(2)` on Unix and `LockFileEx` on Windows
+//! (stabilized in 1.89). Both release the lock automatically when the
+//! last file handle is dropped, so a crashed tebis frees its slot.
 
-#![cfg(unix)]
-
-use std::env;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 pub struct LockFile {
@@ -45,8 +44,11 @@ impl std::fmt::Display for AcquireError {
 
 impl std::error::Error for AcquireError {}
 
-/// `$XDG_RUNTIME_DIR/tebis.lock`, else `/tmp/tebis-$USER.lock`.
+/// Unix: `$XDG_RUNTIME_DIR/tebis.lock`, else `/tmp/tebis-$USER.lock`.
+/// Windows: `%LOCALAPPDATA%\tebis\tebis.lock`.
+#[cfg(unix)]
 pub fn default_path() -> PathBuf {
+    use std::env;
     if let Ok(xdg) = env::var("XDG_RUNTIME_DIR")
         && !xdg.is_empty()
     {
@@ -56,8 +58,16 @@ pub fn default_path() -> PathBuf {
     PathBuf::from(format!("/tmp/tebis-{user}.lock"))
 }
 
-/// Exclusive non-blocking `flock`, writes our pid on success. `mode(0o600)`
-/// at open avoids the open→chmod TOCTOU.
+#[cfg(windows)]
+pub fn default_path() -> PathBuf {
+    directories::ProjectDirs::from("", "", "tebis")
+        .map(|p| p.data_local_dir().join("tebis.lock"))
+        .unwrap_or_else(|| std::env::temp_dir().join("tebis.lock"))
+}
+
+/// Exclusive non-blocking lock. On Unix `mode(0o600)` avoids the
+/// open→chmod TOCTOU; on Windows the file inherits DACLs from
+/// `%LOCALAPPDATA%\tebis\`, which is user-private by default.
 pub fn acquire(path: &Path) -> Result<LockFile, AcquireError> {
     // `$XDG_RUNTIME_DIR` can be GC'd at logout; create it so errors are clear.
     if let Some(parent) = path.parent()
@@ -66,20 +76,18 @@ pub fn acquire(path: &Path) -> Result<LockFile, AcquireError> {
         std::fs::create_dir_all(parent).map_err(AcquireError::Io)?;
     }
 
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path)
-        .map_err(AcquireError::Io)?;
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(path).map_err(AcquireError::Io)?;
 
-    // SAFETY: flock(2) with a valid fd and valid flags is sound.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
             let pid = std::fs::read_to_string(path)
                 .ok()
                 .and_then(|s| s.trim().parse().ok());
@@ -88,7 +96,7 @@ pub fn acquire(path: &Path) -> Result<LockFile, AcquireError> {
                 pid,
             });
         }
-        return Err(AcquireError::Io(err));
+        Err(TryLockError::Error(e)) => return Err(AcquireError::Io(e)),
     }
 
     let mut handle = &file;
@@ -107,23 +115,17 @@ impl Drop for LockFile {
     }
 }
 
-/// Pid of a tebis actually holding the flock. Probes the lock directly —
+/// Pid of a tebis actually holding the lock. Probes the lock directly —
 /// a stale pidfile from a crashed run returns `None`.
 pub fn active_holder(path: &Path) -> Option<u32> {
     let file = OpenOptions::new().read(true).open(path).ok()?;
-
-    // SAFETY: flock(2) with a valid fd and valid flags is sound.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return None;
+    match file.try_lock() {
+        Ok(()) => None,
+        Err(TryLockError::WouldBlock) => std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse().ok()),
+        Err(TryLockError::Error(_)) => None,
     }
-    let errno = std::io::Error::last_os_error().raw_os_error();
-    if errno != Some(libc::EWOULDBLOCK) {
-        return None;
-    }
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
 }
 
 #[cfg(test)]

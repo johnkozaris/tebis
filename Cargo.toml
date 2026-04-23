@@ -25,10 +25,6 @@ indicatif = "0.18"
 hyper = {version = "1.9.0", default-features = false, features = ["client", "http1", "server"]}
 hyper-rustls = {version = "0.27.9", default-features = false, features = ["ring", "http1", "webpki-roots", "tls12"]}
 hyper-util = {version = "0.1.20", default-features = false, features = ["client", "client-legacy", "http1", "tokio"]}
-# fs4 wraps `flock(2)` on Unix and `LockFileEx` on Windows behind a
-# single API so `src/lockfile.rs` + `src/agent_hooks/manifest.rs` don't
-# need per-platform unsafe blocks.
-fs4 = "1.0"
 # Known Folders on Windows, XDG on Linux, Apple dirs on macOS behind one
 # API — config/data/cache/runtime paths stop being hand-rolled.
 directories = "6"
