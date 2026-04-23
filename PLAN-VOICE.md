@@ -695,9 +695,9 @@ Each file must be `shasum -a 256`'d once post-download and the hex pasted into t
 
 ## Critical implementation files
 
-- `<repo>/src/audio/mod.rs` (new) — `AudioSubsystem::new`
-- `<repo>/src/audio/stt/local.rs` (new) — whisper-rs in-process wrapper
-- `<repo>/src/audio/codec.rs` (new) — ogg-opus decode + encode
-- `<repo>/src/audio/fetch.rs` (new) — SHA-verified download
-- `<repo>/src/bridge/mod.rs` (modified) — `Payload` dispatch seam
-- `<repo>/src/telegram/mod.rs` (modified) — get_file / download_file / send_voice
+- `src/audio/mod.rs` (new) — `AudioSubsystem::new`
+- `src/audio/stt/local.rs` (new) — whisper-rs in-process wrapper
+- `src/audio/codec.rs` (new) — ogg-opus decode + encode
+- `src/audio/fetch.rs` (new) — SHA-verified download
+- `src/bridge/mod.rs` (modified) — `Payload` dispatch seam
+- `src/telegram/mod.rs` (modified) — get_file / download_file / send_voice

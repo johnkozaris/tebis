@@ -1,6 +1,13 @@
 #!/usr/bin/expect -f
 # Debug-drive tebis setup. Feeds predefined answers and captures output.
-# Usage: expect scripts/debug-setup.exp [path-to-tebis-binary]
+#
+# Usage:
+#   TEBIS_DEBUG_BOT_TOKEN=<token> TEBIS_DEBUG_USER_ID=<id> \
+#     expect scripts/debug-setup.exp [path-to-tebis-binary]
+#
+# Both env vars are REQUIRED — the script aborts if either is unset so
+# nobody accidentally hardcodes a real bot token in a committed file.
+# Use a throwaway test bot, not your production bridge.
 #
 # This variant exercises the full TTS path:
 #   - empty allowlist (permissive)
@@ -21,6 +28,15 @@
 set timeout 120
 log_user 1
 
+# Refuse to run without explicit creds — no hardcoded fallbacks.
+set bot_token [expr {[info exists env(TEBIS_DEBUG_BOT_TOKEN)] ? $env(TEBIS_DEBUG_BOT_TOKEN) : ""}]
+set user_id [expr {[info exists env(TEBIS_DEBUG_USER_ID)] ? $env(TEBIS_DEBUG_USER_ID) : ""}]
+if {$bot_token eq "" || $user_id eq ""} {
+    puts stderr "debug-setup.exp: set TEBIS_DEBUG_BOT_TOKEN and TEBIS_DEBUG_USER_ID."
+    puts stderr "  Use a throwaway test bot from BotFather, not your production token."
+    exit 2
+}
+
 set bin [lindex $argv 0]
 if {$bin eq ""} { set bin "./target/debug/tebis" }
 spawn $bin setup
@@ -34,11 +50,11 @@ expect {
     }
     -re "Bot token\[^\r\n]*" {}
 }
-send -- "<TEST_BOT_TOKEN>\r"
+send -- "$bot_token\r"
 
 # Step 2 — user id
 expect -re "Your numeric Telegram id"
-send -- "<TEST_USER_ID>\r"
+send -- "$user_id\r"
 
 # Step 3 — session allowlist: No
 expect -re "Restrict to specific session names"

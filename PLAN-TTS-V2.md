@@ -216,8 +216,7 @@ older Debians).
   tokens anywhere — not in `Debug`, not in error chains.
 - **Enforce https by default.** Reject `http://` URLs at config load
   unless `TELEGRAM_TTS_REMOTE_ALLOW_HTTP=true`. Documented escape
-  hatch for LAN / self-hosted deployments like John's kokoro-fastapi
-  on `example.com`.
+  hatch for LAN / self-hosted kokoro-fastapi deployments.
 - **Byte cap on remote response.** 10 MB max. Reject larger responses
   with a clear error. Prevents a misbehaving remote from OOMing tebis.
 - **Timeout bound.** 10 s default, configurable via
