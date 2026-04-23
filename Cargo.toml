@@ -65,11 +65,18 @@ windows = {version = "0.62", features = [
     "Win32_System_Threading",
 ]}
 
-# whisper-rs: Metal GPU on macOS, CPU on Linux.
+# whisper-rs: Metal GPU on macOS, CPU on Linux + Windows. CUDA/Vulkan
+# on Windows could land later behind a feature flag; CPU is the
+# least-surprising default for a personal daemon on a single-user
+# desktop (whisper-base.en is ~150 MB and transcribes a minute of
+# speech in a couple of seconds on modern hardware).
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = {version = "0.16", default-features = false, features = ["metal"]}
 
 [target.'cfg(target_os = "linux")'.dependencies]
+whisper-rs = {version = "0.16", default-features = false}
+
+[target.'cfg(target_os = "windows")'.dependencies]
 whisper-rs = {version = "0.16", default-features = false}
 
 [dependencies.tebis-tts-kokoro]
