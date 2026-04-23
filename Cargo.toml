@@ -25,7 +25,13 @@ indicatif = "0.18"
 hyper = {version = "1.9.0", default-features = false, features = ["client", "http1", "server"]}
 hyper-rustls = {version = "0.27.9", default-features = false, features = ["ring", "http1", "webpki-roots", "tls12"]}
 hyper-util = {version = "0.1.20", default-features = false, features = ["client", "client-legacy", "http1", "tokio"]}
-libc = "0.2.185"
+# fs4 wraps `flock(2)` on Unix and `LockFileEx` on Windows behind a
+# single API so `src/lockfile.rs` + `src/agent_hooks/manifest.rs` don't
+# need per-platform unsafe blocks.
+fs4 = "1.0"
+# Known Folders on Windows, XDG on Linux, Apple dirs on macOS behind one
+# API — config/data/cache/runtime paths stop being hand-rolled.
+directories = "6"
 # Already transitive via hyper-rustls/rustls — made direct so
 # `ring::digest::SHA256` is usable without relying on re-exports.
 ring = "0.17"
@@ -41,6 +47,12 @@ tracing = "0.1.44"
 tracing-subscriber = {version = "0.3.23", features = ["fmt", "env-filter"]}
 ogg = "0.9"
 opus = "0.3"
+
+# libc only reachable through Unix-gated code paths (lockfile flock,
+# notify UDS umask/peer_cred, service launchd/systemd, inspect SIGTERM);
+# keeping it off the Windows build simplifies the dep graph there.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.185"
 
 # whisper-rs: Metal GPU on macOS, CPU on Linux.
 [target.'cfg(target_os = "macos")'.dependencies]
