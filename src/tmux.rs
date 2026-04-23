@@ -20,6 +20,8 @@ pub struct Tmux {
     max_output_chars: usize,
 }
 
+/// Invariant 13: `exact_target` is `=NAME`. The `=` forces tmux exact-match;
+/// bare `-t foo` prefix-matches and would land in `foobar`.
 struct SessionSlot {
     exact_target: String,
     lock: Mutex<()>,

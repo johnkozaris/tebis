@@ -2,61 +2,49 @@
 
 ## Supported versions
 
-tebis is pre-1.0. Only the current `master` / `main` branch is supported.
-There are no back-ported fixes to earlier tags.
+Pre-1.0. Only the current `master` branch is supported.
 
 ## Threat model
 
-tebis is a single-user daemon. It is designed to be run by one person, on
-their own host, against a Telegram bot whose token is treated as secret.
+tebis is a single-user daemon. One person, one host, one bot token.
 
 **In scope:**
 
-- Remote command execution or tmux keystroke injection by anyone other
-  than the configured numeric Telegram `user.id`.
-- Leakage of the bot token through logs, error strings, or the inspect
-  dashboard.
-- Escape from the tmux session-name allowlist (shell metachars, path
-  traversal, tmux exact-match syntax, prefix matching).
-- Unauthorized access to the notify UDS from other local users.
-- HTML injection in Telegram replies (`parse_mode=HTML`).
-- Path-traversal or arbitrary file writes via the inspect dashboard's
-  settings editor.
+- RCE / tmux keystroke injection by anyone other than the configured user id.
+- Bot-token leakage through logs, errors, or the dashboard.
+- Escape from the session-name allowlist (shell metachars, path traversal,
+  tmux prefix matching).
+- Unauthorized notify UDS access from other local users.
+- HTML injection into Telegram replies.
+- Path traversal via the dashboard settings editor.
 
 **Out of scope:**
 
-- Anyone with local `root` or the ability to read `~/.config/tebis/env`.
-- A malicious `tmux` binary on `PATH`.
-- A compromised Telegram server or a hostile `@BotFather`.
-- Denial-of-service from the authorized user themselves.
+- Local root or anyone who can read `~/.config/tebis/env`.
+- A malicious `tmux` on `PATH`.
+- A compromised Telegram server.
+- DoS by the authorized user.
 
-The `CLAUDE.md` file enumerates the specific invariants the code relies on.
+See `CLAUDE.md` for the invariants the code relies on.
 
 ## Reporting a vulnerability
 
-Please do **not** file a public issue for suspected security problems.
+Do **not** file a public issue.
 
-If you found something, open a private advisory on the project's GitHub
-repository ("Security" tab → "Report a vulnerability"), or email the
-maintainer listed in `Cargo.toml` with:
+Open a private advisory on the repo ("Security" → "Report a vulnerability"),
+or email the maintainer in `Cargo.toml` with: impact, repro steps, and
+whether a fix is time-critical.
 
-- A short description of the impact.
-- Repro steps (config / input / expected behavior).
-- Whether you believe a fix is time-critical.
+Acknowledgement within a week. Coordinated disclosure preferred.
 
-Expect an acknowledgement within a week. Coordinated disclosure is
-preferred — we'll work with you on a timeline that lets deployed users
-update before details go public.
+## Hardening tips
 
-## Hardening tips for deployments
-
-- Run under a dedicated user account (the systemd unit in `contrib/linux/`
-  is pre-sandboxed — audit with `systemd-analyze --user security tebis`).
+- Run under a dedicated user (systemd unit in `contrib/linux/` is
+  pre-sandboxed — `systemd-analyze --user security tebis`).
 - Keep `~/.config/tebis/env` at mode 0600.
-- Use the strict allowlist (`TELEGRAM_ALLOWED_SESSIONS=…`) if you know
-  ahead of time which session names you'll target.
-- Disable "Allow Groups" in `@BotFather` so your bot cannot be added to a
-  group chat it would read messages from.
-- Only enable `INSPECT_PORT` if you need it; the dashboard is
-  unauthenticated and relies on loopback-only binding + Origin-header CSRF
-  protection.
+- Set `TELEGRAM_ALLOWED_SESSIONS=…` if you know your session names ahead
+  of time.
+- Disable "Allow Groups" in `@BotFather` so the bot can't be added to a
+  group.
+- Only enable `INSPECT_PORT` if you need it — the dashboard is
+  unauthenticated and relies on loopback + Origin-header CSRF.

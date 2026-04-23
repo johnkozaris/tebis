@@ -189,6 +189,11 @@ fn resolve_tts_choice(
             model: model.unwrap_or_default(),
             voice: voice.unwrap_or_else(|| "af_sarah".to_string()),
             respond_to_all,
+            // Re-probed by the wizard on every run — no need to
+            // round-trip ORT_DYLIB_PATH through discover. If the
+            // user's env already has it, setup::mod will preserve it
+            // via the user-added-keys passthrough.
+            ort_dylib_path: None,
         }),
         "kokoro-remote" | "kokoro_remote" | "remote" => {
             // URL is hard-required; otherwise surface a fresh prompt.

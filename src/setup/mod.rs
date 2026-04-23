@@ -13,6 +13,7 @@ use dialoguer::{Confirm, Select};
 use crate::env_file;
 
 mod discover;
+pub mod onnxruntime;
 /// `pub` so `examples/kokoro-smoke.rs` can call `probe_espeak_ng`.
 pub mod phonemizer;
 mod steps;
@@ -42,6 +43,11 @@ const WIZARD_MANAGED_KEYS_ALWAYS: &[&str] = &[
     "TELEGRAM_TTS_REMOTE_MODEL",
     "TELEGRAM_TTS_REMOTE_TIMEOUT_SEC",
     "TELEGRAM_TTS_REMOTE_ALLOW_HTTP",
+    // `ORT_DYLIB_PATH` is written by the wizard when Kokoro-local is
+    // chosen (points at the brew-installed libonnxruntime). Listed here
+    // so switching to a different backend on re-run doesn't leave a
+    // stale path behind.
+    "ORT_DYLIB_PATH",
 ];
 
 fn wizard_managed_keys() -> impl Iterator<Item = &'static str> {
@@ -74,6 +80,15 @@ pub(super) enum TtsChoice {
         model: String,
         voice: String,
         respond_to_all: bool,
+        /// Full path to `libonnxruntime.{dylib,so}` — written as
+        /// `ORT_DYLIB_PATH=<path>` so the daemon's `libloading` call
+        /// can find the shared library on Apple Silicon (where
+        /// `/opt/homebrew/lib` isn't in the default dyld search path)
+        /// and on Linux distros that don't symlink to `/usr/lib`.
+        /// `None` means "trust the default search path" — suitable for
+        /// env-file re-reads where the user or `tebis setup` has
+        /// already set this separately.
+        ort_dylib_path: Option<String>,
     },
     KokoroRemote {
         url: String,
@@ -342,7 +357,7 @@ fn build_env_file(
                     out.push_str("TELEGRAM_TTS_RESPOND_TO_ALL=on\n");
                 }
             }
-            TtsChoice::KokoroLocal { model, voice, respond_to_all } => {
+            TtsChoice::KokoroLocal { model, voice, respond_to_all, ort_dylib_path } => {
                 out.push_str(
                     "# Local Kokoro ONNX via espeak-ng phonemizer. Requires\n",
                 );
@@ -350,6 +365,14 @@ fn build_env_file(
                 let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=kokoro-local");
                 let _ = writeln!(out, "TELEGRAM_TTS_MODEL={model}");
                 let _ = writeln!(out, "TELEGRAM_TTS_VOICE={voice}");
+                if let Some(p) = ort_dylib_path {
+                    out.push_str(
+                        "# Where the daemon's `libloading` finds the ONNX Runtime shared\n\
+                         # library. On Apple Silicon brew installs to /opt/homebrew/lib,\n\
+                         # which isn't in the default dyld search path.\n",
+                    );
+                    let _ = writeln!(out, "ORT_DYLIB_PATH={p}");
+                }
                 if *respond_to_all {
                     out.push_str("TELEGRAM_TTS_RESPOND_TO_ALL=on\n");
                 }

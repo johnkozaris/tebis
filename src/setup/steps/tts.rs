@@ -84,32 +84,37 @@ fn simple_tts(
     {
         println!();
         println!(
-            "  Using {} (offline, neural). Checking for {}…",
+            "  Using {} (offline, neural). Checking for {} + {}…",
             style("Kokoro local").bold(),
             style("espeak-ng").bold(),
+            style("onnxruntime").bold(),
         );
-        let outcome = super::super::phonemizer::ensure_or_install(theme)
+        let espeak = super::super::phonemizer::ensure_or_install(theme)
             .context("probing / installing espeak-ng")?;
-        match outcome {
-            super::super::phonemizer::EnsureOutcome::Ready(_) => {
+        let ort = super::super::onnxruntime::ensure_or_install(theme)
+            .context("probing / installing onnxruntime")?;
+        match (espeak, ort) {
+            (
+                super::super::phonemizer::EnsureOutcome::Ready(_),
+                super::super::onnxruntime::EnsureOutcome::Ready(ort_path),
+            ) => {
                 let model = default_tts_model();
                 let voice = existing_voice_or(existing, "af_sarah");
                 Ok(Some(TtsChoice::KokoroLocal {
                     model,
                     voice,
                     respond_to_all,
+                    ort_dylib_path: Some(ort_path.to_string_lossy().into_owned()),
                 }))
             }
-            super::super::phonemizer::EnsureOutcome::UserDeclined
-            | super::super::phonemizer::EnsureOutcome::InstallFailed
-            | super::super::phonemizer::EnsureOutcome::NoPackageManager => {
+            _ => {
                 println!();
                 println!(
                     "   {} Continuing with text-only replies. Re-run {} later",
                     style("→").dim(),
                     style("tebis setup").bold(),
                 );
-                println!("     after installing espeak-ng to enable voice replies.");
+                println!("     after installing the missing dependency to enable voice replies.");
                 Ok(Some(TtsChoice::Off))
             }
         }
@@ -220,12 +225,13 @@ fn configure_kokoro_local(
 ) -> Result<Option<TtsChoice>> {
     println!();
     println!(
-        "Kokoro local requires {} on PATH.",
+        "Kokoro local requires {} on PATH and {} shared library.",
         style("espeak-ng").bold(),
+        style("onnxruntime").bold(),
     );
-    let outcome = super::super::phonemizer::ensure_or_install(theme)
+    let espeak = super::super::phonemizer::ensure_or_install(theme)
         .context("probing / installing espeak-ng")?;
-    if !matches!(outcome, super::super::phonemizer::EnsureOutcome::Ready(_)) {
+    if !matches!(espeak, super::super::phonemizer::EnsureOutcome::Ready(_)) {
         println!();
         println!(
             "   {} espeak-ng unavailable — falling back to no TTS.",
@@ -233,6 +239,25 @@ fn configure_kokoro_local(
         );
         return Ok(Some(TtsChoice::Off));
     }
+
+    // onnxruntime: the `ort` crate's `load-dynamic` searches the default
+    // dyld paths, which DON'T include `/opt/homebrew/lib` on Apple
+    // Silicon. We probe, install if missing, and the caller writes the
+    // resolved full path to `ORT_DYLIB_PATH` in the env file.
+    let ort_outcome = super::super::onnxruntime::ensure_or_install(theme)
+        .context("probing / installing onnxruntime")?;
+    let ort_path = match ort_outcome {
+        super::super::onnxruntime::EnsureOutcome::Ready(p) => p,
+        _ => {
+            println!();
+            println!(
+                "   {} onnxruntime unavailable — falling back to no TTS.",
+                style("→").dim(),
+            );
+            return Ok(Some(TtsChoice::Off));
+        }
+    };
+
     let model = default_tts_model();
     let voice: String = Input::with_theme(theme)
         .with_prompt("Voice (af_sarah or am_adam)")
@@ -248,6 +273,7 @@ fn configure_kokoro_local(
         model,
         voice,
         respond_to_all,
+        ort_dylib_path: Some(ort_path.to_string_lossy().into_owned()),
     }))
 }
 

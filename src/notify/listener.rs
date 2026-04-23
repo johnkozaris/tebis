@@ -179,7 +179,9 @@ async fn read_payload(stream: &mut UnixStream) -> Result<Payload> {
     Ok(payload)
 }
 
-/// `read_until` with a hard cap — bounds a client that never sends `\n`.
+/// Invariant 11: newline-framed, NOT EOF-framed. macOS's stock `nc` lacks
+/// `-N` for UDS half-close, so hook scripts use `nc -U -w 2` and depend on
+/// `\n` to flush. Hard cap bounds a client that never sends one.
 async fn read_until_bounded<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     delim: u8,

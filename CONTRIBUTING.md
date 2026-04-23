@@ -1,78 +1,57 @@
-# Contributing to tebis
+# Contributing
 
-Thanks for the interest. tebis is a small, single-user daemon that drives
-another process over `tmux send-keys`, so the bar for changes — especially
-to security-sensitive paths — is intentionally high. Please read this
-before filing a PR.
+tebis is a single-user daemon that drives other processes via `tmux send-keys`.
+The bar for security-sensitive changes is high — read this before filing a PR.
 
 ## Ground rules
 
-1. **Read `CLAUDE.md`.** It enumerates security invariants (1–19) and
-   architectural rules that must not be weakened without explicit
-   discussion. Most of them have been reached after a concrete bug, CVE,
-   or misbehaving client.
-2. **No new runtime dependencies without a justification.** We run on
-   `hyper` + `rustls` (ring) directly to keep the binary and audit surface
-   small. `deny.toml` bans `reqwest`, `openssl`, `native-tls`, and
-   `aws-lc-rs`. If your PR needs one of those, expect a hard conversation.
-3. **Don't log message content.** `message.text`, notify payload `text`,
-   and tmux pane output can carry secrets. Log metadata only
-   (`chat_id`, `bytes`, `kind`).
-4. **Don't relax HTML-escaping.** Every Telegram reply must go through
-   `sanitize::escape_html` and, for `<pre>`/`<code>`-wrapped content,
-   `sanitize::wrap_and_truncate`.
+1. **Read `CLAUDE.md`.** It lists the security invariants. Most were added
+   after a concrete bug or CVE. Don't weaken them without explicit discussion.
+2. **No new runtime dependencies without justification.** `deny.toml` bans
+   `reqwest`, `openssl`, `native-tls`, `aws-lc-rs`.
+3. **Don't log message content.** `message.text`, notify payloads, and pane
+   output can carry secrets. Log metadata only (`chat_id`, `bytes`, `kind`).
+4. **Every Telegram reply goes through `sanitize::escape_html`**, and
+   `<pre>`/`<code>`-wrapped content through `sanitize::wrap_and_truncate`.
 
-## Local development
+## Local checks
 
 ```sh
-cargo test                                               # unit tests
-cargo clippy --all-targets -- -D warnings                # base lints
-cargo clippy --all-targets -- -D warnings \
-    -W clippy::pedantic -W clippy::nursery               # pedantic pass
-cargo fmt --check                                        # style
-cargo audit                                              # RUSTSEC advisories
-cargo deny check                                         # licenses + bans + sources
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
+cargo fmt --check
+cargo audit
+cargo deny check
 ```
 
-CI runs the equivalent on every push / PR. The audit workflow also runs
-daily on a cron so the main branch reports drift independently of pushes.
+CI runs the same on every push/PR plus a daily audit cron.
 
 ## PR checklist
 
-Before opening a PR:
+- [ ] Tests pass.
+- [ ] Clippy pedantic/nursery clean.
+- [ ] `cargo fmt --check` clean.
+- [ ] `cargo deny check` clean (if deps changed).
+- [ ] No `unwrap()` outside tests unless the invariant is documented.
+- [ ] Every `unsafe` block has a `// SAFETY:` comment.
+- [ ] Behavioral changes have tests.
+- [ ] `CLAUDE.md` invariants reflect any security-relevant change.
 
-- [ ] `cargo test` passes locally.
-- [ ] `cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery` is clean.
-- [ ] `cargo fmt --check` is clean.
-- [ ] `cargo deny check` is clean (if you touched deps).
-- [ ] No `unwrap()` on non-test code paths unless the invariant is
-      documented inline (comment or `.expect("why this cannot fail")`).
-- [ ] `unsafe` blocks have a `// SAFETY:` comment explaining why the
-      preconditions hold.
-- [ ] No new `.env` values or paths hard-coded to a specific machine or user.
-- [ ] Tests accompany behavioral changes (parsing, sanitization, tmux error
-      classification, etc.).
-- [ ] If you changed security-sensitive code, the `CLAUDE.md` invariants
-      section reflects the new reality.
+## Commits
 
-## Commit style
+Short imperative subject; body explains the *why*.
 
-Short, imperative summary on the subject line. Body explains the *why* when
-non-obvious — git history is the first place a future reader will look.
+Do **not** add `Co-authored-by: Claude` / `Co-authored-by: Copilot` /
+any AI trailer.
 
-Do **not** sign commits with `Co-authored-by: Claude` / `Co-authored-by:
-Copilot` / any AI-authored-by trailer.
+## Bugs and security
 
-## Reporting bugs
-
-Use the project's issue tracker. For anything that looks like a security
-issue (auth bypass, token leak, shell / tmux injection, path traversal),
-please follow [SECURITY.md](SECURITY.md) instead of filing a public issue.
+Public issues for bugs; private advisory or `SECURITY.md` for anything
+that looks like auth bypass, token leak, or injection.
 
 ## Scope
 
-tebis is intentionally single-user, single-binary, and opinionated. Nice
-additions: a new `/command`, more robust recovery paths, smaller binary,
-better docs. Probably-rejected additions: multi-tenant dispatch,
-auth-via-usernames, a web UI that isn't loopback-only, TCP-reachable notify
-sockets. If you're unsure, open an issue to discuss before coding.
+Nice: new `/command`s, recovery paths, smaller binary, better docs.
+Probably rejected: multi-tenant dispatch, username-based auth, non-loopback
+web UI, TCP notify sockets. Open an issue first if unsure.
