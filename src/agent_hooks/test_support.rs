@@ -5,7 +5,11 @@ use std::sync::{Mutex, MutexGuard};
 
 use super::{AgentKind, HookManager};
 
-fn env_lock() -> MutexGuard<'static, ()> {
+/// Crate-wide test-only mutex for tests that mutate process-global
+/// state (env vars via `with_scratch_data_home`, `libc::umask` in the
+/// peer-listener bind tests, etc.). Must be held across the whole
+/// side-effect window so parallel tests don't observe the mutation.
+pub fn env_lock() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

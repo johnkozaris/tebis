@@ -1,20 +1,31 @@
 //! Filesystem layout. One place to ask "where does tebis keep
-//! config / data / cache / runtime / the env file / the lockfile".
+//! config / data / cache / runtime / the env file / the lockfile /
+//! the notify socket".
 //!
 //! # Layout contract
 //!
-//! | Purpose         | Linux                                 | macOS                                 | Windows                           |
-//! |-----------------|---------------------------------------|---------------------------------------|-----------------------------------|
-//! | `config_dir`    | `$XDG_CONFIG_HOME/tebis` or `~/.config/tebis` | `~/.config/tebis`                     | `%APPDATA%\tebis`                 |
-//! | `data_dir`      | `$XDG_DATA_HOME/tebis` or `~/.local/share/tebis` | `~/.local/share/tebis`                | `%LOCALAPPDATA%\tebis`            |
-//! | `runtime_dir`   | `$XDG_RUNTIME_DIR/tebis`, fallback `/tmp/tebis-$USER` | `/tmp/tebis-$USER`                    | `%LOCALAPPDATA%\tebis\run`        |
-//! | `env_file_path` | `<config_dir>/env`                    | `<config_dir>/env`                    | `<config_dir>\env`                |
-//! | `lock_file_path`| `<runtime_dir>/tebis.lock`            | `<runtime_dir>/tebis.lock`            | `<runtime_dir>\tebis.lock`        |
+//! | Purpose             | Linux                                            | macOS                           | Windows                                  |
+//! |---------------------|--------------------------------------------------|---------------------------------|------------------------------------------|
+//! | `config_dir`        | `$XDG_CONFIG_HOME/tebis` or `~/.config/tebis`    | `~/.config/tebis`               | `%APPDATA%\tebis`                        |
+//! | `data_dir`          | `$XDG_DATA_HOME/tebis` or `~/.local/share/tebis` | `~/.local/share/tebis`          | `%LOCALAPPDATA%\tebis`                   |
+//! | `env_file_path`     | `<config_dir>/env`                               | `<config_dir>/env`              | `<config_dir>\env`                       |
+//! | `lock_file_path`    | `$XDG_RUNTIME_DIR/tebis.lock` or `/tmp/tebis-$USER.lock` | `/tmp/tebis-$USER.lock` | `%LOCALAPPDATA%\tebis\run\tebis.lock`    |
+//! | `notify_address`    | `$XDG_RUNTIME_DIR/tebis.sock` or `/tmp/tebis-$USER.sock` | `/tmp/tebis-$USER.sock` | `\\.\pipe\tebis-<user>-notify` (pipe name) |
+//! | `models_dir`        | `<data_dir>/models`                              | `<data_dir>/models`             | `<data_dir>\models`                      |
+//! | `hook_manifest_path`| `<data_dir>/installed.json`                      | `<data_dir>/installed.json`     | `<data_dir>\installed.json`              |
 //!
-//! Unix paths keep the XDG-style layout tebis has always used, to match
-//! the invariants and docs already referencing `~/.config/tebis` etc.
-//! Windows uses the Known Folder API via the `directories` crate — the
-//! standard location for per-user app config and data on Windows.
+//! Unix paths preserve the flat layout tebis has always shipped —
+//! `$XDG_RUNTIME_DIR/tebis.sock` / `/tmp/tebis-$USER.sock`, not
+//! `$XDG_RUNTIME_DIR/tebis/tebis.sock`. That's what the embedded hook
+//! scripts (`contrib/claude/claude-hook.sh`, `contrib/copilot/…`)
+//! compute, and any user with an existing deployment expects.
+//!
+//! Windows uses the Known Folder API via `directories` for config /
+//! data, and a synthetic `run` subdirectory under `%LOCALAPPDATA%`
+//! for the lockfile (no NT analogue of `XDG_RUNTIME_DIR`). The
+//! notify address on Windows is a **named pipe name**, not a
+//! filesystem path — carried as `PathBuf` for shape compatibility
+//! with the Unix UDS path.
 
 use std::path::PathBuf;
 
@@ -50,15 +61,24 @@ mod unix {
         Ok(home()?.join(".local/share/tebis"))
     }
 
-    pub fn runtime_dir() -> Result<PathBuf> {
+    pub fn lock_file_path() -> Result<PathBuf> {
         if let Ok(x) = std::env::var("XDG_RUNTIME_DIR")
             && !x.is_empty()
         {
-            return Ok(PathBuf::from(x).join("tebis"));
+            return Ok(PathBuf::from(x).join("tebis.lock"));
         }
-        // macOS + BSD: no runtime dir concept; per-user tmp fallback.
         let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-        Ok(PathBuf::from(format!("/tmp/tebis-{user}")))
+        Ok(PathBuf::from(format!("/tmp/tebis-{user}.lock")))
+    }
+
+    pub fn notify_address() -> Result<PathBuf> {
+        if let Ok(x) = std::env::var("XDG_RUNTIME_DIR")
+            && !x.is_empty()
+        {
+            return Ok(PathBuf::from(x).join("tebis.sock"));
+        }
+        let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+        Ok(PathBuf::from(format!("/tmp/tebis-{user}.sock")))
     }
 }
 
@@ -82,29 +102,30 @@ mod windows {
         Ok(dirs()?.data_local_dir().to_path_buf())
     }
 
-    pub fn runtime_dir() -> Result<PathBuf> {
-        // Windows has no XDG_RUNTIME_DIR analogue. `%LOCALAPPDATA%\tebis\run`
-        // is per-user and local (never syncs to a domain controller), which
-        // is what we want for a lockfile + tmp socket-like state.
-        Ok(dirs()?.data_local_dir().join("run"))
+    pub fn lock_file_path() -> Result<PathBuf> {
+        // No XDG_RUNTIME_DIR analogue; synthesize a `run` subdir under
+        // `%LOCALAPPDATA%\tebis\` for ephemeral runtime state.
+        Ok(dirs()?.data_local_dir().join("run").join("tebis.lock"))
+    }
+
+    pub fn notify_address() -> Result<PathBuf> {
+        // Named pipe — not a filesystem path. The listener interprets
+        // this as the pipe name for `CreateNamedPipeW`.
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
+        Ok(PathBuf::from(format!(r"\\.\pipe\tebis-{user}-notify")))
     }
 }
 
 #[cfg(unix)]
-pub use unix::{config_dir, data_dir, runtime_dir};
+pub use unix::{config_dir, data_dir, lock_file_path, notify_address};
 #[cfg(windows)]
-pub use windows::{config_dir, data_dir, runtime_dir};
+pub use windows::{config_dir, data_dir, lock_file_path, notify_address};
 
 /// `<config_dir>/env` — the canonical tebis env file (`KEY=VAL` pairs,
 /// owner-only permissions, written through
 /// [`super::secure_file::atomic_write_private`]).
 pub fn env_file_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("env"))
-}
-
-/// `<runtime_dir>/tebis.lock` — single-instance advisory lock path.
-pub fn lock_file_path() -> Result<PathBuf> {
-    Ok(runtime_dir()?.join("tebis.lock"))
 }
 
 /// `<data_dir>/models` — cached model files (Whisper, future Kokoro).

@@ -445,22 +445,11 @@ pub unsafe fn load_env_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Unix: `<runtime_dir>/tebis.sock` (UDS). See
-/// [`crate::platform::paths::runtime_dir`] for per-OS resolution.
-/// Windows: `\\.\pipe\tebis-<user>-notify` (named pipe).
-///
-/// Phase 2 will replace the `PathBuf` field on `NotifyConfig` with a
-/// platform-abstract address type; for now the pipe name is carried as
-/// a PathBuf and the listener interprets it per-OS.
-#[cfg(unix)]
+/// Default listener address — see
+/// [`crate::platform::paths::notify_address`] for per-OS shape.
+/// Unix: UDS path; Windows: `\\.\pipe\…` name (carried as `PathBuf`
+/// for shape compatibility with the Unix branch — the listener
+/// interprets it per-OS).
 fn default_socket_path() -> Option<PathBuf> {
-    crate::platform::paths::runtime_dir()
-        .ok()
-        .map(|d| d.join("tebis.sock"))
-}
-
-#[cfg(windows)]
-fn default_socket_path() -> Option<PathBuf> {
-    let user = env::var("USERNAME").unwrap_or_else(|_| "user".into());
-    Some(PathBuf::from(format!(r"\\.\pipe\tebis-{user}-notify")))
+    crate::platform::paths::notify_address().ok()
 }

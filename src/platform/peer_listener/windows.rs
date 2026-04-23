@@ -108,6 +108,13 @@ impl Listener {
     }
 
     pub async fn accept(&self) -> io::Result<Conn> {
+        // NOTE: there is a brief window between `take()` and the next
+        // instance creation below during which no pipe instance is
+        // pending. Clients that connect in that window get
+        // ERROR_PIPE_BUSY. For our traffic pattern (one hook at a time,
+        // serialized by the agent's event loop) this is harmless, but a
+        // burst of hooks fired simultaneously could drop some. If that
+        // shows up in practice, keep a 2-deep pending pool here.
         let server = self
             .pending
             .lock()

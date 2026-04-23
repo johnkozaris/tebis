@@ -354,10 +354,13 @@ fn warn_if_hook_deps_missing() {
 
 #[cfg(windows)]
 fn warn_if_hook_deps_missing() {
-    // Phase 2 will emit PowerShell-based hooks and probe for
-    // `powershell.exe` / `pwsh.exe` here. Until then the Windows build
-    // has no hook-script runtime deps to probe — the notify listener
-    // itself is still Unix-only pending Phase 2.
+    // The notify listener is cross-platform since commit 35285f8
+    // (platform::peer_listener with a Windows Named-Pipe backend).
+    // What's still open is the `.ps1` hook-script emission — the
+    // Phase-2 tail work that pairs PowerShell scripts with the
+    // Windows pipe. Once that lands this fn will probe for
+    // `powershell.exe` (>= 5.1) / `pwsh.exe` (>= 7) the same way
+    // the Unix branch probes for jq + nc.
 }
 
 #[cfg(unix)]
