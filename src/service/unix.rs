@@ -14,10 +14,10 @@ use console::style;
 use crate::{lockfile, setup};
 
 #[cfg(target_os = "macos")]
-const MACOS_PLIST_TEMPLATE: &str = include_str!("../contrib/macos/local.tebis.plist");
+const MACOS_PLIST_TEMPLATE: &str = include_str!("../../contrib/macos/local.tebis.plist");
 
 #[cfg(target_os = "linux")]
-const LINUX_SERVICE: &str = include_str!("../contrib/linux/tebis.service");
+const LINUX_SERVICE: &str = include_str!("../../contrib/linux/tebis.service");
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const LAUNCHD_LABEL: &str = "local.tebis";

@@ -1,4 +1,7 @@
-//! Outbound-notify listener (UDS) + `Forwarder` sink. UDS-only (invariants 9–12).
+//! Inbound-notify listener (via `platform::peer_listener` — UDS on Unix,
+//! Named Pipe on Windows) + `Forwarder` sink to Telegram. Invariants
+//! 9–12 apply to both transports; see `platform::peer_listener` for
+//! how each backend realizes the three-layer peer defense.
 
 mod format;
 mod listener;
