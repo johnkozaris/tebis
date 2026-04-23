@@ -33,6 +33,10 @@ pub(crate) fn which_in_path(name: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    // `sh` is guaranteed on Unix; Windows has `cmd.exe` but by full
+    // name with extension and PATHEXT — out of scope for this function,
+    // so assert on Unix only.
+    #[cfg(unix)]
     #[test]
     fn which_finds_sh() {
         assert!(which_in_path("sh").is_some());
