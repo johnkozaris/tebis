@@ -3,7 +3,9 @@
 use std::path::Path;
 
 /// Substring match on purpose — false positives are benign (warnings only)
-/// and a JSON walk would miss invalid-shape user edits.
+/// and a JSON walk would miss invalid-shape user edits. Matches both the
+/// Unix `.sh` form and the Windows `.ps1` form so upgrades from an older
+/// install on either platform surface in the warning.
 pub fn scan_claude(project_dir: &Path) -> Vec<String> {
     let settings = project_dir.join(".claude/settings.local.json");
     let Ok(content) = std::fs::read_to_string(&settings) else {
@@ -15,7 +17,10 @@ pub fn scan_claude(project_dir: &Path) -> Vec<String> {
     let our_prefix = data_dir.to_string_lossy().into_owned();
     content
         .lines()
-        .filter(|line| line.contains("claude-hook.sh") && !line.contains(&our_prefix))
+        .filter(|line| {
+            (line.contains("claude-hook.sh") || line.contains("claude-hook.ps1"))
+                && !line.contains(&our_prefix)
+        })
         .map(|line| line.trim().to_string())
         .collect()
 }

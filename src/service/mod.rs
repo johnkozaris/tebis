@@ -3,14 +3,16 @@
 //!
 //! # Backends
 //!
-//! - **Unix** (`unix`): launchd on macOS, systemd user service on Linux.
-//!   See `src/service/unix.rs` for the full-fidelity implementation.
-//! - **Windows** (`windows`): **Phase-4 stub.** All operations return
-//!   a "not yet supported" error so the binary builds and the other
-//!   CLI surfaces work on Windows. The real implementation will use
-//!   either `windows-service` (true SCM integration) or Task Scheduler
-//!   at-logon registration — the plan defers that decision until the
-//!   install ergonomics are tested in the wizard.
+//! - **Unix** (`unix`): launchd on macOS, systemd user service on
+//!   Linux. See `src/service/unix.rs`.
+//! - **Windows** (`windows`): Task Scheduler at-logon via
+//!   `schtasks.exe /Create /SC ONLOGON /RL LIMITED`. Runs in the
+//!   logged-in user's session so the notify SID gate, `%APPDATA%`
+//!   env file, and Claude Code autostart all see the right
+//!   principal (an SCM service running as LocalSystem wouldn't).
+//!   True SCM integration with explicit user credentials is a future
+//!   follow-up if anyone needs proper service-lifecycle events;
+//!   Task Scheduler is the sane v1.
 //!
 //! All backends share the same public surface: `install`, `uninstall`,
 //! `start`, `stop`, `restart`, `status`, `is_running`.

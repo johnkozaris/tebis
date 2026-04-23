@@ -454,7 +454,10 @@ fn normalize_dir(s: &str) -> String {
     if let Some(rest) = trimmed.strip_prefix("~/")
         && let Ok(home) = crate::platform::paths::home_dir()
     {
-        return format!("{}/{rest}", home.display());
+        // `Path::join` → native separator: `/` on Unix, `\` on Windows.
+        // Plain format!("{home}/{rest}") would mix separators when
+        // `home` is `C:\Users\john` and `rest` is `projects\app`.
+        return home.join(rest).to_string_lossy().into_owned();
     }
     trimmed.to_string()
 }

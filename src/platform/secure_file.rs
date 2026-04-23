@@ -90,7 +90,7 @@ mod unix {
 
 #[cfg(windows)]
 mod windows {
-    use std::fs;
+    use std::fs::{self, File};
     use std::io::{self, Write as _};
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
