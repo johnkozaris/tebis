@@ -1,4 +1,4 @@
-//! Step 3 — tmux session allowlist (optional).
+//! Step 3 — multiplexer session allowlist (optional).
 
 use anyhow::{Context, Result};
 use console::style;
@@ -12,7 +12,10 @@ pub(in crate::setup) fn step_session_allowlist(
     existing: Option<&[String]>,
 ) -> Result<Vec<String>> {
     ui::step_header(3, "Session allowlist (optional)");
-    println!("By default tebis accepts any valid tmux session name. Optionally");
+    println!(
+        "By default tebis accepts any valid {} session name. Optionally",
+        crate::platform::multiplexer::BINARY
+    );
     println!("restrict it to a fixed list for defense-in-depth on top of the");
     println!(
         "user-id filter. Names must match {} either way.",
@@ -40,7 +43,10 @@ pub(in crate::setup) fn step_session_allowlist(
         .filter(|v| !v.is_empty())
         .map_or_else(|| "claude-session".to_string(), |v| v.join(","));
     let raw: String = Input::<String>::with_theme(theme)
-        .with_prompt("Allowed tmux sessions")
+        .with_prompt(format!(
+            "Allowed {} sessions",
+            crate::platform::multiplexer::BINARY
+        ))
         .default(default_list)
         .validate_with(|s: &String| -> std::result::Result<(), &'static str> { validate(s) })
         .interact_text()

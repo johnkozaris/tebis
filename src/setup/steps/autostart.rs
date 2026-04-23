@@ -16,7 +16,10 @@ pub(in crate::setup) fn step_autostart(
     existing: Option<&Autostart>,
 ) -> Result<Option<Autostart>> {
     ui::step_header(4, "Default agent (optional)");
-    println!("Pipe every plain-text message to one tmux session by default —");
+    println!(
+        "Pipe every plain-text message to one {} session by default —",
+        crate::platform::multiplexer::BINARY
+    );
     println!("ideal for driving an AI agent (Claude Code, etc.) from your");
     println!("phone. tebis spawns the session on first message, then routes");
     println!("anything that isn't a {} to it.", style("/command").bold());
