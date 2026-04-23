@@ -57,7 +57,7 @@ impl super::HookManager for ClaudeHooks {
                 "hooks": [
                     {
                         "type": "command",
-                        "command": script_path.to_string_lossy(),
+                        "command": super::script_command(script_path),
                         "timeout": *timeout,
                     }
                 ]
@@ -193,7 +193,10 @@ const fn type_name(v: &Value) -> &'static str {
     }
 }
 
-/// True when an entry's inner `command` resolves to `script_path` (via `paths_eq`).
+/// True when an entry's inner `command` references `script_path`.
+/// Substring-based so the Windows form
+/// (`powershell.exe ... -File "<path>"`) matches as well as the plain
+/// Unix path form.
 fn entry_points_at(entry: &Value, script_path: &Path) -> bool {
     let Some(inner) = entry.get("hooks").and_then(Value::as_array) else {
         return false;
@@ -201,11 +204,12 @@ fn entry_points_at(entry: &Value, script_path: &Path) -> bool {
     inner.iter().any(|h| {
         h.get("command")
             .and_then(Value::as_str)
-            .is_some_and(|s| super::paths_eq(Path::new(s), script_path))
+            .is_some_and(|s| super::command_references_script(s, script_path))
     })
 }
 
-/// True when an entry points at any path under our data dir — sweep tolerant to renames.
+/// True when an entry points at any path under our data dir — sweep
+/// tolerant to renames, and to the PowerShell-wrapped Windows form.
 fn is_tebis_entry(entry: &Value) -> bool {
     let Some(inner) = entry.get("hooks").and_then(Value::as_array) else {
         return false;
@@ -213,7 +217,7 @@ fn is_tebis_entry(entry: &Value) -> bool {
     inner.iter().any(|h| {
         h.get("command")
             .and_then(Value::as_str)
-            .is_some_and(|s| super::is_our_script(Path::new(s)))
+            .is_some_and(super::command_references_our_script)
     })
 }
 

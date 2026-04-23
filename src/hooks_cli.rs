@@ -354,13 +354,48 @@ fn warn_if_hook_deps_missing() {
 
 #[cfg(windows)]
 fn warn_if_hook_deps_missing() {
-    // The notify listener is cross-platform since commit 35285f8
-    // (platform::peer_listener with a Windows Named-Pipe backend).
-    // What's still open is the `.ps1` hook-script emission — the
-    // Phase-2 tail work that pairs PowerShell scripts with the
-    // Windows pipe. Once that lands this fn will probe for
-    // `powershell.exe` (>= 5.1) / `pwsh.exe` (>= 7) the same way
-    // the Unix branch probes for jq + nc.
+    // The Phase-2 `.ps1` hook scripts (contrib/{claude,copilot}/*.ps1)
+    // only use native PowerShell features — `ConvertFrom-Json`,
+    // `System.IO.Pipes.NamedPipeClientStream`, `[Console]::In`. Any
+    // reasonably-modern Windows has PowerShell 5.1 built-in; we probe
+    // for it here so a bare Windows Server install with PowerShell
+    // locked down surfaces the problem at `tebis hooks install` time
+    // rather than silently no-op'ing every hook.
+    if !has_on_path("powershell.exe") && !has_on_path("pwsh.exe") {
+        eprintln!(
+            "  {}  Neither `powershell.exe` nor `pwsh.exe` is on PATH — \
+             hook scripts will silently no-op without one.",
+            style("⚠").yellow().bold(),
+        );
+        eprintln!(
+            "     install: {}",
+            style("Windows PowerShell ships with the OS; if this reports \
+                   missing, check the PowerShell execution policy / PATH. \
+                   PowerShell 7 (`pwsh`) is available via WinGet: \
+                   `winget install Microsoft.PowerShell`.")
+                .dim(),
+        );
+    }
+}
+
+#[cfg(windows)]
+fn has_on_path(tool: &str) -> bool {
+    // Windows PATH is `;`-separated; executables are identified by
+    // PATHEXT-matching extension. Our callers pass explicit `.exe`, so
+    // a plain is_file() check against each PATH dir suffices.
+    let Ok(path_var) = std::env::var("PATH") else {
+        return false;
+    };
+    for dir in path_var.split(';') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(dir).join(tool);
+        if candidate.is_file() {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(unix)]

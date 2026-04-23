@@ -1,5 +1,5 @@
-//! Per-agent hook installation. Ownership sentinel: `command` points at
-//! `$XDG_DATA_HOME/tebis/<agent>-hook.sh`.
+//! Per-agent hook installation. Ownership sentinel: `command` references
+//! the tebis-owned hook script in the tebis data dir (`<data_dir>/<agent>-hook.{sh,ps1}`).
 
 pub mod agent;
 pub mod claude;
@@ -21,11 +21,28 @@ use anyhow::{Context, Result};
 
 use crate::platform::secure_file;
 
+// Hook scripts: bash `.sh` on Unix, PowerShell `.ps1` on Windows.
+// Both are embedded via include_str! so the release binary carries them
+// and `materialize()` writes the OS-appropriate one to disk.
+#[cfg(unix)]
 const CLAUDE_HOOK_FILE: &str = "claude-hook.sh";
-const COPILOT_HOOK_FILE: &str = "copilot-hook.sh";
+#[cfg(windows)]
+const CLAUDE_HOOK_FILE: &str = "claude-hook.ps1";
 
+#[cfg(unix)]
+const COPILOT_HOOK_FILE: &str = "copilot-hook.sh";
+#[cfg(windows)]
+const COPILOT_HOOK_FILE: &str = "copilot-hook.ps1";
+
+#[cfg(unix)]
 const CLAUDE_HOOK_SCRIPT: &str = include_str!("../../contrib/claude/claude-hook.sh");
+#[cfg(windows)]
+const CLAUDE_HOOK_SCRIPT: &str = include_str!("../../contrib/claude/claude-hook.ps1");
+
+#[cfg(unix)]
 const COPILOT_HOOK_SCRIPT: &str = include_str!("../../contrib/copilot/copilot-hook.sh");
+#[cfg(windows)]
+const COPILOT_HOOK_SCRIPT: &str = include_str!("../../contrib/copilot/copilot-hook.ps1");
 
 /// Per-agent install / uninstall / status. All methods are idempotent; ours
 /// are identified by the sentinel script path.
@@ -87,26 +104,43 @@ pub fn materialize(agent: AgentKind) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// True when `candidate`'s parent is our data dir. Symlink-tolerant;
-/// logs on `data_dir()` failure since the result then under-reports.
-pub(super) fn is_our_script(candidate: &Path) -> bool {
-    let our_dir = match data_dir() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(err = %e, "is_our_script: data_dir unavailable");
-            return false;
-        }
-    };
-    let cand_parent = candidate.parent().unwrap_or(candidate);
-    paths_eq(cand_parent, our_dir.as_path())
+/// Shell command the agent should run to invoke the hook. On Unix the
+/// script is directly executable (chmod 0700) and the command is just
+/// the path. On Windows the script is `.ps1`, so the command wraps it
+/// in a `powershell.exe` invocation that disables the profile (speed)
+/// and Bypasses the execution policy (for unsigned user-local scripts).
+#[must_use]
+pub fn script_command(script_path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        script_path.to_string_lossy().into_owned()
+    }
+    #[cfg(windows)]
+    {
+        format!(
+            "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+            script_path.display()
+        )
+    }
 }
 
-/// Canonicalize-first path equality; `==` fallback for nonexistent paths.
-pub(super) fn paths_eq(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(ca), Ok(cb)) => ca == cb,
-        _ => a == b,
-    }
+/// True iff `command_str` (the raw `command` field from an agent's
+/// hook config) references a path inside our data dir. Handles both
+/// the Unix shape (`<data_dir>/claude-hook.sh`) and the Windows shape
+/// (`powershell.exe ... -File "<data_dir>\claude-hook.ps1"`).
+pub(super) fn command_references_our_script(command_str: &str) -> bool {
+    let Ok(our_dir) = data_dir() else {
+        return false;
+    };
+    let dir_str = our_dir.to_string_lossy();
+    command_str.contains(dir_str.as_ref())
+}
+
+/// True iff `command_str` references exactly `script_path` (not just
+/// "somewhere in our data dir"). Used for dedup on install.
+pub(super) fn command_references_script(command_str: &str, script_path: &Path) -> bool {
+    let s = script_path.to_string_lossy();
+    command_str.contains(s.as_ref())
 }
 
 #[cfg(test)]
@@ -115,12 +149,20 @@ mod tests {
     use test_support::with_scratch_data_home;
 
     #[test]
-    fn is_our_script_matches_exact_parent() {
-        with_scratch_data_home("is_our_script", || {
+    fn command_references_our_script_matches_data_dir() {
+        with_scratch_data_home("cmd_ref_our", || {
             let our = data_dir().expect("data_dir with HOME override");
-            assert!(is_our_script(&our.join("claude-hook.sh")));
-            assert!(!is_our_script(Path::new("/usr/local/bin/other-hook.sh")));
-            assert!(!is_our_script(Path::new("claude-hook.sh")));
+            let inside = our.join("claude-hook.sh");
+            assert!(command_references_our_script(&inside.to_string_lossy()));
+            assert!(!command_references_our_script("/usr/local/bin/other-hook.sh"));
+            assert!(!command_references_our_script("claude-hook.sh"));
+            // Windows-shape invocation (raw string so we can use it on
+            // Unix tests too; the helper does a plain substring check).
+            let wrapped = format!(
+                r#"powershell.exe -NoProfile -File "{}""#,
+                inside.display()
+            );
+            assert!(command_references_our_script(&wrapped));
         });
     }
 
@@ -139,7 +181,11 @@ mod tests {
         });
     }
 
-    /// `bash -n` on the embedded scripts so a broken hook can't ship.
+    /// `bash -n` on the embedded Unix scripts so a broken `.sh` hook
+    /// can't ship. The Windows `.ps1` equivalents are validated in CI
+    /// on windows-latest via `pwsh -NoProfile -Command "..."`; we can't
+    /// run that on macOS dev boxes.
+    #[cfg(unix)]
     #[test]
     fn embedded_hook_scripts_parse_as_bash() {
         for (name, content) in [
@@ -175,9 +221,16 @@ mod tests {
             let p2 = materialize(AgentKind::Claude).unwrap();
             assert_eq!(p2, path);
             let updated = fs::read_to_string(&p2).unwrap();
+            // Per-OS shebang / header assertions.
+            #[cfg(unix)]
             assert!(
                 updated.contains("#!/usr/bin/env bash"),
-                "rewrote with embedded content"
+                "rewrote with embedded Unix content"
+            );
+            #[cfg(windows)]
+            assert!(
+                updated.contains("tebis") && updated.contains("pipe"),
+                "rewrote with embedded Windows content"
             );
         });
     }

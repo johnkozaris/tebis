@@ -57,9 +57,14 @@ impl super::HookManager for CopilotHooks {
 
         let mut hooks_obj = serde_json::Map::new();
         for (event, timeout) in EVENTS {
+            // `bash` is Copilot's field name for the command string. On
+            // Unix this is just the script path; on Windows it's a
+            // PowerShell wrapper — see `super::script_command`. Git
+            // Bash on Windows happily executes a `powershell.exe ...`
+            // line in the `bash` field.
             let entry = json!({
                 "type": "command",
-                "bash": script_path.to_string_lossy(),
+                "bash": super::script_command(script_path),
                 "timeoutSec": *timeout,
             });
             hooks_obj.insert((*event).to_string(), Value::Array(vec![entry]));
@@ -172,7 +177,7 @@ fn looks_like_tebis_owned(doc: &Value) -> bool {
                 entry
                     .get("bash")
                     .and_then(Value::as_str)
-                    .is_some_and(|s| super::is_our_script(Path::new(s)))
+                    .is_some_and(super::command_references_our_script)
             })
         })
     })
