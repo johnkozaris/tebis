@@ -96,20 +96,21 @@ jobs:
       - name: shellcheck contrib/
         run: shellcheck --severity=warning contrib/claude/claude-hook.sh contrib/copilot/copilot-hook.sh
 
-  # Windows compile-check. Tests aren't run yet (some rely on
-  # XDG_DATA_HOME overrides that don't affect the Windows paths
-  # backend), but `cargo check --all-targets` catches type/lint errors
-  # against the real Windows target — the one thing we can't reproduce
-  # locally on a macOS dev box (ring's C build needs an MSVC-hosted
-  # toolchain). Promotes to `cargo test` once the test fixtures are
-  # platform-neutral.
-  windows-check:
-    name: cargo check (windows)
+  # Windows build + clippy + unit tests. The test scratch-dir override
+  # goes through TEBIS_SCRATCH_DIR (honored by `platform::paths` in
+  # test builds), which is platform-neutral — Windows's Known Folder
+  # API ignores XDG_* but picks up this env var, so agent_hooks and
+  # manifest tests run against scratch paths the same way they do on
+  # Unix. Unix-only tests (peer_listener UDS, script_e2e_tests .sh
+  # harness, tmux stderr classifier) are cfg-gated and skipped.
+  windows-test:
+    name: cargo test (windows)
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
