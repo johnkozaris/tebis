@@ -58,6 +58,23 @@ optional = true
 path = "crates/tebis-tts-kokoro"
 version = "0.1"
 
+[[example]]
+name = "audio-smoke"
+path = "e2e/audio-smoke.rs"
+
+[[example]]
+name = "inspect-demo"
+path = "e2e/inspect-demo.rs"
+
+[[example]]
+name = "kokoro-smoke"
+path = "e2e/kokoro-smoke.rs"
+required-features = ["kokoro"]
+
+[[example]]
+name = "tts-bench"
+path = "e2e/tts-bench.rs"
+
 [profile.release]
 codegen-units = 1
 debug = false

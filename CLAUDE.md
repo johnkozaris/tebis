@@ -50,9 +50,15 @@ discussion.
    slots are lazily created per regex-valid name. Permissive is the
    default for fresh installs; existing deployments that set a non-empty
    list keep strict behavior.
-3. **`send-keys` uses `-l` then separate `-H 0d`.** No single-call key-name
-   interpolation. The sequence must not be cancelled mid-way — do NOT wrap
-   handlers in a cancel `select!`.
+3. **`send_keys` is a single atomic sequence: `-l` text → Ink-render
+   sleep → `-H 0d` Enter, under one per-session mutex acquisition.**
+   The text-then-Enter pair must land on the same agent turn. No
+   single-call key-name interpolation (`send-keys -l 'foo Enter'`
+   would shell-parse the space). The tokio mutex is held across all
+   three calls so a concurrent `/send` can't interleave its text
+   before our Enter. Do NOT wrap `send_keys` in a cancel `select!` —
+   mid-sequence cancellation strands chars without Enter and they
+   prepend to the next command.
 4. **All Telegram text replies go through `sanitize::escape_html` before
    `parse_mode=HTML`.** Error paths too. Use `wrap_and_truncate` for anything
    wrapped in `<pre>`/`<code>`; naive chunking splits tags and entities.
@@ -108,14 +114,7 @@ discussion.
     on every accepted connection, rejecting any uid ≠ our euid. The cred
     check is the only authenticated gate — (a) and (b) close the TOCTOU
     window between bind and chmod. Do not remove any layer independently.
-18. **`send_keys` text → sleep → Enter happens under a single mutex
-    acquisition.** The sequence is three commands (`send-keys -l`,
-    Ink-render sleep, `send-keys -H 0d`), but the per-session
-    `tokio::Mutex` is held across all three — otherwise a concurrent
-    `/send` could interleave its text before our Enter, and both
-    messages land on the wrong agent turn. `tmux::send_keys` owns the
-    whole sequence; don't split it or wrap it in a cancel `select!`.
-19. **STT transcripts are byte-capped at `MAX_TRANSCRIPT_BYTES` (4000)
+18. **STT transcripts are byte-capped at `MAX_TRANSCRIPT_BYTES` (4000)
     before entering `handler::parse`.** Matches
     `TELEGRAM_MAX_OUTPUT_CHARS`'s upper bound. Without this, a long
     noisy voice recording could paste 100+ KiB of transcribed text

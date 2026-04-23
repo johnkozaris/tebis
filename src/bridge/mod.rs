@@ -322,7 +322,7 @@ fn schedule_graceful_restart(shutdown: &CancellationToken) {
     });
 }
 
-/// Invariant 19: cap transcript bytes fed into `parse` so long voice
+/// Invariant 18: cap transcript bytes fed into `parse` so long voice
 /// notes can't bypass text-size limits.
 const MAX_TRANSCRIPT_BYTES: usize = 4000;
 

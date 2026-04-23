@@ -125,7 +125,7 @@ impl Tmux {
     }
 
     /// Text → sleep → Enter, atomic under the per-session lock (CLAUDE.md
-    /// invariants 3, 18: cancellation mid-sequence strands chars without Enter).
+    /// invariant 3: cancellation mid-sequence strands chars without Enter).
     pub async fn send_keys(&self, session: &str, text: &str) -> Result<()> {
         let slot = self.slot(session)?;
         let _guard = slot.lock.lock().await;

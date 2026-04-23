@@ -1,17 +1,5 @@
-//! End-to-end smoke test for the audio subsystem.
-//!
-//! Exercises the full STT path without needing a Telegram bot token:
-//! 1. Builds an `AudioSubsystem` with STT enabled.
-//! 2. Downloads the default model (~148 MB for base.en) if not cached.
-//! 3. Synthesizes 1 s of silence as f32 PCM.
-//! 4. Runs `transcribe()` against the silence and prints the result.
-//!
-//! A pass = it returns cleanly (text can be empty or a filler like
-//! "(silence)"). The interesting measurements are the wall-clock times
-//! — first-run download ~53 s, subsequent start ~300 ms, inference
-//! ~100 ms on M4 with Metal.
-//!
-//! Run: `cargo run --release --example audio-smoke`
+//! STT + (macOS) TTS smoke test. `cargo run --release --example audio-smoke`
+//! First run downloads ~148 MB for `base.en`; pass = clean exit.
 
 use std::time::Instant;
 
@@ -47,9 +35,6 @@ async fn main() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let tts_cfg = None;
 
-    // Honor the manifest's own default so the smoke test tracks the
-    // current recommended model without code changes when the default
-    // shifts.
     let default_model = tebis::audio::manifest::get()
         .default_stt_model()
         .context("manifest has no default STT model")?

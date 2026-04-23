@@ -1,8 +1,4 @@
-//! TTS latency microbench. Measures `say` synth + Opus encode + OGG mux
-//! across a range of reply sizes. Upload to Telegram is not measured —
-//! that's network-dependent and the same bytes whatever the backend.
-//!
-//! Run: `cargo run --release --example tts-bench`
+//! `say` + Opus + OGG latency microbench. `cargo run --release --example tts-bench`
 
 use std::time::Instant;
 
@@ -60,8 +56,6 @@ async fn main() -> Result<()> {
         let t0 = Instant::now();
         let (oga, duration_sec) = audio.synthesize(text).await?;
         let elapsed = t0.elapsed();
-        // Precision loss on the cast is fine — these are display numbers
-        // for a dev-only bench, not a measurement pipeline.
         #[allow(clippy::cast_precision_loss)]
         let us_per_char = (elapsed.as_micros() as f64) / (char_count as f64);
         println!(

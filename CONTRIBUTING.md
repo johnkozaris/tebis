@@ -7,7 +7,7 @@ changes is intentionally high. Worth a read before your first PR.
 ## Ground rules
 
 1. **Read [`CLAUDE.md`](CLAUDE.md).** It lists the security invariants
-   (numbered 1–19) and architectural rules. Most were added after a
+   (numbered 1–18) and architectural rules. Most were added after a
    concrete bug or CVE; don't weaken them without discussion.
 2. **No new runtime dependencies without justification.** We build on
    `hyper` + `rustls` directly to keep the binary small and the audit

@@ -2,18 +2,12 @@ name: Audit
 
 on:
   push:
+    branches: [main, master]
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/audit.yml'
       - 'deny.toml'
-  pull_request:
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'deny.toml'
-  schedule:
-    - cron: '0 12 * * *'
   workflow_dispatch:
 
 permissions:
