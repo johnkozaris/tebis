@@ -8,7 +8,7 @@ use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input};
 
 use super::super::{Autostart, normalize_dir, ui};
-use crate::tmux::is_valid_session_name;
+use crate::platform::multiplexer::is_valid_session_name;
 
 pub(in crate::setup) fn step_autostart(
     theme: &ColorfulTheme,

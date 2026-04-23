@@ -24,4 +24,3 @@ pub mod security;
 pub mod service;
 pub mod setup;
 pub mod telegram;
-pub mod tmux;

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::agent_hooks;
 use crate::agent_hooks::{AgentKind, HooksMode};
-use crate::tmux::{self, Tmux, TmuxError};
+use crate::platform::multiplexer::{self as mux, Mux, MuxError};
 
 pub struct AutostartConfig {
     pub session: String,
@@ -82,7 +82,7 @@ impl SessionState {
     /// Invariant 14: `autostart_lock` serializes provisioning so concurrent
     /// messages don't race the TUI-boot sleep. Hook install runs outside
     /// the lock — it's idempotent and has no ordering dep.
-    pub async fn resolve_or_autostart(&self, tmux: &Tmux) -> Result<String, ResolveError> {
+    pub async fn resolve_or_autostart(&self, tmux: &Mux) -> Result<String, ResolveError> {
         if let Some(existing) = self.target() {
             return Ok(existing);
         }
@@ -111,7 +111,7 @@ impl SessionState {
                     tokio::time::sleep(TUI_BOOT_DELAY).await;
                     true
                 }
-                Err(TmuxError::AlreadyExists(_)) => {
+                Err(MuxError::AlreadyExists(_)) => {
                     tracing::debug!(
                         session = %auto.session,
                         "autostart: session appeared between has_session and new_session"
@@ -229,7 +229,7 @@ pub enum ResolveError {
     AutostartCommandDied(String),
 
     #[error("{0}")]
-    Tmux(#[from] tmux::TmuxError),
+    Mux(#[from] mux::MuxError),
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@
 //! 4. Callers only reach in via `crate::platform::<name>::…`.
 
 pub mod hostname;
+pub mod multiplexer;
 pub mod paths;
 pub mod peer_listener;
 pub mod process;

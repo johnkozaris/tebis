@@ -11,10 +11,11 @@ use tokio_util::task::TaskTracker;
 use tracing_subscriber::EnvFilter;
 
 use tebis::bridge::session;
+use tebis::platform::multiplexer as mux;
 use tebis::platform::signal::shutdown_signal;
 use tebis::{
     audio, bridge, config, hooks_cli, inspect, lockfile, metrics, notify, security, service, setup,
-    telegram, tmux,
+    telegram,
 };
 
 const HELP: &str = "\
@@ -421,7 +422,7 @@ async fn run_bridge() -> Result<()> {
         None
     };
 
-    let tmux = Arc::new(tmux::Tmux::new(
+    let tmux = Arc::new(mux::Mux::new(
         config.allowed_sessions.clone(),
         config.max_output_chars,
     ));

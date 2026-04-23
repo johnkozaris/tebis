@@ -15,7 +15,7 @@ use crate::bridge::autoreply::AutoreplyConfig;
 use crate::bridge::session::AutostartConfig;
 use crate::env_file;
 use crate::notify::NotifyConfig;
-use crate::tmux::is_valid_session_name;
+use crate::platform::multiplexer::is_valid_session_name;
 
 pub struct Config {
     pub bot_token: SecretString,

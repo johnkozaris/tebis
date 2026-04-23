@@ -1,5 +1,14 @@
-//! tmux subprocess wrapper. Validates session names, serializes per-session
-//! ops via mutex, classifies errors. Strict or permissive allowlist.
+//! Terminal-multiplexer subprocess wrapper. Validates session names,
+//! serializes per-session ops via mutex, classifies errors. Strict or
+//! permissive allowlist.
+//!
+//! Both backends — `tmux` on Unix and `psmux` on Windows — share the
+//! tmux-compatible CLI (`new-session`, `send-keys -l` / `-H 0d`,
+//! `capture-pane`, etc.), so this module is one implementation with a
+//! single `BINARY` name that switches per-OS. Any behavioral quirks
+//! unique to psmux get handled inside `classify_status`, which is
+//! already fuzzy-tolerant ("no such session" / "session not found"
+//! already fold into `NotFound`).
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -13,7 +22,16 @@ use crate::sanitize;
 /// 300 ms is safe; Ink/React TUIs drop Enter that arrives too close to text.
 const SUBMIT_GAP: Duration = Duration::from_millis(300);
 
-pub struct Tmux {
+/// Binary to invoke. tmux on Unix, psmux on Windows (tmux-compatible
+/// Rust port — reads `~/.tmux.conf`, same command language). psmux
+/// needs to be on PATH for the Windows build to actually drive
+/// sessions; `has_on_path` probes will surface a setup-time warning.
+#[cfg(unix)]
+const BINARY: &str = "tmux";
+#[cfg(windows)]
+const BINARY: &str = "psmux";
+
+pub struct Mux {
     strict: HashMap<String, Arc<SessionSlot>>,
     dynamic: std::sync::Mutex<HashMap<String, Arc<SessionSlot>>>,
     permissive: bool,
@@ -28,7 +46,7 @@ struct SessionSlot {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum TmuxError {
+pub enum MuxError {
     #[error("session '{0}' not found")]
     NotFound(String),
 
@@ -44,26 +62,26 @@ pub enum TmuxError {
     #[error("message is empty (nothing to send after sanitization)")]
     EmptyInput,
 
-    #[error("tmux {op} failed: {stderr}")]
+    #[error("multiplexer {op} failed: {stderr}")]
     CommandFailed { op: &'static str, stderr: String },
 
-    #[error("tmux {op} timed out (5s)")]
+    #[error("multiplexer {op} timed out (5s)")]
     Timeout { op: &'static str },
 
-    #[error("tmux spawn error: {0}")]
+    #[error("multiplexer spawn error: {0}")]
     Spawn(String),
 }
 
-impl TmuxError {
+impl MuxError {
     #[must_use]
     pub const fn is_not_found(&self) -> bool {
         matches!(self, Self::NotFound(_))
     }
 }
 
-pub type Result<T> = std::result::Result<T, TmuxError>;
+pub type Result<T> = std::result::Result<T, MuxError>;
 
-impl Tmux {
+impl Mux {
     /// Empty `allowed` → permissive mode.
     pub fn new(allowed: Vec<String>, max_output_chars: usize) -> Self {
         let permissive = allowed.is_empty();
@@ -102,14 +120,14 @@ impl Tmux {
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<String>> {
-        let output = run_tmux("list-sessions", &["list-sessions", "-F", "#{session_name}"]).await?;
+        let output = run_mux("list-sessions", &["list-sessions", "-F", "#{session_name}"]).await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if stderr.contains("no server running") || stderr.contains("no sessions") {
                 return Ok(Vec::new());
             }
-            return Err(TmuxError::CommandFailed {
+            return Err(MuxError::CommandFailed {
                 op: "list-sessions",
                 stderr: stderr.into_owned(),
             });
@@ -132,10 +150,10 @@ impl Tmux {
 
         let sanitized = sanitize::sanitize_tmux_input(text);
         if sanitized.is_empty() {
-            return Err(TmuxError::EmptyInput);
+            return Err(MuxError::EmptyInput);
         }
 
-        let out = run_tmux(
+        let out = run_mux(
             "send-keys",
             &["send-keys", "-t", &slot.exact_target, "-l", &sanitized],
         )
@@ -144,7 +162,7 @@ impl Tmux {
 
         tokio::time::sleep(SUBMIT_GAP).await;
 
-        let out = run_tmux(
+        let out = run_mux(
             "send-keys",
             &["send-keys", "-t", &slot.exact_target, "-H", "0d"],
         )
@@ -156,7 +174,7 @@ impl Tmux {
 
     pub async fn has_session(&self, session: &str) -> Result<bool> {
         let slot = self.slot(session)?;
-        let output = run_tmux("has-session", &["has-session", "-t", &slot.exact_target]).await?;
+        let output = run_mux("has-session", &["has-session", "-t", &slot.exact_target]).await?;
         Ok(output.status.success())
     }
 
@@ -178,7 +196,7 @@ impl Tmux {
             args.push(c);
         }
 
-        let out = run_tmux("new-session", &args).await?;
+        let out = run_mux("new-session", &args).await?;
         classify_status(&out, "new-session", session)?;
         Ok(())
     }
@@ -188,9 +206,9 @@ impl Tmux {
         let slot = self.slot(session)?;
         let _guard = slot.lock.lock().await;
 
-        let out = run_tmux("kill-session", &["kill-session", "-t", &slot.exact_target]).await?;
+        let out = run_mux("kill-session", &["kill-session", "-t", &slot.exact_target]).await?;
         match classify_status(&out, "kill-session", session) {
-            Ok(()) | Err(TmuxError::NotFound(_)) => Ok(()),
+            Ok(()) | Err(MuxError::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -200,7 +218,7 @@ impl Tmux {
         let _guard = slot.lock.lock().await;
 
         let start_line = format!("-{lines}");
-        let output = run_tmux(
+        let output = run_mux(
             "capture-pane",
             &[
                 "capture-pane",
@@ -229,14 +247,14 @@ impl Tmux {
 
     fn slot(&self, session: &str) -> Result<Arc<SessionSlot>> {
         if !is_valid_session_name(session) {
-            return Err(TmuxError::InvalidName);
+            return Err(MuxError::InvalidName);
         }
         if let Some(slot) = self.strict.get(session) {
             return Ok(slot.clone());
         }
         if !self.permissive {
             let allowed = self.strict.keys().cloned().collect::<Vec<_>>().join(", ");
-            return Err(TmuxError::NotAllowed {
+            return Err(MuxError::NotAllowed {
                 session: session.to_string(),
                 allowed,
             });
@@ -282,14 +300,14 @@ fn classify_status(output: &std::process::Output, op: &'static str, session: &st
         || stderr_lc.contains("session not found")
         || stderr_lc.contains("no such session")
     {
-        return Err(TmuxError::NotFound(session.to_string()));
+        return Err(MuxError::NotFound(session.to_string()));
     }
 
     if stderr_lc.contains("duplicate session") {
-        return Err(TmuxError::AlreadyExists(session.to_string()));
+        return Err(MuxError::AlreadyExists(session.to_string()));
     }
 
-    Err(TmuxError::CommandFailed {
+    Err(MuxError::CommandFailed {
         op,
         stderr: strip_equals_prefix(&stderr).into_owned(),
     })
@@ -303,22 +321,22 @@ fn strip_equals_prefix(stderr: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-async fn run_tmux(op: &'static str, args: &[&str]) -> Result<std::process::Output> {
-    let child = Command::new("tmux")
+async fn run_mux(op: &'static str, args: &[&str]) -> Result<std::process::Output> {
+    let child = Command::new(BINARY)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| TmuxError::Spawn(e.to_string()))?;
+        .map_err(|e| MuxError::Spawn(e.to_string()))?;
 
     match tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await {
         Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err(TmuxError::Spawn(format!("tmux io error: {e}"))),
+        Ok(Err(e)) => Err(MuxError::Spawn(format!("{BINARY} io error: {e}"))),
         Err(_) => {
-            tracing::warn!(?args, "tmux command timed out (5s); killed on drop");
-            Err(TmuxError::Timeout { op })
+            tracing::warn!(?args, bin = BINARY, "multiplexer command timed out (5s); killed on drop");
+            Err(MuxError::Timeout { op })
         }
     }
 }
@@ -344,7 +362,7 @@ mod tests {
     fn classify_recognizes_not_found_session() {
         let out = fake_output(1, "can't find session: demo\n");
         let err = classify_status(&out, "kill-session", "demo").unwrap_err();
-        assert!(matches!(err, TmuxError::NotFound(ref s) if s == "demo"));
+        assert!(matches!(err, MuxError::NotFound(ref s) if s == "demo"));
         assert!(err.is_not_found());
     }
 
@@ -353,21 +371,21 @@ mod tests {
         // send-keys reports pane, not session
         let out = fake_output(1, "can't find pane: demo\n");
         let err = classify_status(&out, "send-keys", "demo").unwrap_err();
-        assert!(matches!(err, TmuxError::NotFound(_)));
+        assert!(matches!(err, MuxError::NotFound(_)));
     }
 
     #[test]
     fn classify_recognizes_duplicate() {
         let out = fake_output(1, "duplicate session: =demo\n");
         let err = classify_status(&out, "new-session", "demo").unwrap_err();
-        assert!(matches!(err, TmuxError::AlreadyExists(ref s) if s == "demo"));
+        assert!(matches!(err, MuxError::AlreadyExists(ref s) if s == "demo"));
     }
 
     #[test]
     fn classify_falls_through_to_command_failed() {
         let out = fake_output(1, "some unexpected tmux error\n");
         let err = classify_status(&out, "list-sessions", "x").unwrap_err();
-        assert!(matches!(err, TmuxError::CommandFailed { .. }));
+        assert!(matches!(err, MuxError::CommandFailed { .. }));
     }
 
     #[test]
@@ -394,19 +412,19 @@ mod tests {
 
     #[test]
     fn display_of_not_found_omits_equals_prefix() {
-        let err = TmuxError::NotFound("demo".into());
+        let err = MuxError::NotFound("demo".into());
         assert_eq!(err.to_string(), "session 'demo' not found");
     }
 
     #[test]
     fn display_of_already_exists_omits_equals_prefix() {
-        let err = TmuxError::AlreadyExists("demo".into());
+        let err = MuxError::AlreadyExists("demo".into());
         assert_eq!(err.to_string(), "session 'demo' already exists");
     }
 
     #[test]
     fn display_of_empty_input_is_human_readable() {
-        let err = TmuxError::EmptyInput;
+        let err = MuxError::EmptyInput;
         assert_eq!(
             err.to_string(),
             "message is empty (nothing to send after sanitization)"
@@ -434,27 +452,27 @@ mod tests {
 
     #[test]
     fn strict_mode_rejects_unknown_names() {
-        let t = Tmux::new(vec!["allowed".into()], 4000);
+        let t = Mux::new(vec!["allowed".into()], 4000);
         assert!(!t.is_permissive());
         assert!(matches!(t.validate_session("allowed"), Ok(()),));
         assert!(matches!(
             t.validate_session("not-listed"),
-            Err(TmuxError::NotAllowed { .. }),
+            Err(MuxError::NotAllowed { .. }),
         ));
     }
 
     #[test]
     fn permissive_mode_accepts_any_valid_name() {
-        let t = Tmux::new(Vec::new(), 4000);
+        let t = Mux::new(Vec::new(), 4000);
         assert!(t.is_permissive());
         // Regex still enforced.
         assert!(matches!(
             t.validate_session(""),
-            Err(TmuxError::InvalidName),
+            Err(MuxError::InvalidName),
         ));
         assert!(matches!(
             t.validate_session("session name"),
-            Err(TmuxError::InvalidName),
+            Err(MuxError::InvalidName),
         ));
         // Any regex-valid name resolves.
         assert!(t.validate_session("arbitrary-name").is_ok());
@@ -466,7 +484,7 @@ mod tests {
         // Same name → same `Arc<SessionSlot>`, so the per-session mutex
         // is stable across calls (two concurrent sends on the same
         // session can actually serialize).
-        let t = Tmux::new(Vec::new(), 4000);
+        let t = Mux::new(Vec::new(), 4000);
         let a = t.slot("sess").unwrap();
         let b = t.slot("sess").unwrap();
         assert!(Arc::ptr_eq(&a, &b));

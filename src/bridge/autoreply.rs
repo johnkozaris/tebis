@@ -11,7 +11,7 @@ use tokio_util::task::TaskTracker;
 
 use super::typing::TypingGuard;
 use crate::telegram::TelegramClient;
-use crate::tmux::Tmux;
+use crate::platform::multiplexer::Mux;
 
 #[derive(Clone)]
 pub struct AutoreplyConfig {
@@ -44,7 +44,7 @@ impl Default for AutoreplyConfig {
 pub async fn watch_and_forward(
     tracker: TaskTracker,
     tg: Arc<TelegramClient>,
-    tmux: Arc<Tmux>,
+    tmux: Arc<Mux>,
     session: String,
     chat_id: i64,
     message_id: i64,

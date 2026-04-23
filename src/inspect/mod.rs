@@ -15,7 +15,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::bridge::session::SessionState;
 use crate::metrics::Metrics;
-use crate::tmux::Tmux;
+use crate::platform::multiplexer::Mux;
 
 /// Immutable non-secret config snapshot. `bot_token` is deliberately absent.
 pub struct Snapshot {
@@ -86,7 +86,7 @@ pub struct NotifyInfo {
 
 /// Live state sampled per-request. Restart action fires `shutdown`.
 pub struct LiveContext {
-    pub tmux: Arc<Tmux>,
+    pub tmux: Arc<Mux>,
     pub session: Arc<SessionState>,
     pub handler_sem: Arc<Semaphore>,
     pub metrics: Arc<Metrics>,
@@ -98,7 +98,7 @@ pub struct LiveContext {
 impl LiveContext {
     #[must_use]
     pub fn new(
-        tmux: Arc<Tmux>,
+        tmux: Arc<Mux>,
         session: Arc<SessionState>,
         handler_sem: Arc<Semaphore>,
         metrics: Arc<Metrics>,

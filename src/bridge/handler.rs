@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use super::session::SessionState;
 use crate::sanitize;
-use crate::tmux::Tmux;
+use crate::platform::multiplexer::Mux;
 
 pub enum Command {
     List,
@@ -62,7 +62,7 @@ pub enum Response {
 }
 
 pub struct Deps<'a> {
-    pub tmux: &'a Tmux,
+    pub tmux: &'a Mux,
     pub session: &'a SessionState,
     pub started_at: Instant,
 }

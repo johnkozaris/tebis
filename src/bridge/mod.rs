@@ -21,7 +21,7 @@ use crate::metrics::Metrics;
 use crate::sanitize;
 use crate::security::RateLimiter;
 use crate::telegram::TelegramClient;
-use crate::tmux::Tmux;
+use crate::platform::multiplexer::Mux;
 
 pub enum Payload {
     Text(String),
@@ -37,7 +37,7 @@ pub const MAX_CONCURRENT_HANDLERS: usize = 8;
 
 pub struct HandlerContext {
     pub tg: Arc<TelegramClient>,
-    pub tmux: Arc<Tmux>,
+    pub tmux: Arc<Mux>,
     pub session: Arc<SessionState>,
     pub rate_limiter: Arc<RateLimiter>,
     pub handler_sem: Arc<Semaphore>,

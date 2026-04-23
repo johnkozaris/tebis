@@ -12,7 +12,8 @@ use tokio_util::task::TaskTracker;
 
 use tebis::agent_hooks::HooksMode;
 use tebis::bridge::session;
-use tebis::{inspect, metrics, tmux};
+use tebis::platform::multiplexer as mux;
+use tebis::{inspect, metrics};
 
 #[tokio::main]
 #[expect(
@@ -33,12 +34,12 @@ async fn main() -> Result<()> {
     let live: Vec<String> = if dummy {
         vec!["claude-code".into(), "shell".into(), "notes".into()]
     } else {
-        let probe = tmux::Tmux::new(vec![], 4000);
+        let probe = mux::Mux::new(vec![], 4000);
         probe.list_sessions().await.unwrap_or_default()
     };
     let real_allowlist: Vec<String> = live
         .iter()
-        .filter(|s| tmux::is_valid_session_name(s))
+        .filter(|s| mux::is_valid_session_name(s))
         .cloned()
         .collect();
 
@@ -47,7 +48,7 @@ async fn main() -> Result<()> {
     } else {
         real_allowlist.clone()
     };
-    let tmux = Arc::new(tmux::Tmux::new(allowlist.clone(), 4000));
+    let tmux = Arc::new(mux::Mux::new(allowlist.clone(), 4000));
     let default_target = allowlist.first().cloned();
 
     let sessions = Arc::new(session::SessionState::new(None, HooksMode::Off));
