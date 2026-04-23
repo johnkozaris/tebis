@@ -171,3 +171,21 @@ pub fn models_dir() -> Result<PathBuf> {
 pub fn hook_manifest_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("installed.json"))
 }
+
+/// Cross-platform home-dir lookup — honors `HOME` first (POSIX shells,
+/// including Git Bash on Windows), falls back to `USERPROFILE` on
+/// Windows. Used for `~` expansion in user-typed paths (autostart
+/// dir, env-file path prompts).
+pub fn home_dir() -> Result<PathBuf> {
+    if let Ok(h) = std::env::var("HOME")
+        && !h.is_empty()
+    {
+        return Ok(PathBuf::from(h));
+    }
+    if let Ok(h) = std::env::var("USERPROFILE")
+        && !h.is_empty()
+    {
+        return Ok(PathBuf::from(h));
+    }
+    anyhow::bail!("neither HOME nor USERPROFILE is set")
+}

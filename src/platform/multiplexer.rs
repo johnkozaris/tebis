@@ -27,9 +27,25 @@ const SUBMIT_GAP: Duration = Duration::from_millis(300);
 /// needs to be on PATH for the Windows build to actually drive
 /// sessions; `has_on_path` probes will surface a setup-time warning.
 #[cfg(unix)]
-const BINARY: &str = "tmux";
+pub const BINARY: &str = "tmux";
 #[cfg(windows)]
-const BINARY: &str = "psmux";
+pub const BINARY: &str = "psmux";
+
+/// `BINARY -V` dashboard probe. Returns `"(unknown)"` if the
+/// multiplexer isn't installed — no hard failure, just signals the
+/// inspect UI.
+pub async fn version() -> String {
+    match Command::new(BINARY).arg("-V").output().await {
+        Ok(out) if out.status.success() => {
+            let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            // tmux prints "tmux 3.5a"; psmux prints similar. Strip the
+            // leading binary name if present.
+            line.strip_prefix(&format!("{BINARY} "))
+                .map_or(line.clone(), ToString::to_string)
+        }
+        _ => "(unknown)".to_string(),
+    }
+}
 
 pub struct Mux {
     strict: HashMap<String, Arc<SessionSlot>>,

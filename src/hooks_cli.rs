@@ -305,13 +305,10 @@ fn resolve_dir(cli: Option<&Path>) -> Result<PathBuf> {
 fn expand_tilde(p: &Path) -> Result<PathBuf> {
     let s = p.to_string_lossy();
     if s == "~" {
-        return std::env::var("HOME")
-            .map(PathBuf::from)
-            .context("$HOME unset");
+        return crate::platform::paths::home_dir();
     }
     if let Some(rest) = s.strip_prefix("~/") {
-        let home = std::env::var("HOME").context("$HOME unset")?;
-        return Ok(PathBuf::from(home).join(rest));
+        return Ok(crate::platform::paths::home_dir()?.join(rest));
     }
     Ok(p.to_path_buf())
 }

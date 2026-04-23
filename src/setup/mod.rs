@@ -1,7 +1,6 @@
 //! `tebis setup` — interactive first-run wizard. Writes `~/.config/tebis/env` (0600).
 
 use std::collections::HashSet;
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -448,12 +447,14 @@ fn backup_path(env_path: &Path) -> PathBuf {
 fn normalize_dir(s: &str) -> String {
     let trimmed = s.trim().trim_end_matches('/');
     if trimmed == "~" {
-        return env::var("HOME").unwrap_or_else(|_| trimmed.to_string());
+        return crate::platform::paths::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| trimmed.to_string());
     }
     if let Some(rest) = trimmed.strip_prefix("~/")
-        && let Ok(home) = env::var("HOME")
+        && let Ok(home) = crate::platform::paths::home_dir()
     {
-        return format!("{home}/{rest}");
+        return format!("{}/{rest}", home.display());
     }
     trimmed.to_string()
 }
@@ -461,6 +462,7 @@ fn normalize_dir(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
     #[test]
     fn backup_path_is_sibling() {

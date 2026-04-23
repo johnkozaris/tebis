@@ -170,34 +170,57 @@ pub fn spawn(
 fn bind_with_takeover(addr: SocketAddr) -> Result<std::net::TcpListener> {
     match std::net::TcpListener::bind(addr) {
         Ok(l) => Ok(l),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            match find_port_holder(addr.port()) {
-                Some(holder) if is_tebis_process(holder.pid) => {
-                    tracing::warn!(
-                        pid = holder.pid,
-                        cmd = %holder.cmd,
-                        "Port {} held by a stale tebis process — killing and reclaiming",
-                        addr.port()
-                    );
-                    crate::platform::process::kill_and_wait(holder.pid);
-                    std::net::TcpListener::bind(addr)
-                        .with_context(|| format!("inspect: rebind {addr} after takeover"))
-                }
-                Some(holder) => Err(anyhow::anyhow!(
-                    "inspect: port {} already in use by pid {} ({}). \
-                     Stop that process or pick a different INSPECT_PORT.",
-                    addr.port(),
-                    holder.pid,
-                    holder.cmd,
-                )),
-                None => Err(anyhow::Error::new(e))
-                    .with_context(|| format!("inspect: bind {addr} (holder unknown)")),
-            }
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => try_takeover(addr, e),
         Err(e) => Err(anyhow::Error::new(e)).with_context(|| format!("inspect: bind {addr}")),
     }
 }
 
+/// Takeover is Unix-only for now: relies on `lsof` + `ps`, which have
+/// no clean cross-platform analogue. On Windows the user gets a plain
+/// "port in use" error and can resolve via Task Manager. A future
+/// Phase-6 follow-up can add netstat-based detection if it matters
+/// enough in practice.
+#[cfg(unix)]
+fn try_takeover(addr: SocketAddr, original: std::io::Error) -> Result<std::net::TcpListener> {
+    match find_port_holder(addr.port()) {
+        Some(holder) if is_tebis_process(holder.pid) => {
+            tracing::warn!(
+                pid = holder.pid,
+                cmd = %holder.cmd,
+                "Port {} held by a stale tebis process — killing and reclaiming",
+                addr.port()
+            );
+            crate::platform::process::kill_and_wait(holder.pid);
+            std::net::TcpListener::bind(addr)
+                .with_context(|| format!("inspect: rebind {addr} after takeover"))
+        }
+        Some(holder) => Err(anyhow::anyhow!(
+            "inspect: port {} already in use by pid {} ({}). \
+             Stop that process or pick a different INSPECT_PORT.",
+            addr.port(),
+            holder.pid,
+            holder.cmd,
+        )),
+        None => Err(anyhow::Error::new(original))
+            .with_context(|| format!("inspect: bind {addr} (holder unknown)")),
+    }
+}
+
+#[cfg(windows)]
+fn try_takeover(addr: SocketAddr, original: std::io::Error) -> Result<std::net::TcpListener> {
+    // No port-holder discovery on Windows yet (would need netstat -ano
+    // + tasklist). Surface the original AddrInUse with a clear hint.
+    Err(anyhow::Error::new(original)).with_context(|| {
+        format!(
+            "inspect: port {} already in use. Stop the process holding it \
+             (see `netstat -ano -p TCP` + Task Manager) or pick a different \
+             INSPECT_PORT.",
+            addr.port()
+        )
+    })
+}
+
+#[cfg(unix)]
 #[derive(Debug)]
 struct PortHolder {
     pid: u32,
@@ -205,6 +228,7 @@ struct PortHolder {
 }
 
 /// Find port holder via `lsof`. `None` if `lsof` missing or no holder found.
+#[cfg(unix)]
 fn find_port_holder(port: u16) -> Option<PortHolder> {
     use std::process::Command;
     // `-F pc` → one field per line: `p<pid>` / `c<command>`.
@@ -236,6 +260,7 @@ fn find_port_holder(port: u16) -> Option<PortHolder> {
 
 /// Lenient check for our own binary name — purpose is "don't kill your IDE",
 /// not cryptographic identity. `ps -o comm=` truncates at 15 chars.
+#[cfg(unix)]
 fn is_tebis_process(pid: u32) -> bool {
     use std::process::Command;
     let Ok(out) = Command::new("ps")
@@ -260,16 +285,10 @@ pub fn hostname() -> String {
     crate::platform::hostname::current()
 }
 
+/// Multiplexer version string for the dashboard. Thin wrapper around
+/// `crate::platform::multiplexer::version` — named `tmux_version` for
+/// compatibility with existing call sites (`e2e/inspect-demo.rs`,
+/// `inspect::BridgeInfo`), but the value on Windows is psmux's.
 pub async fn tmux_version() -> String {
-    use tokio::process::Command;
-    match Command::new("tmux").arg("-V").output().await {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .strip_prefix("tmux ")
-            .map_or_else(
-                || String::from_utf8_lossy(&out.stdout).trim().to_string(),
-                ToString::to_string,
-            ),
-        _ => "(unknown)".to_string(),
-    }
+    crate::platform::multiplexer::version().await
 }
