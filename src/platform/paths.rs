@@ -49,7 +49,7 @@ fn test_override() -> Option<PathBuf> {
 }
 
 #[cfg(not(test))]
-fn test_override() -> Option<PathBuf> {
+const fn test_override() -> Option<PathBuf> {
     None
 }
 

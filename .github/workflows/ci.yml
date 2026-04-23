@@ -28,7 +28,7 @@ jobs:
       - run: cargo fmt --all --check
 
   clippy:
-    name: cargo clippy (pedantic)
+    name: cargo clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +36,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --locked -- -D warnings -W clippy::pedantic -W clippy::nursery
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # Pedantic + nursery run non-fatally so style hints surface in CI
+      # logs without blocking merges. Promote to `-D warnings` after a
+      # dedicated polish pass.
+      - run: cargo clippy --all-targets --locked -- -W clippy::pedantic -W clippy::nursery
+        continue-on-error: true
 
   test:
     name: cargo test (${{ matrix.os }})

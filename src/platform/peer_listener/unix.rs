@@ -1,6 +1,7 @@
 //! UDS backend. Invariants 9, 10, 11, 17 — see module docs.
 
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use tokio::net::{UnixListener, UnixStream};
@@ -41,7 +42,6 @@ impl Listener {
         }
         let inner = bind_result?;
 
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
 
         Ok(Self {
@@ -96,12 +96,12 @@ mod tests {
     //!
     //! `bind()` flips `libc::umask` process-globally (invariant 17a),
     //! so these tests serialize on the same mutex the env-mutating
-    //! agent_hooks tests use — a parallel `fs::create_dir_all` inside
-    //! the umask window would get mode 0o600 and break that test.
+    //! `agent_hooks` tests use — a parallel `fs::create_dir_all`
+    //! inside the umask window would get mode 0o600 and break that
+    //! test.
 
     use super::*;
     use crate::agent_hooks::test_support::env_lock;
-    use std::os::unix::fs::PermissionsExt;
 
     /// UDS paths are capped at `SUN_LEN` (~104 bytes on macOS, 108 on
     /// Linux), so temp-dir on some hosts (`/var/folders/xx/...` on
@@ -114,9 +114,9 @@ mod tests {
         std::env::temp_dir().join(format!("tp-{tag}-{:x}.s", ns & 0xff_ffff))
     }
 
-    /// Bind while holding env_lock, then drop the lock before any
-    /// `await` — std::sync::Mutex + await would be a footgun, and the
-    /// umask-sensitive window closes as soon as `bind()` returns.
+    /// Bind while holding `env_lock`, then drop the lock before any
+    /// `await` — `std::sync::Mutex` + await would be a footgun, and
+    /// the umask-sensitive window closes as soon as `bind()` returns.
     fn locked_bind(path: &Path) -> Listener {
         let _lock = env_lock();
         Listener::bind(path).expect("bind")

@@ -41,7 +41,7 @@ pub async fn version() -> String {
             // tmux prints "tmux 3.5a"; psmux prints similar. Strip the
             // leading binary name if present.
             line.strip_prefix(&format!("{BINARY} "))
-                .map_or(line.clone(), ToString::to_string)
+                .map_or_else(|| line.clone(), ToString::to_string)
         }
         _ => "(unknown)".to_string(),
     }
