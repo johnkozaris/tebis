@@ -1,52 +1,20 @@
-//! Env-file I/O: atomic 0600 write + `KEY=VAL` parse + toggle parser.
+//! Env-file I/O: atomic private write + `KEY=VAL` parse + toggle parser.
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-/// Atomic write with mode 0600: tmp file opened 0600 (no umask window), fsync,
-/// rename, fsync parent.
-pub fn atomic_write_0600(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let tmp = path.with_file_name(format!(
-        "{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("env")
-    ));
+use crate::platform::secure_file;
 
-    // `mode(0o600)` on open bypasses umask. chmod after write guards
-    // against ACL layers that lose creation mode.
-    {
-        use std::io::Write as _;
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("opening {}", tmp.display()))?;
-        f.write_all(content.as_bytes())
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", tmp.display()))?;
-    }
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", tmp.display()))?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} → {}", tmp.display(), path.display()))?;
-    // POSIX: rename durability needs fsync on the containing dir.
-    // Best-effort — NFS/tmpfs may reject dir-fsync.
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = fs::File::open(parent)
-        && let Err(e) = dir.sync_all()
-    {
-        tracing::debug!(err = %e, dir = %parent.display(), "atomic_write_0600: parent dir fsync failed");
-    }
-    Ok(())
+/// Atomic owner-private write of an env file. On Unix this is mode 0600
+/// with umask-bypass + post-write chmod; on Windows it currently writes
+/// with the parent directory's default DACL (a Phase-3 caveat — see
+/// `platform::secure_file` module docs).
+pub fn atomic_write_0600(path: &Path, content: &str) -> Result<()> {
+    secure_file::atomic_write_private(path, content.as_bytes())
+        .with_context(|| format!("atomic private write of {}", path.display()))
 }
 
 /// `KEY=VALUE`. No shell expansion; matches systemd's `EnvironmentFile=`.
@@ -195,8 +163,13 @@ mod tests {
         assert_eq!(parse_kv_line("FOO="), Some(("FOO", "")));
     }
 
+    // Mode-bit assertions only make sense on Unix — Windows relies on
+    // parent-directory DACL inheritance until the Phase-3 secure_file
+    // rewrite adds explicit DACLs.
+    #[cfg(unix)]
     #[test]
     fn atomic_write_0600_creates_with_mode() {
+        use std::os::unix::fs::PermissionsExt;
         let p = std::env::temp_dir().join(format!("tebis-env-0600-{}", std::process::id()));
         let _ = fs::remove_file(&p);
         atomic_write_0600(&p, "FOO=bar\n").unwrap();
@@ -206,8 +179,10 @@ mod tests {
         let _ = fs::remove_file(&p);
     }
 
+    #[cfg(unix)]
     #[test]
     fn atomic_write_0600_overwrite_tightens_perms() {
+        use std::os::unix::fs::PermissionsExt;
         let p = std::env::temp_dir().join(format!("tebis-env-0600-tight-{}", std::process::id()));
         fs::write(&p, "old").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
@@ -233,8 +208,11 @@ mod tests {
         assert!(body.contains("BAZ="), "other key must survive: {body:?}");
         assert!(body.contains("# preamble comment"), "comments preserved");
         assert!(body.contains("# trailing"), "comments preserved");
-        // Mode 0600 guaranteed by atomic_write_0600.
-        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        }
         let _ = fs::remove_file(&p);
     }
 

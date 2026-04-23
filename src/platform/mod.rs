@@ -15,4 +15,5 @@
 
 pub mod hostname;
 pub mod process;
+pub mod secure_file;
 pub mod signal;
