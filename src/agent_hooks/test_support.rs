@@ -15,7 +15,11 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Point `XDG_DATA_HOME` + `HOME` at a fresh scratch dir for `f`, restore afterwards.
+/// Point tebis's config + data dirs at a fresh scratch tree for `f`,
+/// restore afterwards. Uses `TEBIS_SCRATCH_DIR` (honored by
+/// `platform::paths` only in test builds) so the override works
+/// uniformly on Unix and Windows — Windows's Known Folder API
+/// wouldn't pick up an `XDG_*` override.
 pub fn with_scratch_data_home<R>(tag: &str, f: impl FnOnce() -> R) -> R {
     let _guard = env_lock();
     let scratch = std::env::temp_dir().join(format!(
@@ -28,27 +32,21 @@ pub fn with_scratch_data_home<R>(tag: &str, f: impl FnOnce() -> R) -> R {
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).expect("scratch mkdir");
 
-    let prior_xdg = std::env::var_os("XDG_DATA_HOME");
-    let prior_home = std::env::var_os("HOME");
+    let prior = std::env::var_os("TEBIS_SCRATCH_DIR");
 
     // SAFETY: We hold `env_lock`; no other thread in this process will
     // observe the intermediate state. We restore on every exit path.
     unsafe {
-        std::env::set_var("XDG_DATA_HOME", &scratch);
-        std::env::set_var("HOME", &scratch);
+        std::env::set_var("TEBIS_SCRATCH_DIR", &scratch);
     }
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 
     // SAFETY: see above.
     unsafe {
-        match prior_xdg {
-            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-            None => std::env::remove_var("XDG_DATA_HOME"),
-        }
-        match prior_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
+        match prior {
+            Some(v) => std::env::set_var("TEBIS_SCRATCH_DIR", v),
+            None => std::env::remove_var("TEBIS_SCRATCH_DIR"),
         }
     }
     let _ = std::fs::remove_dir_all(&scratch);

@@ -31,9 +31,31 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+/// Test-only path override. When `TEBIS_SCRATCH_DIR` is set,
+/// `config_dir()` returns `<scratch>/config` and `data_dir()` returns
+/// `<scratch>/data`, on every platform — including Windows, where
+/// `XDG_*` env vars don't reach the Known Folder API. This lets
+/// `agent_hooks::test_support::with_scratch_data_home` work uniformly
+/// across targets.
+///
+/// In release builds the function always returns `None`; the env var
+/// is never consulted, so prod behavior is unaffected.
+#[cfg(test)]
+fn test_override() -> Option<PathBuf> {
+    std::env::var("TEBIS_SCRATCH_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(not(test))]
+fn test_override() -> Option<PathBuf> {
+    None
+}
+
 #[cfg(unix)]
 mod unix {
-    use super::{Context, PathBuf, Result};
+    use super::{Context, PathBuf, Result, test_override};
 
     fn home() -> Result<PathBuf> {
         let h = std::env::var("HOME").context("HOME not set")?;
@@ -44,6 +66,9 @@ mod unix {
     }
 
     pub fn config_dir() -> Result<PathBuf> {
+        if let Some(root) = test_override() {
+            return Ok(root.join("config"));
+        }
         if let Ok(x) = std::env::var("XDG_CONFIG_HOME")
             && !x.is_empty()
         {
@@ -53,6 +78,9 @@ mod unix {
     }
 
     pub fn data_dir() -> Result<PathBuf> {
+        if let Some(root) = test_override() {
+            return Ok(root.join("data"));
+        }
         if let Ok(x) = std::env::var("XDG_DATA_HOME")
             && !x.is_empty()
         {
@@ -84,7 +112,7 @@ mod unix {
 
 #[cfg(windows)]
 mod windows {
-    use super::{Context, PathBuf, Result};
+    use super::{Context, PathBuf, Result, test_override};
 
     fn dirs() -> Result<directories::ProjectDirs> {
         directories::ProjectDirs::from("", "", "tebis")
@@ -92,6 +120,9 @@ mod windows {
     }
 
     pub fn config_dir() -> Result<PathBuf> {
+        if let Some(root) = test_override() {
+            return Ok(root.join("config"));
+        }
         Ok(dirs()?.config_dir().to_path_buf())
     }
 
@@ -99,6 +130,9 @@ mod windows {
         // `data_local_dir` → `%LOCALAPPDATA%` — per-machine, not roaming.
         // Models + lockfile + cache all belong here; roaming (`%APPDATA%`)
         // is reserved for small config.
+        if let Some(root) = test_override() {
+            return Ok(root.join("data"));
+        }
         Ok(dirs()?.data_local_dir().to_path_buf())
     }
 
