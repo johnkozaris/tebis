@@ -11,6 +11,7 @@ use tokio_util::task::TaskTracker;
 use tracing_subscriber::EnvFilter;
 
 use tebis::bridge::session;
+use tebis::platform::signal::shutdown_signal;
 use tebis::{
     audio, bridge, config, hooks_cli, inspect, lockfile, metrics, notify, security, service, setup,
     telegram, tmux,
@@ -692,23 +693,4 @@ fn kv_url(label: &str, url: &str) {
         style(format!("{label:<13}")).dim(),
         style(url).cyan().underlined(),
     );
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-
-    #[cfg(unix)]
-    {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler");
-        tokio::select! {
-            _ = ctrl_c => {}
-            _ = sigterm.recv() => {}
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        ctrl_c.await.ok();
-    }
 }
