@@ -234,10 +234,20 @@ fn configure_kokoro_local(
     if !matches!(espeak, super::super::phonemizer::EnsureOutcome::Ready(_)) {
         println!();
         println!(
-            "   {} espeak-ng unavailable — falling back to no TTS.",
+            "   {} espeak-ng unavailable — {}.",
             style("→").dim(),
+            if matches!(existing, Some(TtsChoice::KokoroLocal { .. })) {
+                "keeping your previous Kokoro config (install will be retried on next setup)"
+            } else {
+                "falling back to no TTS"
+            },
         );
-        return Ok(Some(TtsChoice::Off));
+        // Preserve the user's prior Kokoro config on transient install
+        // failure so a re-run doesn't cost them voice/model/flag picks.
+        return Ok(Some(match existing {
+            Some(c @ TtsChoice::KokoroLocal { .. }) => c.clone(),
+            _ => TtsChoice::Off,
+        }));
     }
 
     // onnxruntime: the `ort` crate's `load-dynamic` searches the default
@@ -251,10 +261,18 @@ fn configure_kokoro_local(
         _ => {
             println!();
             println!(
-                "   {} onnxruntime unavailable — falling back to no TTS.",
+                "   {} onnxruntime unavailable — {}.",
                 style("→").dim(),
+                if matches!(existing, Some(TtsChoice::KokoroLocal { .. })) {
+                    "keeping your previous Kokoro config (install will be retried on next setup)"
+                } else {
+                    "falling back to no TTS"
+                },
             );
-            return Ok(Some(TtsChoice::Off));
+            return Ok(Some(match existing {
+                Some(c @ TtsChoice::KokoroLocal { .. }) => c.clone(),
+                _ => TtsChoice::Off,
+            }));
         }
     };
 

@@ -109,6 +109,41 @@ pub fn ensure_or_install(theme: &ColorfulTheme) -> Result<EnsureOutcome> {
         return Ok(EnsureOutcome::NoPackageManager);
     };
 
+    // Fedora/RHEL (dnf) and Alpine (apk) don't ship onnxruntime in
+    // their default repos (April 2026). Trying the install exits non-
+    // zero with nothing actionable. Steer the user at pip + manual
+    // `ORT_DYLIB_PATH` instead of burning a confusing failure.
+    if matches!(pm, PackageManager::Dnf | PackageManager::Apk) {
+        println!();
+        println!(
+            "{} {} doesn't ship `onnxruntime` in its default repos.",
+            style("ℹ").cyan(),
+            pm.name(),
+        );
+        println!("   Install via Python pip and hand-set `ORT_DYLIB_PATH`:");
+        println!();
+        println!(
+            "     {}",
+            style("python3 -m pip install --user onnxruntime").bold()
+        );
+        println!(
+            "     {}",
+            style(r#"python3 -c 'import onnxruntime,os; print(os.path.join(os.path.dirname(onnxruntime.__file__),"capi","libonnxruntime.so.1"))'"#)
+                .dim(),
+        );
+        println!(
+            "   Add the printed path to {} as:",
+            style("~/.config/tebis/env").bold()
+        );
+        println!(
+            "     {}",
+            style("ORT_DYLIB_PATH=/path/to/libonnxruntime.so.1").dim()
+        );
+        println!();
+        println!("   Re-run {} once that's done.", style("tebis setup").bold());
+        return Ok(EnsureOutcome::NoPackageManager);
+    }
+
     let pkg = package_name_for(pm);
     let cmd_str = install_cmd_display(pm, pkg);
 

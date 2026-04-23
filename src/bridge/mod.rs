@@ -239,6 +239,16 @@ fn handle_tts_command(ctx: &HandlerContext, v: &handler::TtsVerb) -> Response {
 /// Persist `TELEGRAM_TTS_BACKEND=<value>` and trigger a graceful
 /// restart so the next boot picks it up. Returns a `Response::Text`
 /// for the user.
+///
+/// For `kokoro-local` we ALSO probe for `libonnxruntime` and write
+/// `ORT_DYLIB_PATH=<path>`. Without this, `/tts kokoro-local` lands
+/// us in a silent TTS-off state on Apple Silicon (the ort crate's
+/// default dyld search doesn't include /opt/homebrew/lib). Probe
+/// failure = refuse the switch and tell the user what to install.
+///
+/// For every non-kokoro-local target, we REMOVE any stale
+/// `ORT_DYLIB_PATH` so `cat ~/.config/tebis/env` doesn't lie about
+/// what the runtime actually uses.
 fn switch_tts_backend(ctx: &HandlerContext, value: &str) -> Response {
     let Some(env_path) = ctx.env_file_path.as_ref() else {
         return Response::Text(
@@ -247,7 +257,28 @@ fn switch_tts_backend(ctx: &HandlerContext, value: &str) -> Response {
                 .to_string(),
         );
     };
-    let updates = [("TELEGRAM_TTS_BACKEND", value.to_string())];
+
+    // Build the upsert list. For kokoro-local we need ORT_DYLIB_PATH too.
+    let mut updates: Vec<(&str, String)> =
+        vec![("TELEGRAM_TTS_BACKEND", value.to_string())];
+    if value == "kokoro-local" {
+        match crate::setup::onnxruntime::probe() {
+            Some(p) => updates.push((
+                "ORT_DYLIB_PATH",
+                p.to_string_lossy().into_owned(),
+            )),
+            None => {
+                return Response::Text(
+                    "Can't switch to <code>kokoro-local</code>: <code>libonnxruntime</code> \
+                     isn't on any known path. Run <code>brew install onnxruntime</code> \
+                     (macOS) or your distro's equivalent, then retry. \
+                     <code>tebis setup</code> installs it for you."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     if let Err(e) = crate::env_file::upsert_keys(env_path, &updates) {
         ctx.metrics.record_handler_error();
         tracing::error!(err = %e, "/tts: env-file write failed");
@@ -255,6 +286,17 @@ fn switch_tts_backend(ctx: &HandlerContext, value: &str) -> Response {
             "Failed to write env file — see server logs. TTS unchanged.".to_string(),
         );
     }
+
+    // Switching away from kokoro-local: clear the now-stale dylib path.
+    // Best-effort: a failure here is ugly (the key lingers in the file)
+    // but not a correctness issue since nothing reads it on non-Kokoro
+    // paths.
+    if value != "kokoro-local"
+        && let Err(e) = crate::env_file::remove_keys(env_path, &["ORT_DYLIB_PATH"])
+    {
+        tracing::warn!(err = %e, "/tts: failed to clear stale ORT_DYLIB_PATH");
+    }
+
     tracing::warn!(
         new_backend = %value,
         path = %env_path.display(),

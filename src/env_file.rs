@@ -114,6 +114,25 @@ pub fn upsert_keys(path: &Path, updates: &[(&str, String)]) -> Result<()> {
     atomic_write_0600(path, &body)
 }
 
+/// Remove `keys` from `path`. Silently succeeds if a key (or the file)
+/// isn't present. Atomic 0600 write via [`atomic_write_0600`].
+pub fn remove_keys(path: &Path, keys: &[&str]) -> Result<()> {
+    use std::collections::HashSet;
+    let current = std::fs::read_to_string(path).unwrap_or_default();
+    let drop: HashSet<&str> = keys.iter().copied().collect();
+    let kept: Vec<String> = current
+        .lines()
+        .filter(|line| match parse_kv_line(line) {
+            Some((k, _)) => !drop.contains(k),
+            None => true,
+        })
+        .map(str::to_string)
+        .collect();
+    let mut body = kept.join("\n");
+    body.push('\n');
+    atomic_write_0600(path, &body)
+}
+
 /// First occurrence of `key`, or `None` if file/key is missing.
 pub fn read_key(path: &Path, key: &str) -> io::Result<Option<String>> {
     let content = match fs::read_to_string(path) {
@@ -196,6 +215,36 @@ mod tests {
         let meta = fs::metadata(&p).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         assert_eq!(fs::read_to_string(&p).unwrap(), "new\n");
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn remove_keys_drops_matching_lines_and_preserves_others() {
+        let p = std::env::temp_dir().join(format!("tebis-env-rm-{}", std::process::id()));
+        fs::write(
+            &p,
+            "# preamble comment\nFOO=bar\nBAZ=  qux  \n\n# trailing\nORT_DYLIB_PATH=/x\n",
+        )
+        .unwrap();
+        remove_keys(&p, &["ORT_DYLIB_PATH", "MISSING"]).unwrap();
+        let body = fs::read_to_string(&p).unwrap();
+        assert!(!body.contains("ORT_DYLIB_PATH"), "key must be gone: {body:?}");
+        assert!(body.contains("FOO=bar"), "other key must survive: {body:?}");
+        assert!(body.contains("BAZ="), "other key must survive: {body:?}");
+        assert!(body.contains("# preamble comment"), "comments preserved");
+        assert!(body.contains("# trailing"), "comments preserved");
+        // Mode 0600 guaranteed by atomic_write_0600.
+        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn remove_keys_no_op_when_file_missing() {
+        let p = std::env::temp_dir().join("tebis-env-rm-missing-nonexistent-xyz");
+        let _ = fs::remove_file(&p);
+        // Must succeed + create an empty-ish file.
+        remove_keys(&p, &["WHATEVER"]).unwrap();
+        assert!(p.exists());
         let _ = fs::remove_file(&p);
     }
 
