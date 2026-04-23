@@ -1,7 +1,11 @@
-//! E2E tests for embedded hook scripts — catch Claude/Copilot payload schema drift.
-//! Skip when `bash`/`jq`/`nc` aren't on PATH.
+//! E2E tests for embedded hook scripts — catch Claude/Copilot payload
+//! schema drift. Skip when `bash`/`jq`/`nc` aren't on PATH.
+//!
+//! Unix-only: exercises the `.sh` hooks against a `UnixListener` fake
+//! bridge. The Phase-2 `.ps1` hooks get their own e2e module running
+//! against a `NamedPipeServer` fake.
 
-#![cfg(test)]
+#![cfg(all(test, unix))]
 
 use std::io::Write as _;
 use std::os::unix::net::UnixListener;

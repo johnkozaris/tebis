@@ -327,7 +327,10 @@ fn detect_agent_from_config() -> Result<Option<AgentKind>> {
         .and_then(AgentKind::detect))
 }
 
-/// Warn when `jq`/`nc` aren't on PATH — hook scripts silently no-op without them.
+/// Warn when the hook-script runtime deps are missing. On Unix, the
+/// embedded `.sh` hooks need `jq` + `nc`; on Windows the Phase-2 `.ps1`
+/// hooks need a working PowerShell (5.1 or pwsh 7+).
+#[cfg(unix)]
 fn warn_if_hook_deps_missing() {
     for tool in ["jq", "nc"] {
         if !has_on_path(tool) {
@@ -349,7 +352,17 @@ fn warn_if_hook_deps_missing() {
     }
 }
 
+#[cfg(windows)]
+fn warn_if_hook_deps_missing() {
+    // Phase 2 will emit PowerShell-based hooks and probe for
+    // `powershell.exe` / `pwsh.exe` here. Until then the Windows build
+    // has no hook-script runtime deps to probe — the notify listener
+    // itself is still Unix-only pending Phase 2.
+}
+
+#[cfg(unix)]
 fn has_on_path(tool: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
     let Ok(path_var) = std::env::var("PATH") else {
         return false;
     };
@@ -360,11 +373,9 @@ fn has_on_path(tool: &str) -> bool {
         let candidate = Path::new(dir).join(tool);
         if let Ok(meta) = std::fs::metadata(&candidate)
             && meta.is_file()
+            && meta.permissions().mode() & 0o111 != 0
         {
-            use std::os::unix::fs::PermissionsExt;
-            if meta.permissions().mode() & 0o111 != 0 {
-                return true;
-            }
+            return true;
         }
     }
     false

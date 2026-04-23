@@ -323,7 +323,11 @@ async fn run_tmux(op: &'static str, args: &[&str]) -> Result<std::process::Outpu
     }
 }
 
-#[cfg(test)]
+// These tests cover tmux's stderr wording for error classification —
+// inherently Unix (tmux doesn't run natively on Windows; psmux gets
+// its own classifier in Phase 5) and uses `ExitStatus::from_raw` for
+// synthetic outputs, which is itself Unix-only.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
