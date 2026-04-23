@@ -1,24 +1,39 @@
 # tebis — project notes
 
-Personal Rust daemon that bridges Telegram ↔ tmux so a phone can drive AI
-coding agents (Claude Code) running in tmux sessions.
+Personal Rust daemon that bridges Telegram ↔ terminal multiplexer
+(tmux on Unix, psmux on Windows) so a phone can drive AI coding
+agents (Claude Code, Copilot CLI) running in a multiplexer session.
 
 ## Layout
 
-Split into two layers so plumbing and policy are testable independently.
+Split into three layers so plumbing, per-OS primitives, and policy
+are testable independently.
 
 **Plumbing** — pure I/O wrappers, no knowledge of commands or autostart:
 - `src/main.rs` — poll loop, spawn-per-update, `CancellationToken` + `TaskTracker` shutdown, 401 dead-end
 - `src/telegram/mod.rs` — Bot API client (`thiserror` errors, 429/5xx retry, 409/401 expose via `is_conflict`/`is_unauthorized`)
 - `src/telegram/types.rs` — Telegram DTOs
-- `src/tmux.rs` — `send-keys` / `capture-pane` with per-session `tokio::Mutex`; returns typed `TmuxError` (`NotFound` / `AlreadyExists` / `EmptyInput` / …); owns `is_valid_session_name`
 - `src/config.rs` — env-var parsing only. Populates `Config`; every subsystem owns the shape of its own config type (`AutostartConfig` in `bridge::session`, `NotifyConfig` in `notify`, `AutoreplyConfig` in `bridge::autoreply`, `HooksMode` in `agent_hooks`).
-- `src/env_file.rs` — shared env-file utilities. `atomic_write_0600` (used by wizard + inspect dashboard so secrets never leak through umask), `parse_kv_line` (used by every reader), `parse_toggle` (used by every `TELEGRAM_*` feature flag so unknown values fail loudly).
-- `src/lockfile.rs` — single-instance flock at `$XDG_RUNTIME_DIR/tebis.lock` (or `/tmp/tebis-$USER.lock`).
+- `src/env_file.rs` — shared env-file utilities. `atomic_write_0600` (thin wrapper over `platform::secure_file::atomic_write_private`), `parse_kv_line`, `parse_toggle`.
+- `src/lockfile.rs` — single-instance advisory lock via `std::fs::File::try_lock` (stable 1.89 — `flock(2)` on Unix, `LockFileEx` on Windows). Path resolved through `platform::paths::lock_file_path`.
+
+**Per-OS primitives** (`src/platform/`) — where Unix and Windows diverge.
+Each submodule exposes one cross-platform API; backends live side-by-
+side inside the module so callers never need `#[cfg]` inline. See
+[`feedback_platform_separation.md`](memory) for the "large vs small
+divergence" rule.
+- `platform/signal.rs` — `shutdown_signal()` (SIGINT+SIGTERM on Unix, Ctrl+C on Windows)
+- `platform/hostname.rs` — `current()` (`gethostname(2)` / `%COMPUTERNAME%`)
+- `platform/process.rs` — `kill_and_wait(pid)` (SIGTERM→SIGKILL on Unix, `taskkill /T` → `/F` on Windows)
+- `platform/paths.rs` — `config_dir`, `data_dir`, `env_file_path`, `lock_file_path`, `notify_address`, `models_dir`, `hook_manifest_path`. XDG on Linux, Apple-ish on macOS, Known Folder API on Windows. Tests override via `TEBIS_SCRATCH_DIR`.
+- `platform/secure_file.rs` — `atomic_write_private` (0600 on Unix; owner-only DACL + MoveFileExW-replace on Windows), `ensure_private_dir`, `set_owner_executable`
+- `platform/peer_listener/{mod,unix,windows}.rs` — local IPC listener restricted to same-user peers. Unix UDS + umask/chmod/peer_cred; Windows Named Pipe + SDDL `D:P(A;;GA;;;<SID>)` + `ImpersonateNamedPipeClient` + `TokenUser` SID equality (invariant 20).
+- `platform/multiplexer.rs` — `Mux` struct driving the tmux-compatible CLI; `BINARY` cfg-gated to `tmux` on Unix, `psmux` on Windows.
+- `platform/windows_auth.rs` — shared SID/SDDL/SECURITY_DESCRIPTOR helpers + `HandleGuard`, consumed by both `peer_listener::windows` and `secure_file::windows`.
 
 **Behavior** — what happens per message:
 - `src/bridge/mod.rs` — rate-limit → parse → execute → reply routing (hook-driven / pane-settle / bare 👍). Owns `HandlerContext` (includes the shared `TaskTracker`). Instruments `Metrics` at each stage.
-- `src/bridge/handler.rs` — command parse + execute. Clears stale `default_target` and retries provisioning once on `TmuxError::NotFound` for the plain-text path (with an explicit `kill_session` drain to break zombie-state loops).
+- `src/bridge/handler.rs` — command parse + execute. Clears stale `default_target` and retries provisioning once on `MuxError::NotFound` for the plain-text path (with an explicit `kill_session` drain to break zombie-state loops).
 - `src/bridge/session.rs` — `SessionState` owns `default_target` + `autostart` + its serialization lock + `hooked_sessions` set; `resolve_or_autostart`, `resolve_explicit`, `clear_target_if`, `mark_hooked`/`unmark_hooked`/`is_hooked`. Defines `AutostartConfig` and `ResolveError` (incl. `AutostartCommandDied`). Hook install runs OUTSIDE the autostart lock — it's idempotent atomic writes with no ordering dep on provisioning.
 - `src/bridge/autoreply.rs` — TUI-agnostic pane-settle reply detection (Braille-spinner-tolerant hash + diff-against-baseline). Owns `AutoreplyConfig` (tunings live with the consumer).
 - `src/bridge/typing.rs` — `TypingGuard` RAII handle + `spawn_with_cap` free fn. Every typing-indicator spawn goes on the shared `TaskTracker` (invariant 12).
@@ -30,11 +45,11 @@ Split into two layers so plumbing and policy are testable independently.
 
 **Subsystems:**
 - `src/inspect/{mod,server,render}.rs` — opt-in local HTML dashboard. `INSPECT_PORT=<n>` → `127.0.0.1:<n>`. Loopback-only, CSRF-checked, zero JS. `server.rs` handles HTTP + routing + env-file I/O via `env_file::atomic_write_0600`; `render.rs` handles HTML + JSON + inline CSS. `HooksInfo` row shows mode + every project dir from the manifest.
-- `src/notify/{mod,listener,format}.rs` — opt-in UDS listener for hook-pushed summaries. `mod.rs` owns `Forwarder` trait + `TelegramForwarder` + `Payload`. `listener.rs` handles bind + accept + per-connection protocol (parameterized over `Forwarder` for testability). `format.rs` is pure HTML body formatting.
+- `src/notify/{mod,listener,format}.rs` — opt-in listener for hook-pushed summaries. Transport is `platform::peer_listener` (UDS on Unix, Named Pipe on Windows — both owner-only, peer-authed). `mod.rs` owns `Forwarder` trait + `TelegramForwarder` + `Payload`. `listener.rs` is pure protocol (newline-framed JSON, 16 KiB cap). `format.rs` is HTML body formatting.
 - `src/setup/{mod,steps,discover,ui}.rs` — six-step first-run wizard. `mod.rs` runs steps + preserves user-added env keys across re-runs. `steps.rs` has each step fn + validators (step 5 is hook-mode, defaulting Auto when the autostart command resolves to a known agent). `discover.rs` parses existing env via `env_file::parse_kv_line`. `ui.rs` is the terminal rendering primitives.
-- `src/agent_hooks/{mod,agent,claude,copilot,manifest,jsonfile,test_support}.rs` — native-hook installation for Claude Code + Copilot CLI. `agent.rs` owns `AgentKind` + `HooksMode` (co-located with the installers, not in `config.rs`). `claude.rs` merges into `.claude/settings.local.json` (lowest-precedence project layer); `copilot.rs` writes a single sentinel `.github/hooks/tebis.json`. `manifest.rs` tracks every project-dir/agent pair at `$XDG_DATA_HOME/tebis/installed.json` so `tebis hooks list` and the dashboard can enumerate installs host-wide. `jsonfile.rs` is shared atomic-write + load-or-empty. Both uninstallers probe `data_dir()` up front so an unresolvable `$HOME` fails loudly instead of silently leaving hooks behind.
-- `src/hooks_cli.rs` — `tebis hooks {install,uninstall,status,list}`. Install-time probes `jq` / `nc` on `$PATH` and scans for legacy (pre-Phase-2) hook entries.
-- `src/service.rs` — launchd (macOS) / systemd user (Linux) install / start / stop / status / restart / uninstall.
+- `src/agent_hooks/{mod,agent,claude,copilot,manifest,jsonfile,test_support}.rs` — native-hook installation for Claude Code + Copilot CLI. `agent.rs` owns `AgentKind` + `HooksMode`. `claude.rs` merges into `.claude/settings.local.json` (lowest-precedence project layer); `copilot.rs` writes a single sentinel `.github/hooks/tebis.json`. Hook scripts embedded via `include_str!` — `.sh` on Unix, `.ps1` on Windows (per-OS cfg-gated constants). `script_command(script_path)` produces the per-OS command string (raw path on Unix, `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<path>"` on Windows). `manifest.rs` tracks every project-dir/agent pair at `platform::paths::hook_manifest_path()`.
+- `src/hooks_cli.rs` — `tebis hooks {install,uninstall,status,list}`. Unix: probes `jq` + `nc` on `$PATH`. Windows: probes `powershell.exe` / `pwsh.exe`. Both scan for legacy (pre-Phase-2) hook entries.
+- `src/service/{mod,unix,windows}.rs` — per-OS service install. `unix.rs`: launchd on macOS, systemd user on Linux. `windows.rs`: Task Scheduler via `schtasks.exe /Create /SC ONLOGON /RL LIMITED` — runs in the user's session so per-user paths + Git Bash + Claude Code autostart all work (SCM services default to LocalSystem, which would break all of that).
 
 ## Security invariants — do not weaken
 
@@ -76,16 +91,23 @@ discussion.
 8. **Per-session `tokio::Mutex`** serializes `send_keys` + `capture_pane` on
    the same session. `capture_pane` must actually acquire the guard (`let
    _guard = lock.lock().await`, not `let _ = ...`).
-9. **Notify socket is UDS-only, mode 0600, explicit chmod after bind.**
-   No TCP fallback — the listener must not be reachable over the network.
-   `fs::set_permissions` on the path *after* `UnixListener::bind` because
-   umask alone can't be trusted. Unlink any stale socket before bind.
+9. **Notify listener is local-user-only, per-OS owner-restricted.**
+   No TCP fallback on any platform — the listener must not be reachable
+   over the network. Unix: UDS with mode 0600 + explicit chmod after
+   bind (`fs::set_permissions` on the path *after* `UnixListener::bind`
+   because umask alone can't be trusted; unlink any stale socket first).
+   Windows: Named Pipe with an owner-only DACL set at `CreateNamedPipeW`
+   via SDDL `D:P(A;;GA;;;<OUR_SID>)` — no inheritance, no other
+   principals. See invariants 17 + 20 for the peer-auth gate.
 10. **Notify payload max 16 KiB, per-connection read timeout 5 s.** Do not
     trust hook scripts to be well-behaved just because they're local.
 11. **Notify protocol is newline-terminated JSON, not EOF-framed.** macOS's
-    stock `nc` doesn't support `-N` (UDS half-close). Newline framing works
-    with `nc -U -w 2` on every platform. Bridge's reader uses
-    `read_until(b'\n')` with the 16 KiB cap.
+    stock `nc` doesn't support `-N` (UDS half-close). Newline framing
+    works with `nc -U -w 2` on Unix and with
+    `System.IO.StreamWriter.WriteLine` over
+    `NamedPipeClientStream` on Windows (see
+    `contrib/claude/claude-hook.ps1`). Bridge's reader uses
+    `read_until(b'\n')` with the 16 KiB cap on both transports.
 12. **Per-connection notify tasks spawn on the shared `TaskTracker`.** So
     `tracker.wait()` drains in-flight deliveries at shutdown. Don't use
     bare `tokio::spawn` — that leaves the future orphaned on cancel.
@@ -97,23 +119,27 @@ discussion.
     Without it, concurrent plain-text messages race the TUI-boot sleep:
     the first spawns Claude, the second sees `has_session == true` and
     skips the wait, sending keystrokes before the TUI is ready.
-15. **Stale-target recovery uses `TmuxError::NotFound`, not string
-    matching.** tmux error wording differs by subcommand (`send-keys` says
-    "can't find pane", others say "can't find session"); `classify_status`
-    folds both into `NotFound` so `handler.rs` can safely match on the
-    variant. `kill_session` is idempotent — `NotFound` folds into `Ok(())`.
-    Plain-text auto-retries once via `resolve_or_autostart` on `NotFound`.
+15. **Stale-target recovery uses `MuxError::NotFound`, not string
+    matching.** Multiplexer error wording differs by subcommand
+    (`send-keys` says "can't find pane", others say "can't find
+    session"; psmux uses "no such session" / "session not found");
+    `classify_status` folds them all into `NotFound` so `handler.rs`
+    can safely match on the variant. `kill_session` is idempotent —
+    `NotFound` folds into `Ok(())`. Plain-text auto-retries once via
+    `resolve_or_autostart` on `NotFound`.
 16. **Global handler concurrency cap via `tokio::Semaphore`**
     (`MAX_CONCURRENT_HANDLERS`). Acquired *after* the rate-limit check so
     rate-limited replies don't consume a work slot. Bounds subprocess
     fan-out when Telegram delivers a burst (offline-phone reconnect).
-17. **UDS uses three-layer peer defense.** (a) `umask(0o177)` around
-    `bind(2)` so the socket file is `0600` from creation — Linux honors
-    socket-file perms for `connect`. (b) explicit `chmod 0600` as
-    belt-and-suspenders against weird init umasks. (c) `peer_cred()` check
-    on every accepted connection, rejecting any uid ≠ our euid. The cred
-    check is the only authenticated gate — (a) and (b) close the TOCTOU
-    window between bind and chmod. Do not remove any layer independently.
+17. **UDS (Unix) uses three-layer peer defense.** (a) `umask(0o177)`
+    around `bind(2)` so the socket file is `0600` from creation —
+    Linux honors socket-file perms for `connect`. (b) explicit
+    `chmod 0600` as belt-and-suspenders against weird init umasks.
+    (c) `peer_cred()` check on every accepted connection, rejecting
+    any uid ≠ our euid. The cred check is the only authenticated
+    gate — (a) and (b) close the TOCTOU window between bind and
+    chmod. Do not remove any layer independently. **Windows
+    equivalent is invariant 20.**
 18. **STT transcripts are byte-capped at `MAX_TRANSCRIPT_BYTES` (4000)
     before entering `handler::parse`.** Matches
     `TELEGRAM_MAX_OUTPUT_CHARS`'s upper bound. Without this, a long
@@ -121,6 +147,21 @@ discussion.
     into tmux and bypass every text-message size limit. The cap is in
     bytes (not chars) because `text.len()` is bytes; the config key
     uses "CHARS" for historical reasons.
+19. **Named-Pipe peer auth (Windows) uses `ImpersonateNamedPipeClient` +
+    `OpenThreadToken(TOKEN_QUERY)` + `GetTokenInformation(TokenUser)` +
+    `EqualSid` — never `GetNamedPipeClientProcessId`.** PID is spoofable
+    (Project Zero 2019-09). The impersonation token is kernel-verified.
+    `RevertToSelf` must fire on every exit path — `RevertGuard` Drop
+    handles panic + early-return. This is the Windows analogue of
+    invariant 17's `peer_cred` gate.
+20. **Secure file writes go through `platform::secure_file::atomic_write_private`.**
+    Unix: `O_CREAT | O_WRONLY | O_TRUNC` with `mode(0o600)` + post-write
+    `chmod 0o600` + atomic rename + best-effort parent fsync.
+    Windows: `CreateFileW` with `SECURITY_ATTRIBUTES` holding a DACL of
+    `D:P(A;;FA;;;<OUR_SID>)` (set at creation, no TOCTOU window) plus
+    `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` for atomic replace. Do
+    not roll your own write-then-chmod or remove-then-rename — both
+    have windows the primitive closes.
 
 ## Architectural rules
 
