@@ -1,25 +1,32 @@
-//! `$XDG_DATA_HOME/tebis/models/` — dirs 0700, files 0644. Set mode at create + after.
+//! Model-file cache — `<data_dir>/models/`.
+//!
+//! Dirs are owner-only (0700 on Unix, inherited DACL on Windows —
+//! `%LOCALAPPDATA%` is user-private by default). Model files themselves
+//! are world-readable on Unix (0644) since they're just downloaded
+//! ONNX/Whisper blobs with no secret material; on Windows they inherit
+//! parent permissions.
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+
+use crate::platform::secure_file;
 
 const MODELS_SUBDIR: &str = "models";
 
 pub(crate) const TMP_SUFFIX: &str = ".tebis.tmp";
 
-/// Same dir as `agent_hooks::data_dir` — single XDG lookup.
+/// Same dir as `agent_hooks::data_dir` — single `platform::paths` lookup.
 pub fn base_dir() -> Result<PathBuf> {
     crate::agent_hooks::data_dir()
 }
 
-/// `$XDG_DATA_HOME/tebis/models/` — created (0700) if missing.
+/// `<data_dir>/models/` — created with owner-only perms if missing.
 pub fn models_dir() -> Result<PathBuf> {
     let dir = base_dir()?.join(MODELS_SUBDIR);
-    ensure_dir_0700(&dir)?;
+    secure_file::ensure_private_dir(&dir)?;
     Ok(dir)
 }
 
@@ -36,27 +43,44 @@ pub fn tmp_path_for(final_path: &Path) -> PathBuf {
     final_path.with_file_name(format!("{name}{TMP_SUFFIX}"))
 }
 
-/// Create with mode 0700; tightens an existing looser dir too.
-pub fn ensure_dir_0700(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-}
-
-/// Create 0644 (truncating). Models are public artifacts — no 0600 required.
+/// Open a fresh, truncated model tmp file for writing. Mode 0644 on
+/// Unix (models are public blobs — no 0600 required); default DACL on
+/// Windows.
 pub fn open_model_tmp(path: &Path) -> io::Result<fs::File> {
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o644)
-        .open(path)
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    set_world_readable_create_mode(&mut opts);
+    opts.open(path)
 }
 
-/// Atomic install. `tmp` and `dst` must be on the same FS (`tmp_path_for` ensures this).
+/// Atomic install. `tmp` and `dst` must be on the same FS
+/// (`tmp_path_for` ensures this). On Unix the file is chmodded to 0644
+/// pre-rename so a restrictive umask doesn't leave it owner-only; on
+/// Windows no mode is set (Windows files inherit the parent DACL).
 pub fn install_model_atomic(tmp: &Path, dst: &Path) -> Result<()> {
-    fs::set_permissions(tmp, fs::Permissions::from_mode(0o644))
-        .with_context(|| format!("chmod 0644 {}", tmp.display()))?;
+    set_world_readable_existing_mode(tmp)
+        .with_context(|| format!("setting world-readable mode on {}", tmp.display()))?;
     fs::rename(tmp, dst).with_context(|| format!("renaming {} → {}", tmp.display(), dst.display()))
+}
+
+#[cfg(unix)]
+fn set_world_readable_create_mode(opts: &mut fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.mode(0o644);
+}
+
+#[cfg(windows)]
+fn set_world_readable_create_mode(_opts: &mut fs::OpenOptions) {}
+
+#[cfg(unix)]
+fn set_world_readable_existing_mode(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+}
+
+#[cfg(windows)]
+fn set_world_readable_existing_mode(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Best-effort cleanup of `.tebis.tmp` leftovers. Must not block startup.
@@ -101,29 +125,36 @@ mod tests {
         p
     }
 
+    // Mode-bit assertions are Unix-only. The Windows secure_file
+    // backend uses DACL inheritance — no mode concept to check.
+    #[cfg(unix)]
     #[test]
-    fn ensure_dir_0700_creates_with_mode() {
+    fn models_dir_helper_tightens_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = unique_tmpdir("mkdir");
         let nested = tmp.join("a/b/c");
-        ensure_dir_0700(&nested).unwrap();
-        let meta = fs::metadata(&nested).unwrap();
-        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        secure_file::ensure_private_dir(&nested).unwrap();
+        assert_eq!(fs::metadata(&nested).unwrap().permissions().mode() & 0o777, 0o700);
         fs::remove_dir_all(&tmp).ok();
     }
 
+    #[cfg(unix)]
     #[test]
-    fn ensure_dir_0700_tightens_existing() {
+    fn models_dir_helper_tightens_existing_looser_dir() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = unique_tmpdir("tighten");
         let d = tmp.join("loose");
         fs::create_dir(&d).unwrap();
         fs::set_permissions(&d, fs::Permissions::from_mode(0o777)).unwrap();
-        ensure_dir_0700(&d).unwrap();
+        secure_file::ensure_private_dir(&d).unwrap();
         assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
         fs::remove_dir_all(&tmp).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn open_model_tmp_creates_0644() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = unique_tmpdir("open0644");
         let p = tmp.join("m.bin");
         let _f = open_model_tmp(&p).unwrap();
@@ -131,8 +162,10 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_model_atomic_renames_and_sets_0644() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = unique_tmpdir("install");
         let tmp_file = tmp.join("m.bin.tebis.tmp");
         fs::write(&tmp_file, b"payload").unwrap();

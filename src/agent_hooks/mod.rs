@@ -15,10 +15,11 @@ pub mod test_support;
 pub use agent::{AgentKind, HooksMode};
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+
+use crate::platform::secure_file;
 
 const CLAUDE_HOOK_FILE: &str = "claude-hook.sh";
 const COPILOT_HOOK_FILE: &str = "copilot-hook.sh";
@@ -81,8 +82,8 @@ pub fn materialize(agent: AgentKind) -> Result<PathBuf> {
     if needs_write {
         jsonfile::atomic_write_bytes(&path, content.as_bytes())?;
     }
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod 0700 {}", path.display()))?;
+    secure_file::set_owner_executable(&path)
+        .with_context(|| format!("set owner-executable on {}", path.display()))?;
     Ok(path)
 }
 

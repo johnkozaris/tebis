@@ -219,7 +219,8 @@ impl FetchClient {
         }
 
         if let Some(parent) = tmp_path.parent() {
-            cache::ensure_dir_0700(parent).map_err(FetchError::from_io)?;
+            crate::platform::secure_file::ensure_private_dir(parent)
+                .map_err(FetchError::from_io)?;
         }
         let file = cache::open_model_tmp(tmp_path).map_err(FetchError::from_io)?;
         let mut tee = TeeWriter::new(file);
