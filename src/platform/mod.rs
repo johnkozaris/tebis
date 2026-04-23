@@ -13,4 +13,6 @@
 //!    root via `#[cfg(unix)] pub use unix::*;` / windows equivalent.
 //! 4. Callers only reach in via `crate::platform::<name>::…`.
 
+pub mod hostname;
+pub mod process;
 pub mod signal;

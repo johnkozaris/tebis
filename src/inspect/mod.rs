@@ -179,7 +179,7 @@ fn bind_with_takeover(addr: SocketAddr) -> Result<std::net::TcpListener> {
                         "Port {} held by a stale tebis process — killing and reclaiming",
                         addr.port()
                     );
-                    kill_and_wait(holder.pid);
+                    crate::platform::process::kill_and_wait(holder.pid);
                     std::net::TcpListener::bind(addr)
                         .with_context(|| format!("inspect: rebind {addr} after takeover"))
                 }
@@ -252,44 +252,12 @@ fn is_tebis_process(pid: u32) -> bool {
     base == "tebis" || base == "inspect-demo"
 }
 
-const TERM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-const TERM_POLL_ATTEMPTS: usize = 30;
-const POST_SIGKILL_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
-
-/// SIGTERM + wait + SIGKILL. Synchronous — caller is startup-time only.
-fn kill_and_wait(pid: u32) {
-    // SAFETY: `kill(2)` with a valid pid is sound. `pid` as i32 can only
-    // misbehave for pids ≥ 2^31, which no real system emits.
-    unsafe {
-        libc::kill(pid.cast_signed(), libc::SIGTERM);
-    }
-    for _ in 0..TERM_POLL_ATTEMPTS {
-        std::thread::sleep(TERM_POLL_INTERVAL);
-        // SAFETY: `kill(pid, 0)` is the standard "does this pid exist?"
-        // probe. Returns 0 if alive, -1 with ESRCH if gone.
-        let alive = unsafe { libc::kill(pid.cast_signed(), 0) } == 0;
-        if !alive {
-            return;
-        }
-    }
-    tracing::warn!(pid, "stale process didn't exit on SIGTERM; sending SIGKILL");
-    unsafe {
-        libc::kill(pid.cast_signed(), libc::SIGKILL);
-    }
-    std::thread::sleep(POST_SIGKILL_WAIT);
-}
-
+/// Re-exported so inspect callers can keep `inspect::hostname()`; the
+/// actual impl lives in `crate::platform::hostname` to keep the unix /
+/// windows split out of the dashboard code.
 #[must_use]
 pub fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    // SAFETY: `gethostname` writes at most `buf.len()` bytes into our
-    // buffer; no preconditions.
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
-    if rc != 0 {
-        return "(unknown)".to_string();
-    }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..end]).into_owned()
+    crate::platform::hostname::current()
 }
 
 pub async fn tmux_version() -> String {
