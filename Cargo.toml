@@ -49,14 +49,13 @@ whisper-rs = {version = "0.16", default-features = false, features = ["metal"]}
 [target.'cfg(target_os = "linux")'.dependencies]
 whisper-rs = {version = "0.16", default-features = false}
 
-[features]
-default = []
-kokoro = ["dep:tebis-tts-kokoro"]
-
 [dependencies.tebis-tts-kokoro]
 optional = true
 path = "crates/tebis-tts-kokoro"
-version = "0.1"
+
+[features]
+default = []
+kokoro = ["dep:tebis-tts-kokoro"]
 
 [[example]]
 name = "audio-smoke"
