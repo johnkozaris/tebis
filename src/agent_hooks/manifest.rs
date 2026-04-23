@@ -2,8 +2,6 @@
 //! read/write failures log warn but never block install/uninstall.
 
 use std::fs::OpenOptions;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -42,7 +40,11 @@ fn manifest_lock_path() -> Result<PathBuf> {
     Ok(super::data_dir()?.join(MANIFEST_LOCK_FILE))
 }
 
-/// RAII `flock(2)` guard — serializes concurrent `record_install` read-modify-writes.
+/// RAII exclusive-lock guard — serializes concurrent `record_install`
+/// read-modify-writes. `File::lock` is `flock(2)` on Unix and
+/// `LockFileEx` on Windows (std since 1.89). The OS releases the lock
+/// on file close, so dropping the `File` is sufficient — do **not**
+/// `remove_file` the lock, since another waiter's `open` would race it.
 struct ManifestLock {
     _file: std::fs::File,
 }
@@ -52,24 +54,18 @@ impl ManifestLock {
         let dir = super::data_dir()?;
         std::fs::create_dir_all(&dir)?;
         let path = manifest_lock_path()?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&path)?;
-        // SAFETY: flock(2) with a valid fd + flags is sound.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error().into());
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
         }
+        let file = opts.open(&path)?;
+        file.lock()?;
         Ok(Self { _file: file })
     }
 }
-
-// Kernel releases flock on fd close. Don't `remove_file` the lock —
-// another waiter's `open` would race our removal.
 
 /// Empty on any error; logs warn.
 pub fn load_entries() -> Vec<Entry> {
