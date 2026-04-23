@@ -14,6 +14,7 @@
 //! 4. Callers only reach in via `crate::platform::<name>::…`.
 
 pub mod hostname;
+pub mod paths;
 pub mod process;
 pub mod secure_file;
 pub mod signal;

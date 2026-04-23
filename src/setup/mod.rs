@@ -268,10 +268,10 @@ fn prompt_next_action(
     }
 }
 
-/// `$HOME/.config/tebis/env`.
+/// Canonical tebis env-file path — resolved per-OS via
+/// [`crate::platform::paths::env_file_path`].
 pub fn env_file_path() -> Result<PathBuf> {
-    let home = env::var("HOME").context("HOME env var not set")?;
-    Ok(PathBuf::from(home).join(".config/tebis/env"))
+    crate::platform::paths::env_file_path()
 }
 
 #[allow(

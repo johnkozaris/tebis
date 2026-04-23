@@ -445,18 +445,22 @@ pub unsafe fn load_env_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `$XDG_RUNTIME_DIR/tebis.sock` (Linux / systemd), else
-/// `/tmp/tebis-$USER.sock` (macOS / fallback).
+/// Unix: `<runtime_dir>/tebis.sock` (UDS). See
+/// [`crate::platform::paths::runtime_dir`] for per-OS resolution.
+/// Windows: `\\.\pipe\tebis-<user>-notify` (named pipe).
+///
+/// Phase 2 will replace the `PathBuf` field on `NotifyConfig` with a
+/// platform-abstract address type; for now the pipe name is carried as
+/// a PathBuf and the listener interprets it per-OS.
+#[cfg(unix)]
 fn default_socket_path() -> Option<PathBuf> {
-    if let Ok(xdg) = env::var("XDG_RUNTIME_DIR")
-        && !xdg.is_empty()
-    {
-        return Some(PathBuf::from(xdg).join("tebis.sock"));
-    }
-    if let Ok(user) = env::var("USER")
-        && !user.is_empty()
-    {
-        return Some(PathBuf::from(format!("/tmp/tebis-{user}.sock")));
-    }
-    None
+    crate::platform::paths::runtime_dir()
+        .ok()
+        .map(|d| d.join("tebis.sock"))
+}
+
+#[cfg(windows)]
+fn default_socket_path() -> Option<PathBuf> {
+    let user = env::var("USERNAME").unwrap_or_else(|_| "user".into());
+    Some(PathBuf::from(format!(r"\\.\pipe\tebis-{user}-notify")))
 }

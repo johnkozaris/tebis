@@ -61,15 +61,10 @@ pub fn for_kind(kind: AgentKind) -> Box<dyn HookManager> {
     }
 }
 
-/// `$XDG_DATA_HOME/tebis` or `$HOME/.local/share/tebis` — tebis-owned binaries.
+/// Host-wide tebis data dir — tebis-owned binaries + hook manifest.
+/// Thin re-export of [`crate::platform::paths::data_dir`].
 pub(crate) fn data_dir() -> Result<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
-        && !xdg.is_empty()
-    {
-        return Ok(PathBuf::from(xdg).join("tebis"));
-    }
-    let home = std::env::var("HOME").context("$HOME is not set")?;
-    Ok(PathBuf::from(home).join(".local/share/tebis"))
+    crate::platform::paths::data_dir()
 }
 
 /// Write hook script to its stable path. Rewrites only on content drift;

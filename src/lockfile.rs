@@ -8,6 +8,8 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::platform::paths;
+
 pub struct LockFile {
     path: PathBuf,
     _file: File,
@@ -44,25 +46,12 @@ impl std::fmt::Display for AcquireError {
 
 impl std::error::Error for AcquireError {}
 
-/// Unix: `$XDG_RUNTIME_DIR/tebis.lock`, else `/tmp/tebis-$USER.lock`.
-/// Windows: `%LOCALAPPDATA%\tebis\tebis.lock`.
-#[cfg(unix)]
+/// `<runtime_dir>/tebis.lock` — the canonical single-instance lock.
+/// See `crate::platform::paths` for per-OS runtime-dir resolution.
+/// Falls back to `std::env::temp_dir().join("tebis.lock")` only if the
+/// runtime dir itself can't be resolved (HOME unset, no Known Folder).
 pub fn default_path() -> PathBuf {
-    use std::env;
-    if let Ok(xdg) = env::var("XDG_RUNTIME_DIR")
-        && !xdg.is_empty()
-    {
-        return PathBuf::from(xdg).join("tebis.lock");
-    }
-    let user = env::var("USER").unwrap_or_else(|_| "unknown".into());
-    PathBuf::from(format!("/tmp/tebis-{user}.lock"))
-}
-
-#[cfg(windows)]
-pub fn default_path() -> PathBuf {
-    directories::ProjectDirs::from("", "", "tebis")
-        .map(|p| p.data_local_dir().join("tebis.lock"))
-        .unwrap_or_else(|| std::env::temp_dir().join("tebis.lock"))
+    paths::lock_file_path().unwrap_or_else(|_| std::env::temp_dir().join("tebis.lock"))
 }
 
 /// Exclusive non-blocking lock. On Unix `mode(0o600)` avoids the
