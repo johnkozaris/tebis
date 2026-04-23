@@ -50,6 +50,20 @@ opus = "0.3"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.185"
 
+# Win32 bindings for the Windows-side primitives: named-pipe DACLs,
+# ImpersonateNamedPipeClient + TokenUser SID check (notify peer auth,
+# invariant 20), process termination via TerminateProcess, etc. The
+# feature set is the minimum needed by each platform::windows backend
+# — we extend it per subsystem as phases land.
+[target.'cfg(windows)'.dependencies]
+windows = {version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+]}
+
 # whisper-rs: Metal GPU on macOS, CPU on Linux.
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = {version = "0.16", default-features = false, features = ["metal"]}

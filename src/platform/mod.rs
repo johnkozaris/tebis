@@ -15,6 +15,7 @@
 
 pub mod hostname;
 pub mod paths;
+pub mod peer_listener;
 pub mod process;
 pub mod secure_file;
 pub mod signal;
