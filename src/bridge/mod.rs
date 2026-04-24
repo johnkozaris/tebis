@@ -302,24 +302,12 @@ fn switch_tts_backend(ctx: &HandlerContext, value: &str) -> Response {
         path = %env_path.display(),
         "/tts: env updated, scheduling graceful restart"
     );
-    schedule_graceful_restart(&ctx.shutdown);
+    crate::shutdown::schedule_graceful_restart(&ctx.shutdown);
     let msg = format!(
         "TTS → <code>{}</code>. Restarting in ~300 ms to apply.",
         sanitize::escape_html(value),
     );
     Response::Text(msg)
-}
-
-/// Cancel the root shutdown token after a short delay so the in-flight
-/// reply has time to flush to Telegram before the process exits. The
-/// service manager (launchd / systemd) respawns per its keep-alive
-/// policy. Mirrors `inspect::server::schedule_graceful_restart`.
-fn schedule_graceful_restart(shutdown: &CancellationToken) {
-    let shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        shutdown.cancel();
-    });
 }
 
 /// Invariant 18: cap transcript bytes fed into `parse` so long voice

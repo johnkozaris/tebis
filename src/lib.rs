@@ -23,5 +23,6 @@ pub mod sanitize;
 pub mod security;
 pub mod service;
 pub mod setup;
+pub mod shutdown;
 pub mod telegram;
 pub mod tmux;

@@ -3,7 +3,6 @@
 use std::convert::Infallible;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -133,7 +132,7 @@ async fn handle(
                 return Ok(text_response(StatusCode::FORBIDDEN, "forbidden\n"));
             }
             tracing::warn!("Inspect: restart requested");
-            schedule_graceful_restart(&live.shutdown);
+            crate::shutdown::schedule_graceful_restart(&live.shutdown);
             Ok(redirect_to("/"))
         }
         (&Method::POST, "/actions/config") => {
@@ -227,17 +226,8 @@ async fn handle_config_post(
         path = %env_file,
         "Inspect: config updated, restarting"
     );
-    schedule_graceful_restart(&live.shutdown);
+    crate::shutdown::schedule_graceful_restart(&live.shutdown);
     Ok(redirect_to("/"))
-}
-
-/// Delay before cancelling so the in-flight redirect flushes.
-fn schedule_graceful_restart(shutdown: &CancellationToken) {
-    let shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        shutdown.cancel();
-    });
 }
 
 /// Parse form-urlencoded into validated env updates. Whitelist-only, range-checked.
