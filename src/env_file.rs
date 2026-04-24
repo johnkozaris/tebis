@@ -9,8 +9,9 @@ use anyhow::{Context as _, Result, bail};
 use crate::platform::secure_file;
 
 /// Atomic owner-private write of an env file. Unix: mode 0600 with umask-bypass
+///
 /// + post-write chmod. Windows: owner-only DACL set at `CreateFileW`
-/// (`D:P(A;;FA;;;<OUR_SID>)`) then `MoveFileExW(REPLACE_EXISTING)`. Invariant 20.
+///   (`D:P(A;;FA;;;<OUR_SID>)`) then `MoveFileExW(REPLACE_EXISTING)`. Invariant 20.
 pub fn atomic_write_0600(path: &Path, content: &str) -> Result<()> {
     secure_file::atomic_write_private(path, content.as_bytes())
         .with_context(|| format!("atomic private write of {}", path.display()))

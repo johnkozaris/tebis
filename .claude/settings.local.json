@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(rustc *)",
+      "PowerShell(Test-Path *)",
+      "PowerShell(Get-Command *)",
+      "PowerShell(winget list *)",
+      "PowerShell(winget search *)",
+      "PowerShell",
+      "Bash",
+      "Read"
+    ]
+  }
+}

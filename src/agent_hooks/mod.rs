@@ -89,7 +89,8 @@ pub(crate) fn data_dir() -> Result<PathBuf> {
 /// re-chmods unconditionally so a manual `chmod 0777` gets retightened.
 pub fn materialize(agent: AgentKind) -> Result<PathBuf> {
     let dir = data_dir()?;
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    crate::platform::secure_file::ensure_private_dir(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
     let (name, content) = match agent {
         AgentKind::Claude => (CLAUDE_HOOK_FILE, CLAUDE_HOOK_SCRIPT),
         AgentKind::Copilot => (COPILOT_HOOK_FILE, COPILOT_HOOK_SCRIPT),

@@ -203,7 +203,10 @@ mod tests {
                 let arr = doc["hooks"][event].as_array().unwrap();
                 assert_eq!(arr.len(), 1);
                 assert_eq!(arr[0]["type"], "command");
-                assert_eq!(arr[0]["bash"], script.to_string_lossy().into_owned());
+                // On Unix `bash` holds the raw script path; on Windows it's
+                // the `powershell.exe … -File "<path>"` wrapper from
+                // `super::script_command` — match the installer's behavior.
+                assert_eq!(arr[0]["bash"], super::super::script_command(script));
             }
         });
     }

@@ -54,12 +54,28 @@ pub struct Mux {
     max_output_chars: usize,
 }
 
-/// Invariant 13: `=NAME:0` — `=` forces exact match (`-t foo` prefix-matches
-/// `foobar`); `:0` is required so pane-oriented verbs (send-keys, capture-pane)
-/// resolve the target — bare `=NAME` fails there with "can't find pane".
+/// Invariant 13: on tmux, `exact_target` is `=NAME:0` — `=` forces exact match
+/// (`-t foo` prefix-matches `foobar`); `:0` is required so pane-oriented verbs
+/// (`send-keys`, `capture-pane`) resolve the target.
+///
+/// psmux does NOT prefix-match at all and treats a leading `=` as a literal
+/// character — so on Windows we use the bare name with `:0`. The security
+/// property (no cross-session landing) is preserved by psmux's exact-match
+/// semantics; the `=` would actively break every `-t` call.
 struct SessionSlot {
     exact_target: String,
     lock: Mutex<()>,
+}
+
+/// Build the `-t` value for this platform's multiplexer. See the
+/// `SessionSlot` docstring for why Windows can't use the `=` prefix.
+#[cfg(unix)]
+fn exact_target_for(name: &str) -> String {
+    format!("={name}:0")
+}
+#[cfg(windows)]
+fn exact_target_for(name: &str) -> String {
+    format!("{name}:0")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -105,7 +121,7 @@ impl Mux {
         let strict = allowed
             .into_iter()
             .map(|name| {
-                let exact_target = format!("={name}:0");
+                let exact_target = exact_target_for(&name);
                 (
                     name,
                     Arc::new(SessionSlot {
@@ -179,11 +195,18 @@ impl Mux {
 
         tokio::time::sleep(SUBMIT_GAP).await;
 
-        let out = run_mux(
-            "send-keys",
-            &["send-keys", "-t", &slot.exact_target, "-H", "0d"],
-        )
-        .await?;
+        // Invariant 3 second call: send Enter. tmux accepts `-H 0d`
+        // (literal CR as hex). psmux has no `-H` flag; the only Enter
+        // path is the tmux key-name syntax passed as its own argv
+        // entry — which is fine because each call is a separate spawn
+        // (no space-interpolation shell-parse ambiguity), and we still
+        // hold the per-session mutex so the pair lands atomically on
+        // one agent turn.
+        #[cfg(unix)]
+        let enter_args: [&str; 5] = ["send-keys", "-t", &slot.exact_target, "-H", "0d"];
+        #[cfg(windows)]
+        let enter_args: [&str; 4] = ["send-keys", "-t", &slot.exact_target, "Enter"];
+        let out = run_mux("send-keys", &enter_args).await?;
         classify_status(&out, "send-keys", session)?;
 
         Ok(())
@@ -285,7 +308,7 @@ impl Mux {
                 return Ok(slot.clone());
             }
             let fresh = Arc::new(SessionSlot {
-                exact_target: format!("={session}:0"),
+                exact_target: exact_target_for(session),
                 lock: Mutex::new(()),
             });
             map.insert(session.to_string(), fresh.clone());
@@ -318,6 +341,10 @@ fn classify_status(output: &std::process::Output, op: &'static str, session: &st
         || stderr_lc.contains("can't find pane")
         || stderr_lc.contains("session not found")
         || stderr_lc.contains("no such session")
+        // psmux's send-keys / capture-pane phrase NotFound as
+        // "psmux: no server running on session 'X'". Fold it here so
+        // invariant-15 stale-target recovery fires on Windows too.
+        || stderr_lc.contains("no server running on")
     {
         return Err(MuxError::NotFound(session.to_string()));
     }

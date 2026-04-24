@@ -20,5 +20,6 @@ pub mod peer_listener;
 pub mod process;
 pub mod secure_file;
 pub mod signal;
+pub mod tts_support;
 #[cfg(windows)]
 pub(crate) mod windows_auth;

@@ -33,9 +33,9 @@ use std::sync::Mutex;
 
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
-use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Security::{EqualSid, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY};
-use windows::Win32::System::Pipes::{ImpersonateNamedPipeClient, RevertToSelf};
+use windows::Win32::Foundation::{FALSE, HANDLE};
+use windows::Win32::Security::{EqualSid, PSID, RevertToSelf, SECURITY_ATTRIBUTES, TOKEN_QUERY};
+use windows::Win32::System::Pipes::ImpersonateNamedPipeClient;
 use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
 use crate::platform::windows_auth::{
@@ -66,6 +66,17 @@ pub struct Listener {
     pending: Mutex<Option<NamedPipeServer>>,
 }
 
+// SAFETY: The raw pointers inside `OwnedSecurityDescriptor` (a
+// LocalAlloc'd SECURITY_DESCRIPTOR) and inside `SECURITY_ATTRIBUTES`
+// (`lpSecurityDescriptor` aliasing the same allocation) have no thread
+// affinity — they point into a process-wide heap allocation that
+// `LocalFree` can run from any thread. The `Listener` owns both
+// exclusively and exposes no raw-pointer API, so moving it across
+// threads is safe. `Sync` follows from the interior mutability being
+// limited to `Mutex<Option<NamedPipeServer>>` (itself `Sync`).
+unsafe impl Send for Listener {}
+unsafe impl Sync for Listener {}
+
 impl Listener {
     pub fn bind(path: &Path) -> io::Result<Self> {
         let our_sid = current_user_sid().map_err(to_io)?;
@@ -78,7 +89,7 @@ impl Listener {
         let mut security_attrs = Box::new(SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: descriptor.as_ptr(),
-            bInheritHandle: windows::Win32::Foundation::BOOL(0),
+            bInheritHandle: FALSE,
         });
 
         let first = unsafe {

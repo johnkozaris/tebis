@@ -213,6 +213,10 @@ const fn package_name_for(pm: PackageManager) -> &'static str {
 mod tests {
     use super::*;
 
+    /// `candidate_paths()` only has entries on macOS+Linux; on Windows
+    /// the user supplies `ORT_DYLIB_PATH` manually (no package-manager
+    /// auto-install is wired up yet).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn candidate_paths_non_empty() {
         let paths = candidate_paths();

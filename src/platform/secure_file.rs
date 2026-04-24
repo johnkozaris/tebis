@@ -47,7 +47,7 @@ mod unix {
 
     pub fn atomic_write_private(path: &Path, content: &[u8]) -> io::Result<()> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            ensure_private_dir(parent)?;
         }
         let tmp = path.with_file_name(format!(
             "{}.tmp",
@@ -97,7 +97,7 @@ mod windows {
     use std::os::windows::io::FromRawHandle;
     use std::path::Path;
 
-    use windows::Win32::Foundation::GENERIC_WRITE;
+    use windows::Win32::Foundation::{FALSE, GENERIC_WRITE};
     use windows::Win32::Security::SECURITY_ATTRIBUTES;
     use windows::Win32::Storage::FileSystem::{
         CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE,
@@ -118,14 +118,14 @@ mod windows {
 
     pub fn atomic_write_private(path: &Path, content: &[u8]) -> io::Result<()> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            ensure_private_dir(parent)?;
         }
         let tmp = path.with_file_name(format!(
             "{}.tmp",
             path.file_name().and_then(|n| n.to_str()).unwrap_or("env")
         ));
 
-        // Build an owner-only SECURITY_ATTRIBUTES. `FA` = FILE_ALL_ACCESS
+        // Build an owner-only SECURITY_ATTRIBUTES.`FA` = FILE_ALL_ACCESS
         // — the narrowest grant that covers read+write+delete for the
         // owner. Protected DACL (`D:P`) prevents parent dir inheritance
         // from ever widening the ACL.
@@ -137,7 +137,7 @@ mod windows {
         let sa = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: descriptor.as_ptr(),
-            bInheritHandle: windows::Win32::Foundation::BOOL(0),
+            bInheritHandle: FALSE,
         };
 
         let tmp_wide = to_wide(&tmp);
@@ -183,14 +183,82 @@ mod windows {
     }
 
     pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
-        fs::create_dir_all(path)
-        // Dirs inherit their DACL from the parent. On a normal tebis
-        // install that parent is `%LOCALAPPDATA%\tebis\` (per-user,
-        // owner-only on modern Windows), so inheritance suffices.
-        // If that turns out to be insufficient (e.g. a test override
-        // pointing somewhere shared), extend this with
-        // SetNamedSecurityInfoW + a DACL identical to the one
-        // atomic_write_private uses.
+        fs::create_dir_all(path)?;
+        tighten_dir_dacl(path)
+    }
+
+    /// Apply an owner-only protected DACL to `path` via
+    /// `SetNamedSecurityInfoW`. Called by [`ensure_private_dir`] after
+    /// `create_dir_all` so whether the directory was just created with
+    /// default inheritance or pre-existed with looser permissions, we
+    /// end up with the same narrow ACL (`D:P(A;;FA;;;<OUR_SID>)`).
+    ///
+    /// We only touch `DACL_SECURITY_INFORMATION` + `PROTECTED_DACL_SECURITY_INFORMATION`,
+    /// leaving owner/group alone. Setting owner requires `SeRestorePrivilege`,
+    /// which a user-mode daemon doesn't hold; the default owner on
+    /// newly-created dirs is already the current user, so leaving it
+    /// alone is both correct and safer.
+    fn tighten_dir_dacl(path: &Path) -> io::Result<()> {
+        use windows::Win32::Security::{
+            ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        use windows::Win32::Security::Authorization::{
+            SE_FILE_OBJECT, SetNamedSecurityInfoW,
+        };
+        use windows::core::BOOL;
+
+        let our_sid = current_user_sid().map_err(to_io)?;
+        let sid_str = sid_to_string(&our_sid).map_err(to_io)?;
+        let sddl = owner_only_sddl(&sid_str, "FA");
+        let descriptor = OwnedSecurityDescriptor::from_sddl(&sddl).map_err(to_io)?;
+
+        let mut dacl_present = BOOL(0);
+        let mut dacl_ptr: *mut ACL = std::ptr::null_mut();
+        let mut dacl_defaulted = BOOL(0);
+        // SAFETY: `descriptor` is a well-formed self-relative SD from SDDL;
+        // we pass addresses of stack locals for the out params.
+        unsafe {
+            GetSecurityDescriptorDacl(
+                windows::Win32::Security::PSECURITY_DESCRIPTOR(descriptor.as_ptr()),
+                &mut dacl_present,
+                &mut dacl_ptr,
+                &mut dacl_defaulted,
+            )
+            .map_err(to_io)?;
+        }
+        if dacl_present.0 == 0 || dacl_ptr.is_null() {
+            return Err(io::Error::other(
+                "secure_file: SDDL did not produce a present DACL (internal error)",
+            ));
+        }
+
+        let path_wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // SetNamedSecurityInfoW returns WIN32_ERROR (0 == ERROR_SUCCESS).
+        // Wrap in `windows::core::Error::from_win32()`-style handling via
+        // the return value.
+        // SAFETY: `path_wide` is NUL-terminated; `dacl_ptr` is valid for
+        // the lifetime of `descriptor`, which outlives this call.
+        let rc = unsafe {
+            SetNamedSecurityInfoW(
+                PCWSTR(path_wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(dacl_ptr as *const ACL),
+                None,
+            )
+        };
+        if rc.0 != 0 {
+            return Err(io::Error::from_raw_os_error(rc.0 as i32));
+        }
+        Ok(())
     }
 
     /// No-op on Windows. Hook scripts on Windows are `.ps1` files

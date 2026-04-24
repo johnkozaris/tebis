@@ -6,6 +6,7 @@ use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input, Select};
 
 use super::super::{TtsChoice, ui};
+use crate::platform::tts_support::{kokoro_local_auto_install_supported, say_backend_supported};
 
 pub(in crate::setup) fn step_tts(
     theme: &ColorfulTheme,
@@ -57,7 +58,9 @@ pub(in crate::setup) fn step_tts(
     }
 }
 
-/// macOS → `say`; Linux → Kokoro local (auto-installs espeak-ng). Falls through to `Off` on failure.
+/// macOS → `say`; Linux → Kokoro local (auto-installs espeak-ng). Windows →
+/// surfaces `kokoro-remote` as the only simple path (no pkg-manager driver
+/// for espeak-ng / onnxruntime yet). Falls through to `Off` on failure.
 fn simple_tts(
     theme: &ColorfulTheme,
     existing: Option<&TtsChoice>,
@@ -75,12 +78,13 @@ fn simple_tts(
             style("say").bold(),
             style(&voice).bold(),
         );
-        Ok(Some(TtsChoice::Say {
+        return Ok(Some(TtsChoice::Say {
             voice,
             respond_to_all,
-        }))
+        }));
     }
-    #[cfg(not(target_os = "macos"))]
+
+    #[cfg(target_os = "linux")]
     {
         println!();
         println!(
@@ -89,34 +93,78 @@ fn simple_tts(
             style("espeak-ng").bold(),
             style("onnxruntime").bold(),
         );
-        let espeak = super::super::phonemizer::ensure_or_install(theme)
-            .context("probing / installing espeak-ng")?;
-        let ort = super::super::onnxruntime::ensure_or_install(theme)
-            .context("probing / installing onnxruntime")?;
-        match (espeak, ort) {
-            (
-                super::super::phonemizer::EnsureOutcome::Ready(_),
-                super::super::onnxruntime::EnsureOutcome::Ready(ort_path),
-            ) => {
-                let model = default_tts_model();
-                let voice = existing_voice_or(existing, "af_sarah");
-                Ok(Some(TtsChoice::KokoroLocal {
-                    model,
-                    voice,
-                    respond_to_all,
-                    ort_dylib_path: Some(ort_path.to_string_lossy().into_owned()),
-                }))
-            }
-            _ => {
-                println!();
-                println!(
-                    "   {} Continuing with text-only replies. Re-run {} later",
-                    style("→").dim(),
-                    style("tebis setup").bold(),
-                );
-                println!("     after installing the missing dependency to enable voice replies.");
-                Ok(Some(TtsChoice::Off))
-            }
+        return kokoro_local_simple_flow(theme, existing, respond_to_all);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        // Windows and other targets: no auto-install path for the
+        // Kokoro-local dependencies. Offer remote as the one-step simple
+        // option; Advanced still exposes Kokoro-local for users with a
+        // hand-installed ONNX Runtime DLL.
+        let _ = (theme, respond_to_all);
+        debug_assert!(!kokoro_local_auto_install_supported());
+        println!();
+        println!(
+            "  {} Local TTS dependencies ({} + {}) don't have an auto-install \
+             path on this OS yet.",
+            style("ℹ").cyan(),
+            style("espeak-ng").bold(),
+            style("onnxruntime").bold(),
+        );
+        println!(
+            "  Choose {} for a network-hosted voice, or {} to stay text-only.",
+            style("Advanced → Kokoro (remote)").bold(),
+            style("Skip").bold(),
+        );
+        let want_remote = Confirm::with_theme(theme)
+            .with_prompt("Configure Kokoro (remote) now?")
+            .default(false)
+            .interact()
+            .context("prompt: simple windows remote")?;
+        if want_remote {
+            return configure_kokoro_remote(theme, existing, respond_to_all);
+        }
+        Ok(Some(TtsChoice::Off))
+    }
+}
+
+/// Probe-and-install Kokoro-local dependencies, preserving existing config on
+/// transient failure. Extracted so the Linux arm of [`simple_tts`] stays
+/// readable after the per-OS cfg split.
+#[cfg(target_os = "linux")]
+fn kokoro_local_simple_flow(
+    theme: &ColorfulTheme,
+    existing: Option<&TtsChoice>,
+    respond_to_all: bool,
+) -> Result<Option<TtsChoice>> {
+    let espeak = super::super::phonemizer::ensure_or_install(theme)
+        .context("probing / installing espeak-ng")?;
+    let ort = super::super::onnxruntime::ensure_or_install(theme)
+        .context("probing / installing onnxruntime")?;
+    match (espeak, ort) {
+        (
+            super::super::phonemizer::EnsureOutcome::Ready(_),
+            super::super::onnxruntime::EnsureOutcome::Ready(ort_path),
+        ) => {
+            let model = default_tts_model();
+            let voice = existing_voice_or(existing, "af_sarah");
+            Ok(Some(TtsChoice::KokoroLocal {
+                model,
+                voice,
+                respond_to_all,
+                ort_dylib_path: Some(ort_path.to_string_lossy().into_owned()),
+            }))
+        }
+        _ => {
+            println!();
+            println!(
+                "   {} Continuing with text-only replies. Re-run {} later",
+                style("→").dim(),
+                style("tebis setup").bold(),
+            );
+            println!("     after installing the missing dependency to enable voice replies.");
+            Ok(Some(TtsChoice::Off))
         }
     }
 }
@@ -148,8 +196,9 @@ fn advanced_tts(
                 Pick::KokoroRemote,
             ),
         ];
-        #[cfg(target_os = "macos")]
-        v.push(("Say (macOS only)  — built-in, lower quality", Pick::Say));
+        if say_backend_supported() {
+            v.push(("Say (macOS only)  — built-in, lower quality", Pick::Say));
+        }
         v.push(("None              — text-only replies", Pick::None));
         v
     };
@@ -157,11 +206,9 @@ fn advanced_tts(
     let default_idx: usize = match existing {
         Some(TtsChoice::KokoroLocal { .. }) => 0,
         Some(TtsChoice::KokoroRemote { .. }) => 1,
-        #[cfg(target_os = "macos")]
-        Some(TtsChoice::Say { .. }) => 2,
-        Some(TtsChoice::Off) | None => options.len().saturating_sub(1),
-        #[cfg(not(target_os = "macos"))]
+        Some(TtsChoice::Say { .. }) if say_backend_supported() => 2,
         Some(TtsChoice::Say { .. }) => 0,
+        Some(TtsChoice::Off) | None => options.len().saturating_sub(1),
     };
 
     let labels: Vec<&str> = options.iter().map(|(l, _)| *l).collect();

@@ -66,6 +66,7 @@ pub fn detect_package_manager() -> Option<PackageManager> {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn binary_on_path(name: &str) -> bool {
     crate::audio::espeak::which_in_path(name).is_some()
 }

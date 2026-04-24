@@ -104,6 +104,10 @@ required-features = ["kokoro"]
 name = "tts-bench"
 path = "e2e/tts-bench.rs"
 
+[[example]]
+name = "mux-smoke"
+path = "e2e/mux-smoke.rs"
+
 [profile.release]
 codegen-units = 1
 debug = false

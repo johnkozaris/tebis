@@ -54,15 +54,17 @@ pub fn default_path() -> PathBuf {
     paths::lock_file_path().unwrap_or_else(|_| std::env::temp_dir().join("tebis.lock"))
 }
 
-/// Exclusive non-blocking lock. On Unix `mode(0o600)` avoids the
-/// open→chmod TOCTOU; on Windows the file inherits DACLs from
-/// `%LOCALAPPDATA%\tebis\`, which is user-private by default.
+/// Exclusive non-blocking lock. Parent dir is always hardened to owner-only
+/// via [`secure_file::ensure_private_dir`] before opening. On Unix we also
+/// pass `mode(0o600)` so the pidfile inode is private from creation (avoids
+/// the open→chmod TOCTOU); on Windows the owner-only DACL on the parent
+/// dir blocks cross-user access to newly-created children.
 pub fn acquire(path: &Path) -> Result<LockFile, AcquireError> {
     // `$XDG_RUNTIME_DIR` can be GC'd at logout; create it so errors are clear.
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent).map_err(AcquireError::Io)?;
+        crate::platform::secure_file::ensure_private_dir(parent).map_err(AcquireError::Io)?;
     }
 
     let mut opts = OpenOptions::new();
@@ -141,6 +143,12 @@ mod tests {
         assert!(!path.exists(), "drop should remove the lockfile");
     }
 
+    // Windows `LockFileEx` blocks cross-handle `ReadFile`, so `read_to_string`
+    // from a second process/handle fails while the lock is held. That makes
+    // peer-PID discovery from *outside* the holder a POSIX-only capability
+    // today. The lock itself (mutual exclusion) works on both platforms —
+    // these tests only verify the UX of surfacing the holding PID.
+    #[cfg(unix)]
     #[test]
     fn second_acquire_returns_locked_with_pid() {
         let path = unique_tmp_path("double-acquire");
@@ -163,6 +171,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(unix)]
     #[test]
     fn active_holder_reports_pid_when_held() {
         let path = unique_tmp_path("held");

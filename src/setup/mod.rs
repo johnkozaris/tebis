@@ -466,6 +466,7 @@ fn normalize_dir(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::env;
 
     #[test]
@@ -486,7 +487,10 @@ mod tests {
         assert_eq!(tmp, Path::new("/tmp/tebis/env.tmp"));
     }
 
-    /// Single test because `env::set_var` is process-wide.
+    /// Single test because `env::set_var` is process-wide. Unix-only: the
+    /// assertions hard-code POSIX-style path formatting (`/Users/…`,
+    /// forward slashes) that `Path::join` rewrites with `\` on Windows.
+    #[cfg(unix)]
     #[test]
     fn normalize_dir_all_shapes() {
         let prior = env::var("HOME").ok();

@@ -52,7 +52,7 @@ struct ManifestLock {
 impl ManifestLock {
     fn acquire() -> Result<Self> {
         let dir = super::data_dir()?;
-        std::fs::create_dir_all(&dir)?;
+        crate::platform::secure_file::ensure_private_dir(&dir)?;
         let path = manifest_lock_path()?;
         let mut opts = OpenOptions::new();
         opts.read(true).write(true).create(true).truncate(false);

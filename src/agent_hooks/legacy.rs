@@ -6,6 +6,11 @@ use std::path::Path;
 /// and a JSON walk would miss invalid-shape user edits. Matches both the
 /// Unix `.sh` form and the Windows `.ps1` form so upgrades from an older
 /// install on either platform surface in the warning.
+///
+/// Windows quirk: `.claude/settings.local.json` stores paths with JSON-escaped
+/// backslashes (`C:\\Users\\…`), while `data_dir().to_string_lossy()` returns
+/// the raw path (`C:\Users\…`). We check both forms so our own install isn't
+/// flagged as legacy.
 pub fn scan_claude(project_dir: &Path) -> Vec<String> {
     let settings = project_dir.join(".claude/settings.local.json");
     let Ok(content) = std::fs::read_to_string(&settings) else {
@@ -15,11 +20,19 @@ pub fn scan_claude(project_dir: &Path) -> Vec<String> {
         return Vec::new();
     };
     let our_prefix = data_dir.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    let our_prefix_escaped = our_prefix.replace('\\', "\\\\");
     content
         .lines()
         .filter(|line| {
-            (line.contains("claude-hook.sh") || line.contains("claude-hook.ps1"))
-                && !line.contains(&our_prefix)
+            let hits_hook = line.contains("claude-hook.sh") || line.contains("claude-hook.ps1");
+            if !hits_hook {
+                return false;
+            }
+            let is_ours = line.contains(&our_prefix);
+            #[cfg(windows)]
+            let is_ours = is_ours || line.contains(&our_prefix_escaped);
+            !is_ours
         })
         .map(|line| line.trim().to_string())
         .collect()

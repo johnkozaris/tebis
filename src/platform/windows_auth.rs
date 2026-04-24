@@ -57,7 +57,7 @@ pub fn token_user_sid(token: HANDLE) -> windows::core::Result<Vec<u8>> {
         let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
     }
     if needed == 0 {
-        return Err(windows::core::Error::from_win32());
+        return Err(windows::core::Error::from_thread());
     }
     let mut buf = vec![0u8; needed as usize];
     unsafe {
@@ -94,7 +94,7 @@ pub fn sid_to_string(sid_bytes: &[u8]) -> windows::core::Result<String> {
         )?;
     }
     if sid_str.is_null() {
-        return Err(windows::core::Error::from_win32());
+        return Err(windows::core::Error::from_thread());
     }
     let result = unsafe { wide_to_string(sid_str) };
     unsafe {
@@ -138,7 +138,7 @@ impl OwnedSecurityDescriptor {
             )?;
         }
         if raw.0.is_null() {
-            return Err(windows::core::Error::from_win32());
+            return Err(windows::core::Error::from_thread());
         }
         Ok(Self { raw })
     }
