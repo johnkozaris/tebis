@@ -235,8 +235,9 @@ impl FetchClient {
                         None => break,
                         Some(Err(e)) => {
                             // invariant 6 — uniform redaction even for HF URLs.
-                            return Err(FetchError::Network(redact_hyper_error_string(
+                            return Err(FetchError::Network(crate::sanitize::redact_hyper_error_string(
                                 &e.to_string(),
+                                |s| crate::sanitize::contains_bot_token_shape(s) || s.contains("api.telegram.org"),
                             )));
                         }
                         Some(Ok(f)) => {
@@ -313,24 +314,6 @@ impl Write for TeeWriter {
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
     }
-}
-
-/// String-input shim for invariant 6 — `hyper::Error` can't feed `redact_network_error`.
-fn redact_hyper_error_string(s: &str) -> String {
-    if contains_bot_token_shape(s) || s.contains("api.telegram.org") {
-        return "<redacted network error>".to_string();
-    }
-    s.to_string()
-}
-
-/// Duplicates `telegram::contains_bot_token_shape` to avoid inbound coupling.
-fn contains_bot_token_shape(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    let needle = b"/bot";
-    bytes
-        .windows(needle.len())
-        .enumerate()
-        .any(|(i, w)| w == needle && bytes.get(i + needle.len()).is_some_and(u8::is_ascii_digit))
 }
 
 /// Lowercase hex — hand-rolled to avoid a `hex` crate dep.

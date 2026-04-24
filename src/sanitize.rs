@@ -72,6 +72,56 @@ pub fn escape_html(text: &str) -> String {
     String::from_utf8(out).expect("escape_html only substitutes ASCII — output is valid UTF-8")
 }
 
+// ─── Invariant 6: network-error redaction ────────────────────────────
+//
+// Shared primitives used by every hyper-error logger. Triggers differ by
+// endpoint so each caller passes its own `should_redact` predicate; the
+// scaffold (root-cause walk + "kind: <cause>" format + redacted replacement)
+// is here to prevent drift.
+
+/// True when `s` contains `/bot` followed by an ASCII digit — the Telegram
+/// Bot API URL shape (`/bot<TOKEN>/method`). Callers also check
+/// `api.telegram.org` for host-level leaks.
+pub(crate) fn contains_bot_token_shape(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let needle = b"/bot";
+    bytes
+        .windows(needle.len())
+        .enumerate()
+        .any(|(i, w)| w == needle && bytes.get(i + needle.len()).is_some_and(u8::is_ascii_digit))
+}
+
+/// Render a hyper-util error into a token-safe string. Walks to root cause,
+/// redacts when `should_redact(&raw)` returns true. Invariant 6.
+pub(crate) fn redact_hyper_error(
+    err: &hyper_util::client::legacy::Error,
+    should_redact: impl Fn(&str) -> bool,
+) -> String {
+    const MAX_SOURCE_DEPTH: usize = 16;
+    let mut cur: &dyn std::error::Error = err;
+    for _ in 0..MAX_SOURCE_DEPTH {
+        let Some(next) = cur.source() else { break };
+        cur = next;
+    }
+    let kind = if err.is_connect() { "connect" } else { "request" };
+    let raw = format!("{kind}: {cur}");
+    if should_redact(&raw) {
+        tracing::warn!("Network error contained sensitive data; replaced with redacted placeholder");
+        return format!("{kind}: <redacted network error>");
+    }
+    raw
+}
+
+/// String-input variant of [`redact_hyper_error`] for callers (e.g.
+/// `audio::fetch`) whose error types flatten to a String before reaching
+/// the redaction layer.
+pub(crate) fn redact_hyper_error_string(s: &str, should_redact: impl Fn(&str) -> bool) -> String {
+    if should_redact(s) {
+        return "<redacted network error>".to_string();
+    }
+    s.to_string()
+}
+
 /// Wrap an already-escaped body, truncating to fit Telegram's 4096 cap.
 /// Cut avoids landing inside `&amp;`-style entities and prefers the last newline.
 pub fn wrap_and_truncate(escaped_body: &str, open: &str, close: &str) -> String {
@@ -218,5 +268,53 @@ mod tests {
                 "entity truncated at byte {idx} in: {inside}"
             );
         }
+    }
+
+    #[test]
+    fn bot_token_shape_detects_digit_after_slash_bot() {
+        assert!(contains_bot_token_shape("/bot12345:ABC/getMe"));
+        assert!(contains_bot_token_shape("https://api.telegram.org/bot9/getUpdates"));
+    }
+
+    #[test]
+    fn bot_token_shape_ignores_benign_slash_bot() {
+        assert!(!contains_bot_token_shape("/bot"));
+        assert!(!contains_bot_token_shape("/bot/dir/"));
+        assert!(!contains_bot_token_shape("/robots.txt"));
+        for benign in [
+            "connect: tcp stream closed to /bot/health",
+            "request: /botanical-garden sensor error",
+            "request: unrelated string ending with /bot",
+            "connect: proxy at 10.0.0.1/bot-proxy refused",
+        ] {
+            assert!(
+                !contains_bot_token_shape(benign),
+                "tightened shape should not match benign input: {benign:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bot_token_shape_requires_digit_after_bot() {
+        assert!(contains_bot_token_shape("/bot0"));
+        assert!(contains_bot_token_shape("/bot9123456789:XYZ"));
+        assert!(!contains_bot_token_shape("/bot:"));
+        assert!(!contains_bot_token_shape("/botX"));
+    }
+
+    #[test]
+    fn redact_hyper_error_string_redacts_when_predicate_true() {
+        let raw = "connect: https://api.telegram.org/bot123:X/getUpdates refused";
+        let out = redact_hyper_error_string(raw, |s| {
+            contains_bot_token_shape(s) || s.contains("api.telegram.org")
+        });
+        assert_eq!(out, "<redacted network error>");
+    }
+
+    #[test]
+    fn redact_hyper_error_string_passes_through_when_predicate_false() {
+        let raw = "connect: dns error: no A record";
+        let out = redact_hyper_error_string(raw, |s| s.contains("Bearer "));
+        assert_eq!(out, raw);
     }
 }
