@@ -143,15 +143,21 @@ case "$EVENT" in
             exit 0
         fi
 
-        TRANSCRIPT="$(jq -r '.transcript_path // ""' <<<"$INPUT")"
         CWD="$(jq -r '.cwd // ""' <<<"$INPUT")"
         SESSION="$(jq -r '.session_id // ""' <<<"$INPUT")"
 
-        if [[ -z "$TRANSCRIPT" || ! -f "$TRANSCRIPT" ]]; then
-            exit 0
+        # Prefer inline `last_assistant_message` — Claude's transcript file
+        # writes are async, so the on-disk copy lags by one turn on Stop.
+        RAW="$(jq -r '.last_assistant_message // ""' <<<"$INPUT")"
+        if [[ -n "$RAW" ]]; then
+            SUMMARY="$(tail_trim "$RAW")"
+        else
+            TRANSCRIPT="$(jq -r '.transcript_path // ""' <<<"$INPUT")"
+            if [[ -z "$TRANSCRIPT" || ! -f "$TRANSCRIPT" ]]; then
+                exit 0
+            fi
+            SUMMARY="$(tail_of_last_assistant "$TRANSCRIPT")"
         fi
-
-        SUMMARY="$(tail_of_last_assistant "$TRANSCRIPT")"
         if [[ -n "$SUMMARY" ]]; then
             forward "$SUMMARY" "stop" "$CWD" "$SESSION"
         fi
