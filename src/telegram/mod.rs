@@ -612,38 +612,11 @@ fn build_send_voice_body(
     Bytes::from(out)
 }
 
-/// Render a hyper-util error into a token-safe string. Walks to root cause,
-/// redacts on `/bot<digit>` or `api.telegram.org`. Invariant 6. `pub(crate)`
-/// so `audio::fetch` can route its errors through the same redactor.
+/// Invariant 6: redact `/bot<digit>` or `api.telegram.org` from hyper errors.
 pub(crate) fn redact_network_error(err: &hyper_util::client::legacy::Error) -> String {
-    const MAX_SOURCE_DEPTH: usize = 16;
-    let mut cur: &dyn std::error::Error = err;
-    for _ in 0..MAX_SOURCE_DEPTH {
-        let Some(next) = cur.source() else { break };
-        cur = next;
-    }
-    let kind = if err.is_connect() {
-        "connect"
-    } else {
-        "request"
-    };
-    let raw = format!("{kind}: {cur}");
-    // Gate on `/bot<digit>` — bare `/bot` false-positives on benign paths.
-    if contains_bot_token_shape(&raw) || raw.contains("api.telegram.org") {
-        tracing::warn!("Network error contained URI-like data; replaced with redacted placeholder");
-        return format!("{kind}: <redacted network error>");
-    }
-    raw
-}
-
-/// True when `s` contains `/bot` followed by an ASCII digit.
-fn contains_bot_token_shape(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    let needle = b"/bot";
-    bytes
-        .windows(needle.len())
-        .enumerate()
-        .any(|(i, w)| w == needle && bytes.get(i + needle.len()).is_some_and(u8::is_ascii_digit))
+    crate::sanitize::redact_hyper_error(err, |raw| {
+        crate::sanitize::contains_bot_token_shape(raw) || raw.contains("api.telegram.org")
+    })
 }
 
 impl std::fmt::Debug for TelegramClient {
@@ -661,38 +634,14 @@ mod tests {
     #[test]
     fn redact_passthrough_on_clean_error() {
         let raw = "request: io: connection reset by peer";
-        assert!(!contains_bot_token_shape(raw));
+        assert!(!crate::sanitize::contains_bot_token_shape(raw));
         assert!(!raw.contains("api.telegram.org"));
     }
 
     #[test]
     fn token_substring_triggers_redaction() {
         let leaked = "request: unexpected /bot12345:abcde in error";
-        assert!(contains_bot_token_shape(leaked));
-    }
-
-    #[test]
-    fn bare_bot_path_does_not_trigger_false_positive() {
-        for benign in [
-            "connect: tcp stream closed to /bot/health",
-            "request: /botanical-garden sensor error",
-            "request: unrelated string ending with /bot",
-            "connect: proxy at 10.0.0.1/bot-proxy refused",
-        ] {
-            assert!(
-                !contains_bot_token_shape(benign),
-                "tightened shape should not match benign input: {benign:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn bot_token_shape_requires_digit_after_bot() {
-        assert!(contains_bot_token_shape("/bot0"));
-        assert!(contains_bot_token_shape("/bot9123456789:XYZ"));
-        assert!(!contains_bot_token_shape("/bot:"));
-        assert!(!contains_bot_token_shape("/bot"));
-        assert!(!contains_bot_token_shape("/botX"));
+        assert!(crate::sanitize::contains_bot_token_shape(leaked));
     }
 
     #[test]

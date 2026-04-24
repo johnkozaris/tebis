@@ -12,6 +12,7 @@ use dialoguer::{Confirm, Select};
 use crate::env_file;
 
 mod discover;
+mod installer;
 pub mod onnxruntime;
 /// `pub` so `examples/kokoro-smoke.rs` can call `probe_espeak_ng`.
 pub mod phonemizer;

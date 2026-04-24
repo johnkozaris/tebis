@@ -192,23 +192,11 @@ impl RemoteTts {
     }
 }
 
-/// Walk to root cause, redact URI/auth substrings — parallels `telegram::redact_network_error`.
+/// Remote-TTS flavour of invariant 6: redact URI/auth substrings.
 fn redact_network_error(err: &hyper_util::client::legacy::Error) -> String {
-    const MAX_SOURCE_DEPTH: usize = 16;
-    let mut cur: &dyn std::error::Error = err;
-    for _ in 0..MAX_SOURCE_DEPTH {
-        let Some(next) = cur.source() else { break };
-        cur = next;
-    }
-    let kind = if err.is_connect() { "connect" } else { "request" };
-    let raw = format!("{kind}: {cur}");
-    if raw.contains("://") || raw.contains("Bearer ") || raw.contains("Authorization") {
-        tracing::warn!(
-            "Remote-TTS network error contained URI/auth-like data; replaced with redacted placeholder"
-        );
-        return format!("{kind}: <redacted network error>");
-    }
-    raw
+    crate::sanitize::redact_hyper_error(err, |raw| {
+        raw.contains("://") || raw.contains("Bearer ") || raw.contains("Authorization")
+    })
 }
 
 impl std::fmt::Debug for RemoteTts {

@@ -16,10 +16,10 @@ use crate::platform::secure_file;
 
 const MODELS_SUBDIR: &str = "models";
 
-pub(crate) const TMP_SUFFIX: &str = ".tebis.tmp";
+const TMP_SUFFIX: &str = ".tebis.tmp";
 
 /// Same dir as `agent_hooks::data_dir` — single `platform::paths` lookup.
-pub fn base_dir() -> Result<PathBuf> {
+fn base_dir() -> Result<PathBuf> {
     crate::agent_hooks::data_dir()
 }
 

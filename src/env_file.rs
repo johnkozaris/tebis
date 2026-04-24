@@ -4,14 +4,13 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context as _, Result, bail};
 
 use crate::platform::secure_file;
 
-/// Atomic owner-private write of an env file. On Unix this is mode 0600
-/// with umask-bypass + post-write chmod; on Windows it currently writes
-/// with the parent directory's default DACL (a Phase-3 caveat — see
-/// `platform::secure_file` module docs).
+/// Atomic owner-private write of an env file. Unix: mode 0600 with umask-bypass
+/// + post-write chmod. Windows: owner-only DACL set at `CreateFileW`
+/// (`D:P(A;;FA;;;<OUR_SID>)`) then `MoveFileExW(REPLACE_EXISTING)`. Invariant 20.
 pub fn atomic_write_0600(path: &Path, content: &str) -> Result<()> {
     secure_file::atomic_write_private(path, content.as_bytes())
         .with_context(|| format!("atomic private write of {}", path.display()))
@@ -121,6 +120,8 @@ pub fn read_key(path: &Path, key: &str) -> io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn parse_kv_line_basic() {

@@ -4,14 +4,14 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use console::style;
 
-use crate::{lockfile, setup};
+use crate::{fsutil, lockfile, setup};
 
 #[cfg(target_os = "macos")]
 const MACOS_PLIST_TEMPLATE: &str = include_str!("../../contrib/macos/local.tebis.plist");
@@ -79,34 +79,9 @@ pub fn install() -> Result<()> {
     Ok(())
 }
 
-/// Tmp-then-rename 0644 write. A torn plist would break `launchctl load`.
+/// Tmp-then-rename 0644 write via [`fsutil::atomic_write`]. A torn plist would break `launchctl load`.
 fn atomic_write_0644(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    let tmp = path.with_file_name(format!(
-        "{}.tebis.tmp.{}.{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("svc"),
-        std::process::id(),
-        nanos,
-    ));
-    {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o644)
-            .open(&tmp)
-            .with_context(|| format!("opening {}", tmp.display()))?;
-        f.write_all(bytes)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", tmp.display()))?;
-    }
-    fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} → {}", tmp.display(), path.display()))?;
-    Ok(())
+    fsutil::atomic_write(path, bytes, 0o644)
 }
 
 fn install_binary(src: &Path, dst: &Path) -> Result<()> {
@@ -253,16 +228,8 @@ pub fn uninstall(purge_flag: bool) -> Result<()> {
     Ok(())
 }
 
-/// Remove all tebis-owned on-disk state: binary, env, model cache,
-/// hook manifest, materialized hook scripts. Per-project hook entries
-/// in `.claude/settings.local.json` / `.github/hooks/tebis.json` are
-/// NOT touched — we don't know which projects the user still cares
-/// about. The post-print suggests `tebis hooks uninstall <dir>` for
-/// those.
-///
-/// System packages (`espeak-ng`, installed via `brew`/`apt`/etc.
-/// during the setup wizard's Simple TTS step) stay. Auto-removing
-/// system packages is hostile; we print the one-liner at the end.
+/// Remove tebis-owned on-disk state. Per-project hook entries and system
+/// packages (espeak-ng etc.) are preserved — uninstalling them is hostile.
 fn purge_user_state(bin: &Path, env_dir: &Path, data_dir: Option<&Path>) -> Result<()> {
     println!();
     println!(

@@ -54,8 +54,9 @@ pub struct Mux {
     max_output_chars: usize,
 }
 
-/// Invariant 13: `exact_target` is `=NAME`. The `=` forces tmux exact-match;
-/// bare `-t foo` prefix-matches and would land in `foobar`.
+/// Invariant 13: `=NAME:0` — `=` forces exact match (`-t foo` prefix-matches
+/// `foobar`); `:0` is required so pane-oriented verbs (send-keys, capture-pane)
+/// resolve the target — bare `=NAME` fails there with "can't find pane".
 struct SessionSlot {
     exact_target: String,
     lock: Mutex<()>,
@@ -104,7 +105,7 @@ impl Mux {
         let strict = allowed
             .into_iter()
             .map(|name| {
-                let exact_target = format!("={name}");
+                let exact_target = format!("={name}:0");
                 (
                     name,
                     Arc::new(SessionSlot {
@@ -203,7 +204,9 @@ impl Mux {
         let slot = self.slot(session)?;
         let _guard = slot.lock.lock().await;
 
-        let mut args: Vec<&str> = vec!["new-session", "-d", "-s", &slot.exact_target];
+        // `-s` takes a bare NAME, not a target — passing `=name` would
+        // literally create a session named `=name`. Only `-t` gets the `=` prefix.
+        let mut args: Vec<&str> = vec!["new-session", "-d", "-s", session];
         if let Some(d) = dir {
             args.push("-c");
             args.push(d);
@@ -282,7 +285,7 @@ impl Mux {
                 return Ok(slot.clone());
             }
             let fresh = Arc::new(SessionSlot {
-                exact_target: format!("={session}"),
+                exact_target: format!("={session}:0"),
                 lock: Mutex::new(()),
             });
             map.insert(session.to_string(), fresh.clone());
