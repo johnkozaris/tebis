@@ -206,6 +206,36 @@ cargo build --release                        # ~4.25 MB binary
 
 CI runs audit + deny daily on a cron (`.github/workflows/audit.yml`).
 
+## Code hygiene — rules for AI-authored changes
+
+These exist because past AI passes drifted in predictable ways. Hold the line.
+
+1. **Rationale comments: 1 line, 2 exceptional.** Preserve the *why* when it
+   ties to a numbered invariant, a CVE, a platform quirk, or a non-obvious
+   correctness reason. Delete prose that restates the code below it. Prefer
+   `/// Invariant N: <one-line reminder>.` over three sentences re-deriving
+   it. Two lines are allowed only when an invariant number AND a CVE AND a
+   platform quirk all apply to the same site.
+
+2. **One logical change per commit.** A feature commit may not silently
+   refactor or strip comments from unrelated modules. Cleanup passes get
+   their own commit with an honest subject line. If you notice unrelated
+   drift while touching a file, write it down and handle it in a separate
+   commit — do not fold it in.
+
+3. **No split-brain.** Before copying a function to avoid a dep arrow,
+   propose extracting a shared helper. If you truly must duplicate, the
+   duplicate's header comment must name the canonical source AND the
+   specific reason the arrow is forbidden (module-layering, orphan-rule,
+   cyclic-feature-gate — not "to avoid inbound coupling", which is not a
+   reason).
+
+4. **Invariant-6 redaction lives in `src/sanitize.rs`.** `contains_bot_token_shape`,
+   the root-cause walker, and `redact_hyper_error` are shared primitives.
+   Per-destination predicates (Telegram: `/bot<digit>|api.telegram.org`;
+   remote-TTS: `://|Bearer|Authorization`) live at the call site because
+   redaction triggers differ by endpoint shape.
+
 ## Secrets
 
 Bot token belongs in OpenBao at `secret/telegram/bot-token/bridge` (see global
