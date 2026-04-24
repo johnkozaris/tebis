@@ -20,9 +20,8 @@ pub struct Tmux {
     max_output_chars: usize,
 }
 
-/// Invariant 13: `=NAME:0` — `=` forces exact match (`-t foo` prefix-matches
-/// `foobar`); `:0` is required so pane-oriented verbs (send-keys, capture-pane)
-/// resolve the target — bare `=NAME` fails there with "can't find pane".
+/// Invariant 13: `=NAME:0` — `=` forces exact match (`-t foo` prefix-matches `foobar`);
+/// `:0` is required so pane verbs (send-keys, capture-pane) resolve — bare `=NAME` fails.
 struct SessionSlot {
     exact_target: String,
     lock: Mutex<()>,

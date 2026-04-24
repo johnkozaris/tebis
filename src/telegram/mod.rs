@@ -214,8 +214,7 @@ impl TelegramClient {
     }
 
     /// Download a file via the Bot API's file-serving endpoint. Enforces
-    /// [`MAX_FILE_DOWNLOAD_BYTES`] regardless of server claims; one retry
-    /// on connect-level errors.
+    /// [`MAX_FILE_DOWNLOAD_BYTES`] regardless of server claims; one retry on connect errors.
     pub async fn download_file(&self, file_path: &str) -> Result<Bytes> {
         let file_path = file_path.trim_start_matches('/');
 
@@ -559,13 +558,8 @@ impl TelegramClient {
     }
 }
 
-/// Install rustls's process-wide crypto provider. Idempotent — the
-/// setup wizard's `prepare_audio_downloads` installs one, then the
-/// foreground-run path installs again. `install_default` returns
-/// `Err(existing)` on the second call, which we swallow because
-/// `ring` is the only provider we ever register (no risk of a dep
-/// silently picking a different backend). Verified by the
-/// `aws-lc-rs = deny` rule in `deny.toml`.
+/// Install rustls's process-wide crypto provider. Idempotent: wizard + foreground both call;
+/// second `install_default` returns `Err(existing)` which we swallow (ring-only per deny.toml).
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }

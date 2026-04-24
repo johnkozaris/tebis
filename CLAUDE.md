@@ -210,12 +210,12 @@ CI runs audit + deny daily on a cron (`.github/workflows/audit.yml`).
 
 These exist because past AI passes drifted in predictable ways. Hold the line.
 
-1. **Rationale comments: 1 line, 2 exceptional.** Preserve the *why* when it
+1. **Rationale comments: 1–2 lines, hard cap.** Preserve the *why* when it
    ties to a numbered invariant, a CVE, a platform quirk, or a non-obvious
    correctness reason. Delete prose that restates the code below it. Prefer
    `/// Invariant N: <one-line reminder>.` over three sentences re-deriving
-   it. Two lines are allowed only when an invariant number AND a CVE AND a
-   platform quirk all apply to the same site.
+   it. Three+ lines are reserved for `# Safety` blocks on `unsafe` and
+   genuinely multi-step protocol docs — not for prose.
 
 2. **One logical change per commit.** A feature commit may not silently
    refactor or strip comments from unrelated modules. Cleanup passes get

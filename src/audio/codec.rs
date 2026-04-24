@@ -38,9 +38,8 @@ const MAX_SAMPLES_PER_PACKET: usize = 5760;
 
 const OUTPUT_RATE: u32 = 16_000;
 
-/// OGG/Opus → 16 kHz mono `f32` in `[-1.0, 1.0]`. `max_samples` caps
-/// output — byte-input cap alone isn't enough (Opus compresses hard).
-/// Rejects multi-channel; downmixing silently would be a footgun.
+/// OGG/Opus → 16 kHz mono `f32` in `[-1.0, 1.0]`; `max_samples` caps output (byte-input cap
+/// alone isn't enough — Opus compresses hard). Rejects multi-channel (silent downmix = footgun).
 pub fn decode_opus_to_pcm16k(
     oga_bytes: &[u8],
     max_samples: usize,

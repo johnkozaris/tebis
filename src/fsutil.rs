@@ -12,9 +12,8 @@ use anyhow::{Context, Result};
 /// pid+nanos+counter. Two is plenty — a third failure is a real problem.
 const TMP_RETRIES: usize = 3;
 
-/// Write `bytes` to `path` atomically with POSIX `mode`. Uses `O_CREAT|O_EXCL`
-/// on the tmp path so a pre-existing or symlinked tmp can't be reused
-/// (invariant-6-adjacent: env file + plist + hook JSON all run through this).
+/// Atomic write with POSIX `mode` via `O_CREAT|O_EXCL` on the tmp path — a pre-existing or
+/// symlinked tmp can't be reused (invariant-6-adjacent: env file + plist + hook JSON).
 pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;

@@ -56,8 +56,7 @@ pub fn parse_toggle(value: &str) -> Result<Option<bool>> {
     }
 }
 
-/// Upsert `KEY=value` pairs in `path`, preserving comments + line order.
-/// Missing file is treated as empty. Keys not already present are appended.
+/// Upsert `KEY=value` pairs, preserving comments + order. Missing file = empty.
 /// Atomic 0600 write via [`atomic_write_0600`].
 pub fn upsert_keys(path: &Path, updates: &[(&str, String)]) -> Result<()> {
     let current = std::fs::read_to_string(path).unwrap_or_default();

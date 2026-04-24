@@ -290,12 +290,8 @@ fn default_threads() -> u32 {
     u32::try_from(half).unwrap_or(4)
 }
 
-/// Autoreply (pane-settle) is on by default as the universal fallback
-/// for any TUI. `TELEGRAM_AUTOREPLY=off` disables it — the common pair
-/// is `TELEGRAM_HOOKS_MODE=auto` + `TELEGRAM_AUTOREPLY=off` when you
-/// only want precise hook-driven replies from Claude / Copilot. Note
-/// that pane-settle is already suppressed per-session when hooks are
-/// installed for that session, so you rarely need `off`.
+/// Autoreply (pane-settle) is the universal TUI fallback; suppressed per-session when
+/// hooks are installed. Opt out with `TELEGRAM_AUTOREPLY=off` for hook-only replies.
 fn load_autoreply_config() -> Result<Option<AutoreplyConfig>> {
     let enabled = parse_toggle_env("TELEGRAM_AUTOREPLY", true)?;
     Ok(if enabled {
@@ -359,11 +355,8 @@ fn reject_control_chars(value: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Defensive check on `TELEGRAM_TTS_VOICE`: `[A-Za-z0-9._-]{1,64}`, same
-/// bar as tmux session names. The Kokoro crate builds the voice file
-/// path as `voices_dir.join(format!("{voice_name}.bin"))`; without this
-/// check a `/` or `..` would become a path-traversal surface if manifest
-/// validation ordering ever changes.
+/// Defensive `[A-Za-z0-9._-]{1,64}` check — Kokoro builds the voice path as
+/// `voices_dir.join(format!("{voice}.bin"))`, so `/` or `..` would be path-traversal.
 fn ensure_safe_voice_name(voice: &str) -> Result<()> {
     if voice.is_empty() || voice.len() > 64 {
         bail!("TELEGRAM_TTS_VOICE must be 1..=64 chars (got {})", voice.len());
@@ -380,10 +373,8 @@ fn ensure_safe_voice_name(voice: &str) -> Result<()> {
     Ok(())
 }
 
-/// The outbound-notify listener is on by default; `chat_id` defaults to
-/// the authorized user id so hooks can forward to the same person who
-/// sent the original message. Opt out with `TELEGRAM_NOTIFY=off`.
-/// `NOTIFY_CHAT_ID=<id>` overrides the default target.
+/// Outbound-notify listener; `NOTIFY_CHAT_ID` defaults to the authorized user so
+/// hooks forward to the sender. Opt out with `TELEGRAM_NOTIFY=off`.
 fn load_notify_config(allowed_user_id: i64) -> Result<Option<NotifyConfig>> {
     if !parse_toggle_env("TELEGRAM_NOTIFY", true)? {
         return Ok(None);

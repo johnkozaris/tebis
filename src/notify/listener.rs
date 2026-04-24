@@ -41,9 +41,8 @@ pub fn spawn<F: Forwarder>(
     Ok(())
 }
 
-/// Invariant 17: three-layer defense — umask(0177) + chmod 0600 + peer_cred.
-/// Pre-bind unlink is symlink-safe (unlink doesn't follow symlinks; /tmp
-/// sticky bit blocks clobbering attacker-owned files).
+/// Invariant 17: three-layer defense — umask(0177) + chmod 0600 + peer_cred. Pre-bind
+/// unlink is symlink-safe (unlink doesn't follow; /tmp sticky bit blocks clobbering).
 fn bind(path: &Path) -> Result<UnixListener> {
     match std::fs::remove_file(path) {
         Ok(()) => {}
@@ -179,9 +178,8 @@ async fn read_payload(stream: &mut UnixStream) -> Result<Payload> {
     Ok(payload)
 }
 
-/// Invariant 11: newline-framed, NOT EOF-framed. macOS's stock `nc` lacks
-/// `-N` for UDS half-close, so hook scripts use `nc -U -w 2` and depend on
-/// `\n` to flush. Hard cap bounds a client that never sends one.
+/// Invariant 11: newline-framed, not EOF-framed — macOS `nc` lacks `-N` for UDS
+/// half-close, so hook scripts use `nc -U -w 2` and depend on `\n` to flush.
 async fn read_until_bounded<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     delim: u8,

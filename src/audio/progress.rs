@@ -8,11 +8,8 @@ use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-/// Adapter between `fetch::FetchClient::download_verified`'s progress
-/// callback (`FnMut(u64, Option<u64>)`) and either an `indicatif`
-/// bar or a rate-limited `tracing::info`. Construct once per download,
-/// pass its `update` closure to the fetch client, then call `finish`
-/// when the fetch returns.
+/// Adapter between `fetch::download_verified`'s `FnMut(u64, Option<u64>)` progress callback
+/// and either an `indicatif` bar or a rate-limited `tracing::info`.
 pub(super) enum Reporter {
     Bar(ProgressBar),
     /// Throttled log. `last_logged` is the last value we emitted at;
@@ -21,9 +18,8 @@ pub(super) enum Reporter {
 }
 
 impl Reporter {
-    /// `label` is a short prefix shown left of the bar (`"Whisper small.en"`).
-    /// `total_hint` is the expected byte count from the manifest; bars
-    /// degrade to a spinner when unknown.
+    /// `label` is the bar's left prefix (`"Whisper small.en"`); `total_hint` comes from the
+    /// manifest — bars degrade to a spinner when unknown.
     pub(super) fn new(label: &str, total_hint: Option<u64>) -> Self {
         if console::Term::stderr().is_term() {
             let pb = match total_hint {

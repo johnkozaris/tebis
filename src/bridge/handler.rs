@@ -30,9 +30,8 @@ pub enum Command {
     Status,
     Restart,
     Help,
-    /// TTS backend selection — handled by `bridge::handle_update`, not
-    /// `execute`, because writing the env file + graceful restart needs
-    /// `HandlerContext` fields that `Deps` doesn't carry.
+    /// TTS backend selection — routed through `bridge::handle_update` (not `execute`)
+    /// because env-file writes + graceful restart need `HandlerContext`, not `Deps`.
     Tts(TtsVerb),
     PlainText(String),
 }
@@ -49,9 +48,8 @@ pub enum TtsVerb {
     Unknown(String),
 }
 
-/// `Text`: reply body. `ReactSuccess`: 👍. `Sent`: text delivered to a
-/// session, routed to typing+autoreply or 👍 by `handle_update`.
-/// `baseline` is the pre-send pane capture for diff-based autoreply.
+/// `Text`: reply body. `ReactSuccess`: 👍. `Sent`: text delivered to a session; `baseline`
+/// is the pre-send pane capture for diff-based autoreply, routed by `handle_update`.
 pub enum Response {
     Text(String),
     ReactSuccess,

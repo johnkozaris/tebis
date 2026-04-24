@@ -325,9 +325,8 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Thin wrapper around [`env_file::upsert_keys`] that accepts the
-/// `&'static str` keys that `parse_config_form` returns, without
-/// forcing the shared helper to fix its key lifetime.
+/// Thin wrapper around [`env_file::upsert_keys`] that accepts the `&'static str` keys
+/// `parse_config_form` returns, without forcing the shared helper to fix its key lifetime.
 fn write_env_file(path: &Path, updates: &[(&'static str, String)]) -> anyhow::Result<()> {
     let borrowed: Vec<(&str, String)> =
         updates.iter().map(|(k, v)| (*k, v.clone())).collect();
