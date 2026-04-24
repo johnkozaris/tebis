@@ -228,16 +228,8 @@ pub fn uninstall(purge_flag: bool) -> Result<()> {
     Ok(())
 }
 
-/// Remove all tebis-owned on-disk state: binary, env, model cache,
-/// hook manifest, materialized hook scripts. Per-project hook entries
-/// in `.claude/settings.local.json` / `.github/hooks/tebis.json` are
-/// NOT touched — we don't know which projects the user still cares
-/// about. The post-print suggests `tebis hooks uninstall <dir>` for
-/// those.
-///
-/// System packages (`espeak-ng`, installed via `brew`/`apt`/etc.
-/// during the setup wizard's Simple TTS step) stay. Auto-removing
-/// system packages is hostile; we print the one-liner at the end.
+/// Remove tebis-owned on-disk state. Per-project hook entries and system
+/// packages (espeak-ng etc.) are preserved — uninstalling them is hostile.
 fn purge_user_state(bin: &Path, env_dir: &Path, data_dir: Option<&Path>) -> Result<()> {
     println!();
     println!(

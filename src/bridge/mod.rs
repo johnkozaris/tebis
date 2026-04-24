@@ -188,22 +188,13 @@ async fn react_ok(ctx: &HandlerContext, chat_id: i64, message_id: i64) {
     }
 }
 
-/// Handle `/tts` verbs. `Status` reports; the mutative verbs write
-/// `TELEGRAM_TTS_BACKEND=<value>` to the env file and schedule a
-/// graceful restart (mirrors the inspect dashboard's Settings-Save
-/// flow). `Unknown` replies with the usage line.
-///
-/// `Say` on non-macOS is rejected at this layer so a user on Linux
-/// doesn't brick their config by writing a value `build_tts` will
-/// refuse on restart.
+/// `/tts` verb dispatcher. Mutative verbs write env + trigger graceful restart.
+/// `Say` on non-macOS is rejected here so Linux users can't brick the config.
 fn handle_tts_command(ctx: &HandlerContext, v: &handler::TtsVerb) -> Response {
     use handler::TtsVerb;
     use sanitize::escape_html;
 
-    // Status report uses the live subsystem state when present.
-    // `tts_backend_kind()` returns `"none"` when TTS init failed or was
-    // disabled at startup — surface that as "off" to the user so the
-    // terminology matches what they'd type (`/tts off`).
+    // `"none"` from the subsystem maps to `"off"` in user-facing copy.
     let current_label = match ctx.audio.as_ref().map(|a| a.tts_backend_kind()) {
         None | Some("none") => "off",
         Some(other) => other,
@@ -236,19 +227,10 @@ fn handle_tts_command(ctx: &HandlerContext, v: &handler::TtsVerb) -> Response {
     }
 }
 
-/// Persist `TELEGRAM_TTS_BACKEND=<value>` and trigger a graceful
-/// restart so the next boot picks it up. Returns a `Response::Text`
-/// for the user.
-///
-/// For `kokoro-local` we ALSO probe for `libonnxruntime` and write
-/// `ORT_DYLIB_PATH=<path>`. Without this, `/tts kokoro-local` lands
-/// us in a silent TTS-off state on Apple Silicon (the ort crate's
-/// default dyld search doesn't include /opt/homebrew/lib). Probe
-/// failure = refuse the switch and tell the user what to install.
-///
-/// For every non-kokoro-local target, we REMOVE any stale
-/// `ORT_DYLIB_PATH` so `cat ~/.config/tebis/env` doesn't lie about
-/// what the runtime actually uses.
+/// Persist `TELEGRAM_TTS_BACKEND=<value>` and trigger a graceful restart.
+/// For `kokoro-local` also probes `libonnxruntime` and writes `ORT_DYLIB_PATH`
+/// (the ort crate's default dyld search misses /opt/homebrew/lib on Apple
+/// Silicon); for every other target, removes any stale `ORT_DYLIB_PATH`.
 fn switch_tts_backend(ctx: &HandlerContext, value: &str) -> Response {
     let Some(env_path) = ctx.env_file_path.as_ref() else {
         return Response::Text(

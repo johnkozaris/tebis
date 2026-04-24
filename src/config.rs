@@ -414,18 +414,14 @@ fn load_notify_config(allowed_user_id: i64) -> Result<Option<NotifyConfig>> {
     }))
 }
 
-/// Load a `KEY=VALUE` env file into the current process. Skips blank
-/// lines and `#` comments. Does **not** override vars already set in the
-/// environment (so `systemd`'s `EnvironmentFile=` and launchd's
-/// `set -a ; source` keep precedence).
+/// Load `KEY=VALUE` env file without overriding already-set vars (`systemd`
+/// `EnvironmentFile=` / launchd `source` keep precedence).
 ///
 /// # Safety
 ///
-/// Must be called **before** any tokio runtime starts or any thread is
-/// spawned. `std::env::set_var` is sound under edition 2024 only when no
-/// other thread could observe the write (it mutates a process-global
-/// table). `main()` calling this pre-runtime is fine; calling from
-/// anywhere async is a data race.
+/// Must be called **before** any tokio runtime or extra thread starts —
+/// `std::env::set_var` is sound under edition 2024 only when no other
+/// thread can observe the write.
 pub unsafe fn load_env_file(path: &Path) -> Result<()> {
     let content =
         fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;

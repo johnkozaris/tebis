@@ -1,14 +1,6 @@
-//! `libonnxruntime.{dylib,so}` detection + install for the Kokoro-local path.
-//!
-//! `ort` with `load-dynamic` resolves the shared library via
-//! `libloading::Library::new`, which on macOS doesn't search
-//! `/opt/homebrew/lib` by default. We find the lib on disk (standard
-//! brew prefixes / `ORT_DYLIB_PATH`), or offer to install via the
-//! detected package manager, then write `ORT_DYLIB_PATH=<full-path>`
-//! to the env file so the daemon's libloading call finds it at boot.
-//!
-//! Reuses the `PackageManager` enum from [`super::phonemizer`] — same
-//! detection logic, different package name.
+//! `libonnxruntime.{dylib,so}` detection + install for Kokoro-local TTS.
+//! ort's `load-dynamic` uses libloading — which on macOS doesn't search
+//! `/opt/homebrew/lib` — so we probe standard prefixes + `ORT_DYLIB_PATH`.
 
 use std::path::PathBuf;
 use std::process::Command;
