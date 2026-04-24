@@ -2,51 +2,16 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
-/// Atomic write with mode 0600: tmp file opened 0600 (no umask window), fsync,
-/// rename, fsync parent.
+use crate::fsutil;
+
+/// Atomic 0600 write via [`fsutil::atomic_write`]. Thin wrapper kept for
+/// call-site legibility (env files are always 0600 — invariant 6 adjacent).
 pub fn atomic_write_0600(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let tmp = path.with_file_name(format!(
-        "{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("env")
-    ));
-
-    // `mode(0o600)` on open bypasses umask. chmod after write guards
-    // against ACL layers that lose creation mode.
-    {
-        use std::io::Write as _;
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("opening {}", tmp.display()))?;
-        f.write_all(content.as_bytes())
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", tmp.display()))?;
-    }
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", tmp.display()))?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} → {}", tmp.display(), path.display()))?;
-    // POSIX: rename durability needs fsync on the containing dir.
-    // Best-effort — NFS/tmpfs may reject dir-fsync.
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = fs::File::open(parent)
-        && let Err(e) = dir.sync_all()
-    {
-        tracing::debug!(err = %e, dir = %parent.display(), "atomic_write_0600: parent dir fsync failed");
-    }
-    Ok(())
+    fsutil::atomic_write(path, content.as_bytes(), 0o600)
 }
 
 /// `KEY=VALUE`. No shell expansion; matches systemd's `EnvironmentFile=`.
@@ -153,6 +118,7 @@ pub fn read_key(path: &Path, key: &str) -> io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn parse_kv_line_basic() {

@@ -13,6 +13,7 @@ pub mod audio;
 pub mod bridge;
 pub mod config;
 pub mod env_file;
+pub mod fsutil;
 pub mod hooks_cli;
 pub mod inspect;
 pub mod lockfile;

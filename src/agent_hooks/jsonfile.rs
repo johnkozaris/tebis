@@ -1,40 +1,16 @@
 //! Atomic-write + JSON load/save for hook config files.
 
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
+use crate::fsutil;
+
+/// Hook JSON files are read by Claude Code / Copilot CLI — 0644 is intentional.
 pub(super) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    // pid + nanos + counter → unique tmp name even for concurrent same-tick writers.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    let tmp_name = format!(
-        "{}.tebis.tmp.{}.{}.{seq}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("unnamed"),
-        std::process::id(),
-        nanos,
-    );
-    let tmp = path.with_file_name(tmp_name);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    {
-        let mut f = File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        f.write_all(bytes)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", tmp.display()))?;
-    }
-    fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} → {}", tmp.display(), path.display()))?;
-    Ok(())
+    fsutil::atomic_write(path, bytes, 0o644)
 }
 
 pub(super) fn atomic_write_json(path: &Path, value: &Value) -> Result<()> {
