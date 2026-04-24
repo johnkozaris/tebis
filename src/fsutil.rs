@@ -140,13 +140,9 @@ mod tests {
     }
 
     #[test]
-    fn refuses_to_follow_symlinked_tmp() {
-        let p = tmp("symlink-tmp");
+    fn overwrites_existing_file_atomically() {
+        let p = tmp("overwrite");
         let _ = fs::remove_file(&p);
-        // Pre-create a tmp name matching what the next call would generate is
-        // probabilistically hard; instead, verify create_new semantics by
-        // pre-seeding a specific tmp and watching the retry loop skip it.
-        // We exercise the retry path indirectly via the counter.
         atomic_write(&p, b"a", 0o600).unwrap();
         atomic_write(&p, b"b", 0o600).unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"b");

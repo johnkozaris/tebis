@@ -8,9 +8,8 @@ use tokio_util::sync::CancellationToken;
 /// or HTTP redirect has time to flush before the process exits; the service
 /// manager (launchd / systemd) respawns per its keep-alive policy.
 ///
-/// Bare `tokio::spawn` is intentional: this task *triggers* shutdown, so
-/// invariant 12 (drain in-flight work via `TaskTracker`) does not apply —
-/// draining the trigger would deadlock shutdown.
+/// Bare `tokio::spawn` is fine here: this task is a shutdown *trigger*, not
+/// in-flight work that needs draining under invariant 12.
 pub fn schedule_graceful_restart(shutdown: &CancellationToken) {
     let shutdown = shutdown.clone();
     tokio::spawn(async move {
