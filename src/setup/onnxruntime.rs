@@ -18,7 +18,10 @@ use console::style;
 use dialoguer::Confirm;
 use dialoguer::theme::ColorfulTheme;
 
-use super::phonemizer::{PackageManager, detect_package_manager};
+pub use super::installer::EnsureOutcome;
+use super::installer::{
+    PackageManager, detect_package_manager, install_argv, install_cmd_display,
+};
 
 #[cfg(target_os = "macos")]
 const DYLIB_NAME: &str = "libonnxruntime.dylib";
@@ -56,14 +59,6 @@ fn candidate_paths() -> Vec<PathBuf> {
 #[must_use]
 pub fn probe() -> Option<PathBuf> {
     candidate_paths().into_iter().find(|p| p.exists())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EnsureOutcome {
-    Ready(PathBuf),
-    UserDeclined,
-    InstallFailed,
-    NoPackageManager,
 }
 
 /// Probe → confirm → install → re-probe. `Ready(path)` caller writes
@@ -222,31 +217,6 @@ const fn package_name_for(pm: PackageManager) -> &'static str {
     }
 }
 
-fn install_cmd_display(pm: PackageManager, pkg: &str) -> String {
-    match pm {
-        PackageManager::Brew => format!("brew install {pkg}"),
-        PackageManager::MacPorts => format!("sudo port install {pkg}"),
-        PackageManager::Apt => format!("sudo apt install -y {pkg}"),
-        PackageManager::Dnf => format!("sudo dnf install -y {pkg}"),
-        PackageManager::Pacman => format!("sudo pacman -S --noconfirm {pkg}"),
-        PackageManager::Zypper => format!("sudo zypper install -y {pkg}"),
-        PackageManager::Apk => format!("sudo apk add {pkg}"),
-    }
-}
-
-fn install_argv(pm: PackageManager, pkg: &str) -> Vec<String> {
-    let pkg = pkg.to_string();
-    match pm {
-        PackageManager::Brew => vec!["brew".into(), "install".into(), pkg],
-        PackageManager::MacPorts => vec!["sudo".into(), "port".into(), "install".into(), pkg],
-        PackageManager::Apt => vec!["sudo".into(), "apt".into(), "install".into(), "-y".into(), pkg],
-        PackageManager::Dnf => vec!["sudo".into(), "dnf".into(), "install".into(), "-y".into(), pkg],
-        PackageManager::Pacman => vec!["sudo".into(), "pacman".into(), "-S".into(), "--noconfirm".into(), pkg],
-        PackageManager::Zypper => vec!["sudo".into(), "zypper".into(), "install".into(), "-y".into(), pkg],
-        PackageManager::Apk => vec!["sudo".into(), "apk".into(), "add".into(), pkg],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn install_argv_includes_pkg_name() {
+    fn package_name_for_every_pm() {
         for pm in [
             PackageManager::Brew,
             PackageManager::MacPorts,
@@ -268,30 +238,7 @@ mod tests {
             PackageManager::Zypper,
             PackageManager::Apk,
         ] {
-            let pkg = package_name_for(pm);
-            let argv = install_argv(pm, pkg);
-            assert!(
-                argv.iter().any(|a| a == pkg),
-                "argv for {pm:?} missing pkg {pkg}: {argv:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn install_cmd_display_matches_argv_head() {
-        for pm in [
-            PackageManager::Brew,
-            PackageManager::MacPorts,
-            PackageManager::Apt,
-            PackageManager::Dnf,
-            PackageManager::Pacman,
-            PackageManager::Zypper,
-            PackageManager::Apk,
-        ] {
-            let pkg = package_name_for(pm);
-            let display = install_cmd_display(pm, pkg);
-            let argv = install_argv(pm, pkg);
-            assert_eq!(display, argv.join(" "), "display-vs-argv drift for {pm:?}");
+            assert!(!package_name_for(pm).is_empty(), "{pm:?}");
         }
     }
 }
