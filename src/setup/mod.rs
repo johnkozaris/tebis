@@ -13,6 +13,7 @@ use crate::env_file;
 
 mod discover;
 mod installer;
+mod mux_prereq;
 pub mod onnxruntime;
 /// `pub` so `examples/kokoro-smoke.rs` can call `probe_espeak_ng`.
 pub mod phonemizer;
@@ -135,7 +136,7 @@ pub enum Next {
 pub fn run() -> Result<Next> {
     let theme = ColorfulTheme::default();
     ui::print_welcome();
-    warn_missing_multiplexer();
+    mux_prereq::ensure_or_offer_install(&theme)?;
 
     let env_path = env_file_path()?;
     let discovered = discover::discover(&env_path);
@@ -221,31 +222,6 @@ pub fn run() -> Result<Next> {
 
     ui::print_wrote(&env_path);
     prompt_next_action(&theme, &env_path, inspect_port)
-}
-
-fn warn_missing_multiplexer() {
-    if crate::platform::multiplexer::binary_on_path() {
-        return;
-    }
-    let bin = crate::platform::multiplexer::BINARY;
-    ui::note_warn(&format!(
-        "`{bin}` is not on PATH yet. Setup can write config, but runtime needs it."
-    ));
-    #[cfg(windows)]
-    {
-        println!("   Install psmux, then open a new terminal:");
-        println!("     scoop bucket add psmux https://github.com/psmux/scoop-psmux");
-        println!("     scoop install psmux");
-        println!(
-            "   Other options: winget install marlocarlo.psmux, choco install psmux, cargo install psmux"
-        );
-        println!("   psmux also ships `tmux.exe` and `pmux.exe` aliases.");
-    }
-    #[cfg(not(windows))]
-    {
-        println!("   Install tmux 3.x with your OS package manager, then re-run or start tebis.");
-    }
-    println!();
 }
 
 fn prompt_next_action(

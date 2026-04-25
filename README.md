@@ -76,8 +76,12 @@ tebis hook scripts). Claude Code and Copilot CLI both have native Windows
 installers as of 2026; install whichever you want to drive from Telegram.
 
 psmux v3.3+ is the current target. It ships `psmux.exe`, `pmux.exe`, and a
-`tmux.exe` compatibility alias; tebis calls `psmux.exe` directly. Install
-with one of:
+`tmux.exe` compatibility alias; tebis calls `psmux.exe` directly. If psmux is
+missing, `tebis setup` detects Scoop, WinGet, Chocolatey, or Cargo and offers to
+install it for you. Declining or failing that install stops setup before writing
+config, because the bridge cannot run without a multiplexer.
+
+Manual install options:
 
 ```powershell
 scoop bucket add psmux https://github.com/psmux/scoop-psmux

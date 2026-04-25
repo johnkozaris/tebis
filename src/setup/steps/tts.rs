@@ -389,18 +389,10 @@ fn configure_kokoro_local(
     if !matches!(espeak, super::super::phonemizer::EnsureOutcome::Ready(_)) {
         println!();
         println!(
-            "   {} espeak-ng unavailable — {}.",
+            "   {} espeak-ng unavailable — disabling Kokoro-local TTS.",
             style("→").dim(),
-            if matches!(existing, Some(TtsChoice::KokoroLocal { .. })) {
-                "keeping your previous Kokoro config (install will be retried on next setup)"
-            } else {
-                "falling back to no TTS"
-            },
         );
-        return Ok(Some(match existing {
-            Some(c @ TtsChoice::KokoroLocal { .. }) => c.clone(),
-            _ => TtsChoice::Off,
-        }));
+        return Ok(Some(TtsChoice::Off));
     }
 
     let ort_outcome = super::super::onnxruntime::ensure_or_install(theme)
@@ -410,18 +402,10 @@ fn configure_kokoro_local(
         _ => {
             println!();
             println!(
-                "   {} onnxruntime unavailable — {}.",
+                "   {} onnxruntime unavailable — disabling Kokoro-local TTS.",
                 style("→").dim(),
-                if matches!(existing, Some(TtsChoice::KokoroLocal { .. })) {
-                    "keeping your previous Kokoro config (install will be retried on next setup)"
-                } else {
-                    "falling back to no TTS"
-                },
             );
-            return Ok(Some(match existing {
-                Some(c @ TtsChoice::KokoroLocal { .. }) => c.clone(),
-                _ => TtsChoice::Off,
-            }));
+            return Ok(Some(TtsChoice::Off));
         }
     };
 
