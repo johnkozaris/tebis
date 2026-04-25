@@ -22,13 +22,13 @@ const HELP: &str = "\
 tebis — Telegram-multiplexer bridge
 
 Usage:
-  tebis                 Run in foreground (auto-loads ~/.config/tebis/env).
+  tebis                 Run in foreground (auto-loads the per-user env file).
   tebis setup           Interactive first-run config wizard.
   tebis install         Install as a background service (launchd / systemd user).
   tebis uninstall [--purge]
                         Remove the background service. `--purge` also
-                        deletes ~/.local/bin/tebis, ~/.config/tebis/,
-                        ~/.local/share/tebis/ (env + model cache + hook
+                        deletes the installed binary and per-user tebis
+                        config/data dirs (env + model cache + hook
                         manifest). Per-project hooks and system
                         packages (espeak-ng) are left alone.
   tebis start           Start the installed background service.
@@ -193,13 +193,16 @@ fn nudge_to_setup() -> ! {
 }
 
 fn unauthorized_dead_end(err: &telegram::TelegramError) -> anyhow::Error {
+    let env_path = setup::env_file_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "the tebis env file".to_string());
     eprintln!();
     eprintln!(
         "  {}  Telegram rejected the bot token (401 Unauthorized).",
         console::style("✗").red().bold()
     );
     eprintln!();
-    eprintln!("  The token in ~/.config/tebis/env is wrong, revoked, or was regenerated");
+    eprintln!("  The token in {env_path} is wrong, revoked, or was regenerated");
     eprintln!("  in BotFather. Re-run `tebis setup` to paste a fresh one.");
     eprintln!();
     anyhow::anyhow!("bot token rejected by Telegram (401 Unauthorized): {err}")

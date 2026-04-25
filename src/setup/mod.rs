@@ -1,4 +1,4 @@
-//! `tebis setup` — interactive first-run wizard. Writes `~/.config/tebis/env` (0600).
+//! `tebis setup` — interactive first-run wizard. Writes the per-user env file.
 
 use std::collections::HashSet;
 use std::fs;

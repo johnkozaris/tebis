@@ -59,11 +59,7 @@ pub fn install() -> Result<()> {
         "{}  Installing tebis as a background task (Task Scheduler)…",
         style("▶").cyan().bold()
     );
-    println!(
-        "    binary  {} → {}",
-        bin_src.display(),
-        bin_dst.display()
-    );
+    println!("    binary  {} → {}", bin_src.display(), bin_dst.display());
     copy_binary(&bin_src, &bin_dst)?;
 
     register_task(&bin_dst)?;
@@ -91,10 +87,7 @@ pub fn uninstall(purge_flag: bool) -> Result<()> {
         if !stderr.to_ascii_lowercase().contains("does not exist")
             && !stderr.to_ascii_lowercase().contains("cannot find")
         {
-            bail!(
-                "schtasks /Delete /TN {TASK_NAME} failed: {}",
-                stderr.trim()
-            );
+            bail!("schtasks /Delete /TN {TASK_NAME} failed: {}", stderr.trim());
         }
     }
 
@@ -105,7 +98,10 @@ pub fn uninstall(purge_flag: bool) -> Result<()> {
         let bin = installed_binary_path().ok();
         let env_file = setup::env_file_path().ok();
         let data = crate::platform::paths::data_dir().ok();
-        for entry in [bin.as_deref(), env_file.as_deref(), data.as_deref()].into_iter().flatten() {
+        for entry in [bin.as_deref(), env_file.as_deref(), data.as_deref()]
+            .into_iter()
+            .flatten()
+        {
             if entry.exists() {
                 let kind = if entry.is_dir() { "dir " } else { "file" };
                 match if entry.is_dir() {
@@ -147,7 +143,10 @@ pub fn stop() -> Result<()> {
         .context("spawning schtasks /End")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.to_ascii_lowercase().contains("not currently running") {
+        if stderr
+            .to_ascii_lowercase()
+            .contains("not currently running")
+        {
             println!("{}  Task was not running.", style("ℹ").dim());
             return Ok(());
         }
@@ -178,11 +177,28 @@ pub fn status() -> Result<()> {
     Ok(())
 }
 
-/// Reports `true` when any `tebis.exe` (or `inspect-demo.exe`) is
-/// running for the current user. Uses `tasklist` to avoid pulling in
-/// the `windows` crate just for ProcessStatus.
+/// Reports `true` when the Task Scheduler entry exists and is running.
 #[must_use]
 pub fn is_running() -> bool {
+    let Ok(out) = Command::new("schtasks")
+        .args(["/Query", "/TN", TASK_NAME, "/V", "/FO", "LIST"])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+    stdout
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .any(|(key, value)| key.trim().eq_ignore_ascii_case("status") && value.contains("running"))
+}
+
+/// Reports `true` when any foreground `tebis.exe` process is running for
+/// the current user. Used only to avoid installing over an active dev run.
+fn tebis_process_running() -> bool {
     let Ok(out) = Command::new("tasklist")
         .args(["/FI", "IMAGENAME eq tebis.exe", "/FO", "CSV", "/NH"])
         .output()
@@ -200,18 +216,18 @@ fn installed_binary_path() -> Result<PathBuf> {
     // `%LOCALAPPDATA%\Programs\tebis\tebis.exe`. Mirrors the Microsoft
     // Store / WinGet convention of installing per-user apps under
     // `%LOCALAPPDATA%\Programs\<app>\`.
-    let base = env::var_os("LOCALAPPDATA")
-        .context("LOCALAPPDATA env var not set")?;
-    Ok(PathBuf::from(base).join("Programs").join("tebis").join("tebis.exe"))
+    let base = env::var_os("LOCALAPPDATA").context("LOCALAPPDATA env var not set")?;
+    Ok(PathBuf::from(base)
+        .join("Programs")
+        .join("tebis")
+        .join("tebis.exe"))
 }
 
 fn copy_binary(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    fs::copy(src, dst)
-        .with_context(|| format!("copying {} → {}", src.display(), dst.display()))?;
+    fs::copy(src, dst).with_context(|| format!("copying {} → {}", src.display(), dst.display()))?;
     Ok(())
 }
 
@@ -245,7 +261,7 @@ fn run_schtasks(args: &[&str]) -> Result<std::process::Output> {
 }
 
 fn refuse_if_foreground_running(op: &str) -> Result<()> {
-    if is_running() {
+    if tebis_process_running() {
         bail!(
             "a tebis process is currently running; stop it before `tebis {op}`. \
              Use `tebis stop` (if installed) or close the foreground terminal."
