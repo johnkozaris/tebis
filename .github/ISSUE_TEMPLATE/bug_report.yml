@@ -1,0 +1,60 @@
+name: Bug report
+description: Report something that is not working as expected.
+title: "Bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Do not paste bot tokens, API keys, Telegram message text, or terminal output that may contain secrets.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the problem in plain language.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run ...
+        2. Send ...
+        3. See ...
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tebis version or commit
+      placeholder: "tebis --version, or git commit SHA"
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant config
+      description: Remove all secrets before pasting. Keep only settings needed to understand the bug.
+      render: shell
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      description: Remove secrets and private terminal output before pasting.
+      render: text

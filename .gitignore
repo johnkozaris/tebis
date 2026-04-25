@@ -50,3 +50,4 @@ tarpaulin-report.*
 .direnv/
 .envrc.local
 .claude/settings.local.json
+.impeccable.md

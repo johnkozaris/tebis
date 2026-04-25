@@ -18,21 +18,18 @@ pub(in crate::setup) fn step_hooks_mode(
     match detected {
         None => {
             println!("Your autostart command isn't a recognized agent, so there are no");
-            println!("native hooks to install. Pane-settle auto-reply covers generic TUIs.");
+            println!("agent hooks to install. Tebis will still watch terminal output for replies.");
             println!();
             return Ok(HooksChoice::Off);
         }
         Some(kind) => {
             println!(
-                "Detected {}. Native hooks give precise, low-latency replies",
+                "Detected {}. Agent hooks usually send replies faster",
                 style(kind.display()).bold(),
             );
+            println!("than waiting for terminal output to settle. Hooks");
             println!(
-                "via the agent's {} event instead of polling the pane. Hooks",
-                style("Stop").bold(),
-            );
-            println!(
-                "are idempotent and reversible — remove any time with {}.",
+                "are idempotent and reversible. Remove any time with {}.",
                 style("tebis hooks uninstall").bold(),
             );
             println!();

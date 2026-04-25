@@ -301,7 +301,7 @@ fn build_env_file(
     let _ = writeln!(out, "TELEGRAM_ALLOWED_USER={user_id}");
     if sessions.is_empty() {
         out.push_str(
-            "# TELEGRAM_ALLOWED_SESSIONS unset → any multiplexer session name is accepted.\n\
+            "# TELEGRAM_ALLOWED_SESSIONS unset: any valid terminal session name is accepted.\n\
              # Uncomment and set a comma-separated list to restrict, e.g.:\n\
              # TELEGRAM_ALLOWED_SESSIONS=claude-code,shell\n",
         );
@@ -319,8 +319,9 @@ fn build_env_file(
     match hooks_mode {
         HooksChoice::Auto => {
             out.push_str(
-                "\n# Auto-install agent hooks at autostart. Replies come via\n\
-                 # the agent's native Stop event (precise) rather than pane-settle.\n",
+                "\n# Install supported Claude Code or Copilot CLI hooks when the\n\
+                 # default agent starts. This usually sends replies faster than\n\
+                 # waiting for terminal output to settle.\n",
             );
             out.push_str("TELEGRAM_HOOKS_MODE=auto\n");
         }
@@ -335,8 +336,8 @@ fn build_env_file(
     }
 
     if let Some(v) = voice {
-        out.push_str("\n# Voice input (STT). Transcribes Telegram voice notes in-process\n");
-        out.push_str("# via whisper-rs. Model downloads on first run to\n");
+        out.push_str("\n# Voice input. Transcribes Telegram voice notes locally.\n");
+        out.push_str("# Model downloads on first run to\n");
         out.push_str("# the per-user tebis data dir (about 181 MB for small.en).\n");
         if v.enabled {
             let _ = writeln!(out, "TELEGRAM_STT=on");
@@ -347,7 +348,9 @@ fn build_env_file(
     }
 
     if let Some(t) = tts {
-        out.push_str("\n# Voice replies (TTS). See PLAN-TTS-V2.md for the backend story.\n");
+        out.push_str(
+            "\n# Voice replies. Text replies can be sent back as Telegram voice messages.\n",
+        );
         match t {
             TtsChoice::Off => {
                 let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=none");
@@ -356,7 +359,7 @@ fn build_env_file(
                 voice,
                 respond_to_all,
             } => {
-                out.push_str("# macOS `say` shell-out.\n");
+                out.push_str("# macOS built-in speech voice.\n");
                 let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=say");
                 let _ = writeln!(out, "TELEGRAM_TTS_VOICE={voice}");
                 if *respond_to_all {
@@ -368,13 +371,13 @@ fn build_env_file(
                 respond_to_all,
             } => {
                 out.push_str(
-                    "# Windows WinRT `SpeechSynthesizer` — zero-install, uses OneCore voices\n\
-                     # (David/Zira/Mark). Voice is a case-insensitive substring match;\n\
-                     # leave empty for the system default.\n",
+                    "# Windows built-in speech voice. Voice is a case-insensitive\n\
+                     # substring match such as David, Zira, or Mark. Leave empty\n\
+                     # for the system default.\n",
                 );
                 let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=winrt");
                 if voice.is_empty() {
-                    out.push_str("# TELEGRAM_TTS_VOICE unset → system default voice.\n");
+                    out.push_str("# TELEGRAM_TTS_VOICE unset: system default voice.\n");
                 } else {
                     let _ = writeln!(out, "TELEGRAM_TTS_VOICE={voice}");
                 }
@@ -388,16 +391,15 @@ fn build_env_file(
                 respond_to_all,
                 ort_dylib_path,
             } => {
-                out.push_str("# Local Kokoro ONNX via espeak-ng phonemizer. Requires\n");
-                out.push_str("# the `kokoro-local` cargo feature at build time.\n");
+                out.push_str("# Local Kokoro voice. Requires a build with the\n");
+                out.push_str("# `kokoro-local` cargo feature.\n");
                 let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=kokoro-local");
                 let _ = writeln!(out, "TELEGRAM_TTS_MODEL={model}");
                 let _ = writeln!(out, "TELEGRAM_TTS_VOICE={voice}");
                 if let Some(p) = ort_dylib_path {
                     out.push_str(
-                        "# Where the daemon's `libloading` finds the ONNX Runtime shared\n\
-                         # library. On Apple Silicon brew installs to /opt/homebrew/lib,\n\
-                         # which isn't in the default dyld search path.\n",
+                        "# Path to the ONNX Runtime shared library when your OS cannot\n\
+                         # find it automatically.\n",
                     );
                     let _ = writeln!(out, "ORT_DYLIB_PATH={p}");
                 }
@@ -414,7 +416,7 @@ fn build_env_file(
                 allow_http,
                 respond_to_all,
             } => {
-                out.push_str("# Remote OpenAI-compatible TTS endpoint (e.g. Kokoro-FastAPI).\n");
+                out.push_str("# Remote OpenAI-compatible speech endpoint.\n");
                 let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=kokoro-remote");
                 let _ = writeln!(out, "TELEGRAM_TTS_REMOTE_URL={url}");
                 if let Some(k) = api_key

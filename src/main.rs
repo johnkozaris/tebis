@@ -19,7 +19,7 @@ use tebis::{
 };
 
 const HELP: &str = "\
-tebis — Telegram-multiplexer bridge
+tebis - Telegram to local terminal bridge
 
 Usage:
   tebis                 Run in foreground (auto-loads the per-user env file).
@@ -44,21 +44,21 @@ Required env (set by `tebis setup` or your own scripts):
   TELEGRAM_ALLOWED_USER         Your numeric Telegram user id
 
 Optional env:
-  TELEGRAM_ALLOWED_SESSIONS     Comma-separated multiplexer session allowlist
+  TELEGRAM_ALLOWED_SESSIONS     Comma-separated terminal session allowlist
   TELEGRAM_POLL_TIMEOUT         Long-poll seconds (default 30, 1..=900)
   TELEGRAM_MAX_OUTPUT_CHARS     /read truncation cap (default 4000)
   TELEGRAM_AUTOSTART_SESSION    Autostart session name
   TELEGRAM_AUTOSTART_DIR        Autostart working directory
   TELEGRAM_AUTOSTART_COMMAND    Autostart command (e.g. `claude`)
-  NOTIFY_CHAT_ID                Enable hook-forward UDS listener
-  NOTIFY_SOCKET_PATH            UDS path (default $XDG_RUNTIME_DIR/tebis.sock)
+  NOTIFY_CHAT_ID                Chat id for agent hook replies
+  NOTIFY_SOCKET_PATH            Local notification socket path on Unix
   INSPECT_PORT                  Local control dashboard on 127.0.0.1:<port>
   BRIDGE_ENV_FILE               Env file path (enables dashboard Settings edits)
-  TELEGRAM_AUTOREPLY            `off` to disable pane-settle auto-reply
+  TELEGRAM_AUTOREPLY            `off` to disable terminal-output auto-reply
   TELEGRAM_HOOKS_MODE           `auto` to auto-install agent hooks at autostart
-  TELEGRAM_NOTIFY               `off` to disable outbound-notify UDS listener
+  TELEGRAM_NOTIFY               `off` to disable local hook notifications
 
-Docs: README.md · CLAUDE.md.
+Docs: README.md · SECURITY.md.
 ";
 
 fn main() -> Result<()> {

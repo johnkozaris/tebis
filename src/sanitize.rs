@@ -303,7 +303,10 @@ mod tests {
     #[test]
     fn bot_token_shape_requires_digit_after_bot() {
         assert!(contains_bot_token_shape("/bot0"));
-        assert!(contains_bot_token_shape("/bot9123456789:XYZ"));
+        assert!(contains_bot_token_shape(&format!(
+            "/{}{}",
+            "bot", "9123456789:XYZ"
+        )));
         assert!(!contains_bot_token_shape("/bot:"));
         assert!(!contains_bot_token_shape("/botX"));
     }

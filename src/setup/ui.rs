@@ -154,7 +154,7 @@ pub(super) fn print_summary(
     );
     let hooks_row = match hooks_mode {
         HooksChoice::Auto => style("auto-install on first message").to_string(),
-        HooksChoice::Off => style("(pane-settle only)").dim().to_string(),
+        HooksChoice::Off => style("(watch terminal output)").dim().to_string(),
     };
     let dashboard_row = inspect_port.map_or_else(
         || style("(disabled)").dim().to_string(),
