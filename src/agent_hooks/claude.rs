@@ -10,10 +10,8 @@ use super::jsonfile;
 
 pub struct ClaudeHooks;
 
-/// Installed events + timeouts (seconds). Shorter than Claude's 600s default
-/// — a slow hook should fall back to pane-settle, not hang the turn.
-/// SessionStart/SessionEnd deliberately omitted: one is noise, the other
-/// doesn't fire on tmux `kill-session`.
+/// Installed events + timeouts (seconds). Shorter than Claude's 600s default — slow hooks
+/// fall back to pane-settle, not hang the turn. SessionStart/End omitted (noise, no kill-session fire).
 const EVENTS: &[(&str, u64)] = &[
     ("UserPromptSubmit", 5),
     ("Stop", 15),

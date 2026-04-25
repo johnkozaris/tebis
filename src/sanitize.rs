@@ -79,9 +79,8 @@ pub fn escape_html(text: &str) -> String {
 // scaffold (root-cause walk + "kind: <cause>" format + redacted replacement)
 // is here to prevent drift.
 
-/// True when `s` contains `/bot` followed by an ASCII digit — the Telegram
-/// Bot API URL shape (`/bot<TOKEN>/method`). Callers also check
-/// `api.telegram.org` for host-level leaks.
+/// Invariant 6: true when `s` contains `/bot` + ASCII digit (Telegram Bot API URL shape
+/// `/bot<TOKEN>/method`). Callers pair with host-level `api.telegram.org` check.
 pub(crate) fn contains_bot_token_shape(s: &str) -> bool {
     let bytes = s.as_bytes();
     let needle = b"/bot";
@@ -103,18 +102,23 @@ pub(crate) fn redact_hyper_error(
         let Some(next) = cur.source() else { break };
         cur = next;
     }
-    let kind = if err.is_connect() { "connect" } else { "request" };
+    let kind = if err.is_connect() {
+        "connect"
+    } else {
+        "request"
+    };
     let raw = format!("{kind}: {cur}");
     if should_redact(&raw) {
-        tracing::warn!("Network error contained sensitive data; replaced with redacted placeholder");
+        tracing::warn!(
+            "Network error contained sensitive data; replaced with redacted placeholder"
+        );
         return format!("{kind}: <redacted network error>");
     }
     raw
 }
 
-/// String-input variant of [`redact_hyper_error`] for callers (e.g.
-/// `audio::fetch`) whose error types flatten to a String before reaching
-/// the redaction layer.
+/// String-input variant of [`redact_hyper_error`] for callers whose errors flatten
+/// to `String` before reaching the redaction layer (e.g. `audio::fetch`).
 pub(crate) fn redact_hyper_error_string(s: &str, should_redact: impl Fn(&str) -> bool) -> String {
     if should_redact(s) {
         return "<redacted network error>".to_string();
@@ -273,7 +277,9 @@ mod tests {
     #[test]
     fn bot_token_shape_detects_digit_after_slash_bot() {
         assert!(contains_bot_token_shape("/bot12345:ABC/getMe"));
-        assert!(contains_bot_token_shape("https://api.telegram.org/bot9/getUpdates"));
+        assert!(contains_bot_token_shape(
+            "https://api.telegram.org/bot9/getUpdates"
+        ));
     }
 
     #[test]

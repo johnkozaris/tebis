@@ -102,9 +102,8 @@ impl RemoteTts {
         self.api_key.is_some()
     }
 
-    /// Synthesize `text` to OGG/Opus bytes plus the audio duration in
-    /// seconds. The bytes are pass-through-ready for Telegram's
-    /// `sendVoice`; no re-encode.
+    /// Synthesize `text` to OGG/Opus bytes plus duration in seconds.
+    /// Bytes are pass-through-ready for Telegram `sendVoice` (no re-encode).
     pub async fn synthesize_to_opus(&self, text: &str) -> Result<(Bytes, u32), TtsError> {
         if text.trim().is_empty() {
             return Err(TtsError::Synthesis("empty text".to_string()));

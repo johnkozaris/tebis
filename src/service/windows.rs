@@ -199,6 +199,7 @@ pub fn is_running() -> bool {
 /// Reports `true` when any foreground `tebis.exe` process is running for
 /// the current user. Used only to avoid installing over an active dev run.
 fn tebis_process_running() -> bool {
+    let current_pid = std::process::id();
     let Ok(out) = Command::new("tasklist")
         .args(["/FI", "IMAGENAME eq tebis.exe", "/FO", "CSV", "/NH"])
         .output()
@@ -206,8 +207,7 @@ fn tebis_process_running() -> bool {
         return false;
     };
     let text = String::from_utf8_lossy(&out.stdout);
-    // Empty output / "no tasks" header → not running.
-    text.lines().any(|line| line.contains("tebis.exe"))
+    tasklist_contains_other_tebis(&text, current_pid)
 }
 
 // ---- Helpers ----
@@ -232,12 +232,13 @@ fn copy_binary(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn register_task(bin_path: &Path) -> Result<()> {
+    let task_command = quote_task_command(bin_path);
     let out = run_schtasks(&[
         "/Create",
         "/TN",
         TASK_NAME,
         "/TR",
-        &bin_path.to_string_lossy(),
+        task_command.as_str(),
         "/SC",
         "ONLOGON",
         "/RL",
@@ -251,6 +252,49 @@ fn register_task(bin_path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn quote_task_command(bin_path: &Path) -> String {
+    format!("\"{}\"", bin_path.display())
+}
+
+fn tasklist_contains_other_tebis(text: &str, current_pid: u32) -> bool {
+    text.lines()
+        .filter_map(parse_tasklist_csv_line)
+        .any(|(image, pid)| image.eq_ignore_ascii_case("tebis.exe") && pid != current_pid)
+}
+
+fn parse_tasklist_csv_line(line: &str) -> Option<(String, u32)> {
+    let fields = csv_fields(line);
+    if fields.len() < 2 {
+        return None;
+    }
+    let pid = fields[1].trim().parse().ok()?;
+    Some((fields[0].trim().to_string(), pid))
+}
+
+fn csv_fields(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut chars = line.chars().peekable();
+    let mut in_quotes = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if in_quotes && chars.peek() == Some(&'"') => {
+                field.push('"');
+                let _ = chars.next();
+            }
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                fields.push(field.trim().to_string());
+                field.clear();
+            }
+            _ => field.push(ch),
+        }
+    }
+    fields.push(field.trim().to_string());
+    fields
 }
 
 fn run_schtasks(args: &[&str]) -> Result<std::process::Output> {
@@ -268,4 +312,33 @@ fn refuse_if_foreground_running(op: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn tasklist_parser_ignores_current_process() {
+        let current = std::process::id();
+        let text = format!("\"tebis.exe\",\"{current}\",\"Console\",\"1\",\"12,345 K\"\r\n");
+        assert!(!tasklist_contains_other_tebis(&text, current));
+    }
+
+    #[test]
+    fn tasklist_parser_detects_other_tebis_process() {
+        let current = 100_u32;
+        let text = "\"tebis.exe\",\"4242\",\"Console\",\"1\",\"12,345 K\"\r\n";
+        assert!(tasklist_contains_other_tebis(text, current));
+    }
+
+    #[test]
+    fn task_command_quotes_paths_with_spaces() {
+        let path = PathBuf::from(r"C:\Users\Jane Doe\AppData\Local\Programs\tebis\tebis.exe");
+        assert_eq!(
+            quote_task_command(&path),
+            r#""C:\Users\Jane Doe\AppData\Local\Programs\tebis\tebis.exe""#
+        );
+    }
 }

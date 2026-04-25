@@ -214,15 +214,12 @@ impl TelegramClient {
     }
 
     /// Download a file via the Bot API's file-serving endpoint. Enforces
-    /// [`MAX_FILE_DOWNLOAD_BYTES`] regardless of server claims; one retry
-    /// on connect-level errors.
+    /// [`MAX_FILE_DOWNLOAD_BYTES`] regardless of server claims; one retry on connect errors.
     pub async fn download_file(&self, file_path: &str) -> Result<Bytes> {
         let file_path = file_path.trim_start_matches('/');
 
         // Reject traversal / full-URL injection in server-provided path.
-        if file_path.split('/').any(|seg| seg == "..")
-            || file_path.contains("://")
-        {
+        if file_path.split('/').any(|seg| seg == "..") || file_path.contains("://") {
             return Err(TelegramError::Network {
                 method: "download_file".to_string(),
                 description: "rejected file_path with suspicious content".to_string(),
@@ -249,7 +246,15 @@ impl TelegramClient {
 
         match self.download_file_once(&url).await {
             Ok(body) => return Ok(body),
-            Err(e) if matches!(&e, TelegramError::Network { retryable: true, .. }) => {
+            Err(e)
+                if matches!(
+                    &e,
+                    TelegramError::Network {
+                        retryable: true,
+                        ..
+                    }
+                ) =>
+            {
                 tracing::warn!(err = %e, "download_file: retrying once on connect-level error");
             }
             Err(e) => return Err(e),
@@ -359,11 +364,14 @@ impl TelegramClient {
 
         let status = response.status();
         let limited = Limited::new(response.into_body(), MAX_RESPONSE_BYTES);
-        let body_bytes = limited.collect().await.map_err(|e| TelegramError::Network {
-            method: "sendVoice".to_string(),
-            description: format!("body read: {e}"),
-            retryable: false,
-        })?;
+        let body_bytes = limited
+            .collect()
+            .await
+            .map_err(|e| TelegramError::Network {
+                method: "sendVoice".to_string(),
+                description: format!("body read: {e}"),
+                retryable: false,
+            })?;
         let envelope: ApiResponse<Message> = serde_json::from_slice(&body_bytes.to_bytes())
             .map_err(|e| TelegramError::Parse {
                 method: "sendVoice".to_string(),
@@ -468,9 +476,7 @@ impl TelegramClient {
             if start.elapsed() > TOTAL_RETRY_BUDGET {
                 return Err(TelegramError::Network {
                     method: method.into(),
-                    description: format!(
-                        "exceeded {TOTAL_RETRY_BUDGET:?} retry budget"
-                    ),
+                    description: format!("exceeded {TOTAL_RETRY_BUDGET:?} retry budget"),
                     retryable: false,
                 });
             }
@@ -559,13 +565,8 @@ impl TelegramClient {
     }
 }
 
-/// Install rustls's process-wide crypto provider. Idempotent — the
-/// setup wizard's `prepare_audio_downloads` installs one, then the
-/// foreground-run path installs again. `install_default` returns
-/// `Err(existing)` on the second call, which we swallow because
-/// `ring` is the only provider we ever register (no risk of a dep
-/// silently picking a different backend). Verified by the
-/// `aws-lc-rs = deny` rule in `deny.toml`.
+/// Install rustls's process-wide crypto provider. Idempotent: wizard + foreground both call;
+/// second `install_default` returns `Err(existing)` which we swallow (ring-only per deny.toml).
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
@@ -667,12 +668,10 @@ mod tests {
         let as_str = std::str::from_utf8(&body).unwrap_or("");
         assert!(as_str.contains("--abcdef0123456789\r\n"));
         assert!(as_str.contains("--abcdef0123456789--\r\n"));
-        assert!(as_str.contains(
-            "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n987654\r\n"
-        ));
         assert!(
-            as_str.contains("Content-Disposition: form-data; name=\"duration\"\r\n\r\n3\r\n")
+            as_str.contains("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n987654\r\n")
         );
+        assert!(as_str.contains("Content-Disposition: form-data; name=\"duration\"\r\n\r\n3\r\n"));
         assert!(as_str.contains(
             "Content-Disposition: form-data; name=\"voice\"; filename=\"voice.oga\"\r\n"
         ));

@@ -39,8 +39,8 @@ use windows::Win32::System::Pipes::ImpersonateNamedPipeClient;
 use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
 use crate::platform::windows_auth::{
-    HandleGuard, OwnedSecurityDescriptor, current_user_sid, owner_only_sddl, sid_to_string,
-    to_io, token_user_sid,
+    HandleGuard, OwnedSecurityDescriptor, current_user_sid, owner_only_sddl, sid_to_string, to_io,
+    token_user_sid,
 };
 
 pub type Conn = NamedPipeServer;
@@ -186,13 +186,8 @@ fn peer_sid_via_impersonation(pipe: HANDLE) -> windows::core::Result<Vec<u8>> {
 
     let mut thread_token = HANDLE::default();
     unsafe {
-        // `OpenAsSelf = false` → we want the *impersonated* (peer's) token.
-        OpenThreadToken(
-            GetCurrentThread(),
-            TOKEN_QUERY,
-            false,
-            &mut thread_token,
-        )?;
+        // Identification-level clients require `OpenAsSelf`; the token is still the peer's.
+        OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut thread_token)?;
     }
     let _tok = HandleGuard(thread_token);
     token_user_sid(thread_token)
@@ -205,5 +200,66 @@ impl Drop for RevertGuard {
         unsafe {
             let _ = RevertToSelf();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    fn unique_pipe_name(tag: &str) -> String {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        format!("tebis-test-{tag}-{}-{ns:x}", std::process::id())
+    }
+
+    #[tokio::test]
+    async fn same_user_identification_client_is_trusted() {
+        let pipe_name = unique_pipe_name("ident");
+        let pipe_path = PathBuf::from(format!(r"\\.\pipe\{pipe_name}"));
+        let listener = Listener::bind(&pipe_path).expect("bind pipe");
+
+        let script = format!(
+            r#"
+$pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
+    '.',
+    '{pipe_name}',
+    [System.IO.Pipes.PipeDirection]::InOut,
+    [System.IO.Pipes.PipeOptions]::None,
+    [System.Security.Principal.TokenImpersonationLevel]::Identification
+)
+$pipe.Connect(5000)
+Start-Sleep -Milliseconds 500
+$pipe.Dispose()
+"#
+        );
+
+        let mut child = tokio::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn powershell.exe");
+
+        let conn = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("accept timed out")
+            .expect("accept");
+
+        assert!(
+            listener.is_trusted_peer(&conn),
+            "same-user Identification client must pass SID peer auth"
+        );
+
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("client wait timed out")
+            .expect("client wait");
+        assert!(status.success(), "PowerShell pipe client failed: {status}");
     }
 }

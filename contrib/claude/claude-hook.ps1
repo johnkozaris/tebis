@@ -107,7 +107,7 @@ function Forward {
             $PipeName,
             [System.IO.Pipes.PipeDirection]::InOut,
             [System.IO.Pipes.PipeOptions]::None,
-            [System.Security.Principal.TokenImpersonationLevel]::Anonymous
+            [System.Security.Principal.TokenImpersonationLevel]::Identification
         )
         try {
             # 2000 ms matches the `-w 2` timeout in the .sh branch.

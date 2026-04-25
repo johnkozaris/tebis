@@ -79,9 +79,8 @@ impl SessionState {
         self.autostart.as_ref().map(|a| a.session.as_str())
     }
 
-    /// Invariant 14: `autostart_lock` serializes provisioning so concurrent
-    /// messages don't race the TUI-boot sleep. Hook install runs outside
-    /// the lock — it's idempotent and has no ordering dep.
+    /// Invariant 14: `autostart_lock` serializes provisioning so concurrent messages don't
+    /// race the TUI-boot sleep. Hook install runs outside — idempotent, no ordering dep.
     pub async fn resolve_or_autostart(&self, tmux: &Mux) -> Result<String, ResolveError> {
         if let Some(existing) = self.target() {
             return Ok(existing);

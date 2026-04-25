@@ -107,14 +107,8 @@ pub struct Mux {
     max_output_chars: usize,
 }
 
-/// Invariant 13: on tmux, `exact_target` is `=NAME:0` — `=` forces exact match
-/// (`-t foo` prefix-matches `foobar`); `:0` is required so pane-oriented verbs
-/// (`send-keys`, `capture-pane`) resolve the target.
-///
-/// psmux does NOT prefix-match at all and treats a leading `=` as a literal
-/// character — so on Windows we use the bare name with `:0`. The security
-/// property (no cross-session landing) is preserved by psmux's exact-match
-/// semantics; the `=` would actively break every `-t` call.
+/// Invariant 13: tmux needs `=NAME:0` for exact pane targets. psmux treats `=`
+/// literally, so Windows uses `NAME:0`; psmux target matching is exact.
 struct SessionSlot {
     exact_target: String,
     lock: Mutex<()>,

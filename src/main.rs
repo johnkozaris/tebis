@@ -114,11 +114,8 @@ fn handle_setup() -> Result<()> {
     }
 }
 
-/// Download STT + TTS model files now (during setup) rather than on
-/// first daemon start. Discards the loaded subsystem — we only wanted
-/// the SHA-pinned downloads on disk. Failures log-and-continue so a
-/// wizard completion isn't held hostage to Hugging Face availability;
-/// the daemon's first-start path retries.
+/// Pre-download STT + TTS model files during setup (not on first daemon start). Discards
+/// the loaded subsystem; log-and-continue on failure so HF outages don't block the wizard.
 fn prepare_audio_downloads() -> Result<()> {
     let config = match config::Config::from_env() {
         Ok(c) => c,

@@ -154,14 +154,13 @@ mod tests {
             let our = data_dir().expect("data_dir with HOME override");
             let inside = our.join("claude-hook.sh");
             assert!(command_references_our_script(&inside.to_string_lossy()));
-            assert!(!command_references_our_script("/usr/local/bin/other-hook.sh"));
+            assert!(!command_references_our_script(
+                "/usr/local/bin/other-hook.sh"
+            ));
             assert!(!command_references_our_script("claude-hook.sh"));
             // Windows-shape invocation (raw string so we can use it on
             // Unix tests too; the helper does a plain substring check).
-            let wrapped = format!(
-                r#"powershell.exe -NoProfile -File "{}""#,
-                inside.display()
-            );
+            let wrapped = format!(r#"powershell.exe -NoProfile -File "{}""#, inside.display());
             assert!(command_references_our_script(&wrapped));
         });
     }
@@ -233,5 +232,23 @@ mod tests {
                 "rewrote with embedded Windows content"
             );
         });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn embedded_windows_hook_clients_expose_identity_to_pipe_server() {
+        for (name, content) in [
+            ("claude", CLAUDE_HOOK_SCRIPT),
+            ("copilot", COPILOT_HOOK_SCRIPT),
+        ] {
+            assert!(
+                content.contains("TokenImpersonationLevel]::Identification"),
+                "{name} hook must let the pipe server identify the same-user client"
+            );
+            assert!(
+                !content.contains("TokenImpersonationLevel]::Anonymous"),
+                "{name} hook would be rejected by impersonation-based peer auth"
+            );
+        }
     }
 }

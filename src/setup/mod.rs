@@ -87,14 +87,8 @@ pub(super) enum TtsChoice {
         model: String,
         voice: String,
         respond_to_all: bool,
-        /// Full path to `libonnxruntime.{dylib,so}` — written as
-        /// `ORT_DYLIB_PATH=<path>` so the daemon's `libloading` call
-        /// can find the shared library on Apple Silicon (where
-        /// `/opt/homebrew/lib` isn't in the default dyld search path)
-        /// and on Linux distros that don't symlink to `/usr/lib`.
-        /// `None` means "trust the default search path" — suitable for
-        /// env-file re-reads where the user or `tebis setup` has
-        /// already set this separately.
+        /// Full path to `libonnxruntime.{dylib,so}` → written as `ORT_DYLIB_PATH` so the
+        /// daemon's `libloading` finds it on Apple Silicon (`/opt/homebrew/lib` not in default dyld search) and Linux distros without the `/usr/lib` symlink. `None` trusts the default search.
         ort_dylib_path: Option<String>,
     },
     KokoroRemote {
@@ -468,9 +462,8 @@ fn build_env_file(
     out
 }
 
-/// Lines for keys NOT in the wizard-managed set — preserved so user-added
-/// settings (`TELEGRAM_NOTIFY`, `TELEGRAM_AUTOREPLY`, …) survive re-runs.
-/// Comments and blanks are dropped; the wizard emits its own headers.
+/// Lines for keys not in the wizard-managed set — preserved so user-added settings
+/// (`TELEGRAM_NOTIFY`, `TELEGRAM_AUTOREPLY`, …) survive re-runs. Comments/blanks dropped.
 fn extra_lines_to_preserve(env_path: &Path) -> Vec<String> {
     let Ok(content) = fs::read_to_string(env_path) else {
         return Vec::new();

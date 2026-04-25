@@ -63,7 +63,7 @@ function Forward {
             $PipeName,
             [System.IO.Pipes.PipeDirection]::InOut,
             [System.IO.Pipes.PipeOptions]::None,
-            [System.Security.Principal.TokenImpersonationLevel]::Anonymous
+            [System.Security.Principal.TokenImpersonationLevel]::Identification
         )
         try {
             $pipe.Connect(2000)

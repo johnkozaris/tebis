@@ -49,10 +49,8 @@ pub struct HandlerContext {
     pub tracker: TaskTracker,
     pub shutdown: CancellationToken,
     pub audio: Option<Arc<AudioSubsystem>>,
-    /// `BRIDGE_ENV_FILE` — required for runtime config writes
-    /// (`/tts`, inspect Settings). `None` → mutative commands reply
-    /// with a "set `BRIDGE_ENV_FILE`" error instead of silently
-    /// accepting a no-op.
+    /// `BRIDGE_ENV_FILE` — required for runtime config writes (`/tts`, inspect Settings).
+    /// `None` → mutative commands reply with an explicit error instead of a silent no-op.
     pub env_file_path: Option<std::path::PathBuf>,
 }
 
@@ -228,10 +226,8 @@ fn handle_tts_command(ctx: &HandlerContext, v: &handler::TtsVerb) -> Response {
     }
 }
 
-/// Persist `TELEGRAM_TTS_BACKEND=<value>` and trigger a graceful restart.
-/// For `kokoro-local` also probes `libonnxruntime` and writes `ORT_DYLIB_PATH`
-/// (the ort crate's default dyld search misses /opt/homebrew/lib on Apple
-/// Silicon); for every other target, removes any stale `ORT_DYLIB_PATH`.
+/// Persist `TELEGRAM_TTS_BACKEND=<value>` and trigger a graceful restart. `kokoro-local`
+/// also probes + writes `ORT_DYLIB_PATH` (ort's dyld search misses /opt/homebrew/lib).
 fn switch_tts_backend(ctx: &HandlerContext, value: &str) -> Response {
     let Some(env_path) = ctx.env_file_path.as_ref() else {
         return Response::Text(
@@ -563,9 +559,8 @@ async fn synthesize_and_send_voice_detached(
     metrics.record_tts_success(synth_ms);
 }
 
-/// Strip the `<pre>`/`<code>` wrappers we produce and decode the
-/// entities `escape_html` emits. Sentinel-swap `&amp;` so we don't
-/// double-decode inputs like `&amp;lt;` (should stay as `&lt;`, not become `<`).
+/// Strip `<pre>`/`<code>` wrappers and decode entities from `escape_html`. Sentinel-swap
+/// `&amp;` to avoid double-decoding inputs like `&amp;lt;` (must stay `&lt;`, not `<`).
 fn strip_html_for_tts(body: &str) -> String {
     let no_tags = body
         .replace("<pre>", "")

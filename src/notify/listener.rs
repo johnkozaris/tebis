@@ -155,9 +155,8 @@ where
     Ok(payload)
 }
 
-/// Invariant 11: newline-framed, NOT EOF-framed. macOS's stock `nc` lacks
-/// `-N` for UDS half-close, so hook scripts use `nc -U -w 2` and depend on
-/// `\n` to flush. Hard cap bounds a client that never sends one.
+/// Invariant 11: newline-framed, not EOF-framed — macOS `nc` lacks `-N` for UDS
+/// half-close, so hook scripts use `nc -U -w 2` and depend on `\n` to flush.
 async fn read_until_bounded<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     delim: u8,

@@ -125,9 +125,8 @@ fn format_pane_reply(pane: &str) -> String {
     crate::sanitize::wrap_and_truncate(&escaped, "<pre>", "</pre>")
 }
 
-/// Anchor on the last 3 non-empty baseline lines; everything after that
-/// point in `after` is new. `find` not `rfind` so a reply that echoes the
-/// anchor back (quoted prompt) doesn't strip the real content before it.
+/// Anchor on last 3 non-empty baseline lines; everything after that point in `after` is new.
+/// `find` not `rfind` so an echoed/quoted prompt doesn't strip real content before it.
 fn extract_new(baseline: Option<&str>, after: &str) -> String {
     let Some(baseline) = baseline else {
         return after.to_string();

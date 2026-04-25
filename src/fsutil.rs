@@ -20,9 +20,8 @@ use anyhow::{Context, Result};
 /// pid+nanos+counter. Two is plenty — a third failure is a real problem.
 const TMP_RETRIES: usize = 3;
 
-/// Write `bytes` to `path` atomically. On Unix, `mode` is applied to the tmp file
-/// at creation and re-asserted via `chmod` after write. On Windows `mode` is
-/// ignored (DACL inheritance handles access control).
+/// Atomic write with POSIX `mode` on Unix via `O_CREAT|O_EXCL`; pre-existing tmp paths
+/// can't be reused. On Windows, `mode` is ignored and atomic replace uses `MoveFileExW`.
 pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -147,7 +146,10 @@ mod tests {
         let p = tmp("0600");
         let _ = fs::remove_file(&p);
         atomic_write(&p, b"x\n", 0o600).unwrap();
-        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert_eq!(fs::read(&p).unwrap(), b"x\n");
         let _ = fs::remove_file(&p);
     }
@@ -158,7 +160,10 @@ mod tests {
         let p = tmp("0644");
         let _ = fs::remove_file(&p);
         atomic_write(&p, b"y", 0o644).unwrap();
-        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
         let _ = fs::remove_file(&p);
     }
 
@@ -169,7 +174,10 @@ mod tests {
         fs::write(&p, "old").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
         atomic_write(&p, b"new\n", 0o600).unwrap();
-        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = fs::remove_file(&p);
     }
 
@@ -198,4 +206,3 @@ mod tests {
         let _ = fs::remove_file(&p);
     }
 }
-

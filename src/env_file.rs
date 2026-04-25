@@ -59,8 +59,7 @@ pub fn parse_toggle(value: &str) -> Result<Option<bool>> {
     }
 }
 
-/// Upsert `KEY=value` pairs in `path`, preserving comments + line order.
-/// Missing file is treated as empty. Keys not already present are appended.
+/// Upsert `KEY=value` pairs, preserving comments + order. Missing file = empty.
 /// Atomic 0600 write via [`atomic_write_0600`].
 pub fn upsert_keys(path: &Path, updates: &[(&str, String)]) -> Result<()> {
     let current = std::fs::read_to_string(path).unwrap_or_default();
@@ -205,7 +204,10 @@ mod tests {
         .unwrap();
         remove_keys(&p, &["ORT_DYLIB_PATH", "MISSING"]).unwrap();
         let body = fs::read_to_string(&p).unwrap();
-        assert!(!body.contains("ORT_DYLIB_PATH"), "key must be gone: {body:?}");
+        assert!(
+            !body.contains("ORT_DYLIB_PATH"),
+            "key must be gone: {body:?}"
+        );
         assert!(body.contains("FOO=bar"), "other key must survive: {body:?}");
         assert!(body.contains("BAZ="), "other key must survive: {body:?}");
         assert!(body.contains("# preamble comment"), "comments preserved");
@@ -213,7 +215,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         let _ = fs::remove_file(&p);
     }
