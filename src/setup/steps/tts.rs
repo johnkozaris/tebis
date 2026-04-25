@@ -6,18 +6,27 @@ use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input, Select};
 
 use super::super::{TtsChoice, ui};
-use crate::platform::tts_support::{kokoro_local_auto_install_supported, say_backend_supported};
+use crate::platform::tts_support::{
+    NativeTtsKind, kokoro_local_auto_install_supported, native_tts_kind,
+};
 
 pub(in crate::setup) fn step_tts(
     theme: &ColorfulTheme,
     existing: Option<&TtsChoice>,
 ) -> Result<Option<TtsChoice>> {
     ui::step_header(8, "Voice replies (optional)");
-    println!("Synthesize text replies back as voice notes. Three backends:");
-    println!(
-        "  • {}: macOS-native, zero install, lower quality",
-        style("say").bold(),
-    );
+    println!("Synthesize text replies back as voice notes. Available backends:");
+    match native_tts_kind() {
+        Some(NativeTtsKind::Say) => println!(
+            "  • {}: macOS built-in, zero install, modest quality",
+            style("say").bold(),
+        ),
+        Some(NativeTtsKind::WinRt) => println!(
+            "  • {}: Windows built-in WinRT SpeechSynthesizer, zero install, OneCore voices",
+            style("winrt").bold(),
+        ),
+        None => {}
+    }
     println!(
         "  • {}: neural ONNX + {}, cross-platform (feature-gated)",
         style("kokoro-local").bold(),
@@ -58,32 +67,17 @@ pub(in crate::setup) fn step_tts(
     }
 }
 
-/// macOS → `say`; Linux → Kokoro local (auto-installs espeak-ng). Windows →
-/// surfaces `kokoro-remote` as the only simple path (no pkg-manager driver
-/// for espeak-ng / onnxruntime yet). Falls through to `Off` on failure.
-fn simple_tts(
-    theme: &ColorfulTheme,
-    existing: Option<&TtsChoice>,
-) -> Result<Option<TtsChoice>> {
+/// macOS → `say`; Windows → WinRT; Linux → Kokoro local (auto-installs
+/// espeak-ng). Any OS with no native backend + no auto-install path
+/// (e.g. BSDs) falls through to a Kokoro-remote Y/N. Never dead-ends.
+fn simple_tts(theme: &ColorfulTheme, existing: Option<&TtsChoice>) -> Result<Option<TtsChoice>> {
     let respond_to_all = existing.is_some_and(TtsChoice::respond_to_all);
 
-    #[cfg(target_os = "macos")]
-    {
-        let _ = theme;
-        let voice = existing_voice_or(existing, "Samantha");
-        println!();
-        println!(
-            "  {} macOS {} with voice {}.",
-            style("✓").green(),
-            style("say").bold(),
-            style(&voice).bold(),
-        );
-        return Ok(Some(TtsChoice::Say {
-            voice,
-            respond_to_all,
-        }));
+    if let Some(kind) = native_tts_kind() {
+        return simple_native(kind, existing, respond_to_all);
     }
 
+    // Linux: try Kokoro-local auto-install (espeak-ng + onnxruntime).
     #[cfg(target_os = "linux")]
     {
         println!();
@@ -96,37 +90,99 @@ fn simple_tts(
         return kokoro_local_simple_flow(theme, existing, respond_to_all);
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    // Anything else (BSD, unknown) — no native, no auto-install path.
+    #[cfg(not(target_os = "linux"))]
     {
-        // Windows and other targets: no auto-install path for the
-        // Kokoro-local dependencies. Offer remote as the one-step simple
-        // option; Advanced still exposes Kokoro-local for users with a
-        // hand-installed ONNX Runtime DLL.
         let _ = (theme, respond_to_all);
+        debug_assert!(native_tts_kind().is_none());
         debug_assert!(!kokoro_local_auto_install_supported());
-        println!();
-        println!(
-            "  {} Local TTS dependencies ({} + {}) don't have an auto-install \
-             path on this OS yet.",
-            style("ℹ").cyan(),
-            style("espeak-ng").bold(),
-            style("onnxruntime").bold(),
-        );
-        println!(
-            "  Choose {} for a network-hosted voice, or {} to stay text-only.",
-            style("Advanced → Kokoro (remote)").bold(),
-            style("Skip").bold(),
-        );
-        let want_remote = Confirm::with_theme(theme)
-            .with_prompt("Configure Kokoro (remote) now?")
-            .default(false)
-            .interact()
-            .context("prompt: simple windows remote")?;
-        if want_remote {
-            return configure_kokoro_remote(theme, existing, respond_to_all);
-        }
-        Ok(Some(TtsChoice::Off))
+        simple_fallback_remote_or_off(theme, existing, respond_to_all)
     }
+}
+
+/// macOS `say` / Windows WinRT — both are zero-install so the Simple
+/// flow just picks a default voice and is done.
+fn simple_native(
+    kind: NativeTtsKind,
+    existing: Option<&TtsChoice>,
+    respond_to_all: bool,
+) -> Result<Option<TtsChoice>> {
+    match kind {
+        NativeTtsKind::Say => {
+            let voice = existing_voice_or(existing, "Samantha");
+            println!();
+            println!(
+                "  {} macOS {} with voice {}.",
+                style("✓").green(),
+                style("say").bold(),
+                style(&voice).bold(),
+            );
+            Ok(Some(TtsChoice::Say {
+                voice,
+                respond_to_all,
+            }))
+        }
+        NativeTtsKind::WinRt => {
+            // WinRT picks an installed voice if we leave this empty —
+            // matches "use system default" behavior most Windows users
+            // expect from a zero-install flow.
+            let voice = existing_voice_or(existing, "");
+            println!();
+            if voice.is_empty() {
+                println!(
+                    "  {} Windows {} with the system default voice.",
+                    style("✓").green(),
+                    style("WinRT SpeechSynthesizer").bold(),
+                );
+                println!(
+                    "     Pick a specific voice (e.g. {}, {}) in {}.",
+                    style("Zira").bold(),
+                    style("David").bold(),
+                    style("Advanced").bold(),
+                );
+            } else {
+                println!(
+                    "  {} Windows {} with voice substring {}.",
+                    style("✓").green(),
+                    style("WinRT SpeechSynthesizer").bold(),
+                    style(&voice).bold(),
+                );
+            }
+            Ok(Some(TtsChoice::WinRt {
+                voice,
+                respond_to_all,
+            }))
+        }
+    }
+}
+
+/// Simple flow escape hatch for OSes without a native TTS or auto-install
+/// path — offer Kokoro (remote) or Off; never panic.
+#[cfg(not(target_os = "linux"))]
+fn simple_fallback_remote_or_off(
+    theme: &ColorfulTheme,
+    existing: Option<&TtsChoice>,
+    respond_to_all: bool,
+) -> Result<Option<TtsChoice>> {
+    println!();
+    println!(
+        "  {} No native or auto-installable TTS backend on this OS.",
+        style("ℹ").cyan(),
+    );
+    println!(
+        "  Choose {} for a network-hosted voice, or {} to stay text-only.",
+        style("Advanced → Kokoro (remote)").bold(),
+        style("Skip").bold(),
+    );
+    let want_remote = Confirm::with_theme(theme)
+        .with_prompt("Configure Kokoro (remote) now?")
+        .default(false)
+        .interact()
+        .context("prompt: simple fallback remote")?;
+    if want_remote {
+        return configure_kokoro_remote(theme, existing, respond_to_all);
+    }
+    Ok(Some(TtsChoice::Off))
 }
 
 /// Probe-and-install Kokoro-local dependencies, preserving existing config on
@@ -169,46 +225,62 @@ fn kokoro_local_simple_flow(
     }
 }
 
-fn advanced_tts(
-    theme: &ColorfulTheme,
-    existing: Option<&TtsChoice>,
-) -> Result<Option<TtsChoice>> {
+fn advanced_tts(theme: &ColorfulTheme, existing: Option<&TtsChoice>) -> Result<Option<TtsChoice>> {
     #[derive(Clone, Copy)]
     enum Pick {
+        Native(NativeTtsKind),
         KokoroLocal,
         KokoroRemote,
-        Say,
         None,
     }
 
-    #[allow(
-        clippy::vec_init_then_push,
-        reason = "cfg-gated middle entry rules out a flat vec![] literal"
-    )]
-    let options: Vec<(&'static str, Pick)> = {
-        let mut v = vec![
-            (
-                "Kokoro (local)    — neural, offline, needs espeak-ng",
-                Pick::KokoroLocal,
-            ),
-            (
-                "Kokoro (remote)   — HTTP endpoint (Kokoro-FastAPI, etc.)",
-                Pick::KokoroRemote,
-            ),
-        ];
-        if say_backend_supported() {
-            v.push(("Say (macOS only)  — built-in, lower quality", Pick::Say));
-        }
-        v.push(("None              — text-only replies", Pick::None));
-        v
-    };
+    // Build the catalog based on capabilities, not hardcoded cfg —
+    // this is the OCP seam: adding a backend means adding an entry,
+    // not editing 7 files.
+    let mut options: Vec<(&'static str, Pick)> = Vec::new();
+    if let Some(kind) = native_tts_kind() {
+        options.push((
+            match kind {
+                NativeTtsKind::Say => "Say (macOS)       — built-in, modest quality",
+                NativeTtsKind::WinRt => "WinRT (Windows)   — built-in, OneCore voices",
+            },
+            Pick::Native(kind),
+        ));
+    }
+    options.push((
+        "Kokoro (local)    — neural, offline, needs espeak-ng",
+        Pick::KokoroLocal,
+    ));
+    options.push((
+        "Kokoro (remote)   — HTTP endpoint (Kokoro-FastAPI, etc.)",
+        Pick::KokoroRemote,
+    ));
+    options.push(("None              — text-only replies", Pick::None));
 
     let default_idx: usize = match existing {
-        Some(TtsChoice::KokoroLocal { .. }) => 0,
-        Some(TtsChoice::KokoroRemote { .. }) => 1,
-        Some(TtsChoice::Say { .. }) if say_backend_supported() => 2,
-        Some(TtsChoice::Say { .. }) => 0,
+        Some(TtsChoice::Say { .. }) if matches!(native_tts_kind(), Some(NativeTtsKind::Say)) => 0,
+        Some(TtsChoice::WinRt { .. })
+            if matches!(native_tts_kind(), Some(NativeTtsKind::WinRt)) =>
+        {
+            0
+        }
+        Some(TtsChoice::KokoroLocal { .. }) => {
+            if native_tts_kind().is_some() {
+                1
+            } else {
+                0
+            }
+        }
+        Some(TtsChoice::KokoroRemote { .. }) => {
+            if native_tts_kind().is_some() {
+                2
+            } else {
+                1
+            }
+        }
         Some(TtsChoice::Off) | None => options.len().saturating_sub(1),
+        // Unreachable on a given host (e.g. `Say` on Windows), fall to "None".
+        Some(_) => options.len().saturating_sub(1),
     };
 
     let labels: Vec<&str> = options.iter().map(|(l, _)| *l).collect();
@@ -224,45 +296,68 @@ fn advanced_tts(
 
     match pick {
         Pick::None => Ok(Some(TtsChoice::Off)),
-        Pick::Say => configure_say(theme, existing, respond_to_all_default),
+        Pick::Native(kind) => configure_native(theme, kind, existing, respond_to_all_default),
         Pick::KokoroLocal => configure_kokoro_local(theme, existing, respond_to_all_default),
         Pick::KokoroRemote => configure_kokoro_remote(theme, existing, respond_to_all_default),
     }
 }
 
-#[cfg(target_os = "macos")]
-fn configure_say(
+fn configure_native(
     theme: &ColorfulTheme,
+    kind: NativeTtsKind,
     existing: Option<&TtsChoice>,
     respond_to_all_default: bool,
 ) -> Result<Option<TtsChoice>> {
-    let voice: String = Input::with_theme(theme)
-        .with_prompt("`say` voice (e.g. Samantha, Alex, Ava (Premium))")
-        .default(existing_voice_or(existing, "Samantha"))
-        .interact_text()
-        .context("prompt: say voice")?;
-    let respond_to_all = Confirm::with_theme(theme)
-        .with_prompt("Voice-reply to typed messages too?")
-        .default(respond_to_all_default)
-        .interact()
-        .context("prompt: say respond_to_all")?;
-    Ok(Some(TtsChoice::Say {
-        voice,
-        respond_to_all,
-    }))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn configure_say(
-    _theme: &ColorfulTheme,
-    _existing: Option<&TtsChoice>,
-    _respond_to_all_default: bool,
-) -> Result<Option<TtsChoice>> {
-    // Dead branch — UI hides `Say` on non-macOS. Degrade instead of panicking.
-    tracing::warn!(
-        "configure_say invoked on non-macOS; falling back to TTS off"
-    );
-    Ok(Some(TtsChoice::Off))
+    match kind {
+        NativeTtsKind::Say => {
+            let voice: String = Input::with_theme(theme)
+                .with_prompt("`say` voice (e.g. Samantha, Alex, Ava (Premium))")
+                .default(existing_voice_or(existing, "Samantha"))
+                .interact_text()
+                .context("prompt: say voice")?;
+            let respond_to_all = Confirm::with_theme(theme)
+                .with_prompt("Voice-reply to typed messages too?")
+                .default(respond_to_all_default)
+                .interact()
+                .context("prompt: say respond_to_all")?;
+            Ok(Some(TtsChoice::Say {
+                voice,
+                respond_to_all,
+            }))
+        }
+        NativeTtsKind::WinRt => {
+            println!();
+            println!(
+                "  {}: substring match on installed voice. Common names: \
+                 {}, {}, {} (US English); {} (UK English).",
+                style("Voice").dim(),
+                style("Zira").bold(),
+                style("David").bold(),
+                style("Mark").bold(),
+                style("Hazel").bold(),
+            );
+            println!(
+                "  Leave empty for the system default. Win11 \"Natural\" voices \
+                 (Aria/Jenny/Guy) are Narrator-only and {}.",
+                style("not exposed to third-party apps").dim(),
+            );
+            let voice: String = Input::with_theme(theme)
+                .with_prompt("Voice substring (empty = default)")
+                .default(existing_voice_or(existing, ""))
+                .allow_empty(true)
+                .interact_text()
+                .context("prompt: winrt voice")?;
+            let respond_to_all = Confirm::with_theme(theme)
+                .with_prompt("Voice-reply to typed messages too?")
+                .default(respond_to_all_default)
+                .interact()
+                .context("prompt: winrt respond_to_all")?;
+            Ok(Some(TtsChoice::WinRt {
+                voice: voice.trim().to_string(),
+                respond_to_all,
+            }))
+        }
+    }
 }
 
 fn configure_kokoro_local(
@@ -276,6 +371,19 @@ fn configure_kokoro_local(
         style("espeak-ng").bold(),
         style("onnxruntime").bold(),
     );
+    if !kokoro_local_auto_install_supported() {
+        println!(
+            "   {} Auto-install not wired on this OS. {}:",
+            style("⚠").yellow(),
+            style("Install manually").bold(),
+        );
+        println!("     • espeak-ng: add to PATH");
+        println!(
+            "     • onnxruntime: set {} to the DLL/dylib/so path",
+            style("ORT_DYLIB_PATH").bold()
+        );
+        println!("   The daemon will start if these env vars point at valid binaries.");
+    }
     let espeak = super::super::phonemizer::ensure_or_install(theme)
         .context("probing / installing espeak-ng")?;
     if !matches!(espeak, super::super::phonemizer::EnsureOutcome::Ready(_)) {
@@ -289,18 +397,12 @@ fn configure_kokoro_local(
                 "falling back to no TTS"
             },
         );
-        // Preserve the user's prior Kokoro config on transient install
-        // failure so a re-run doesn't cost them voice/model/flag picks.
         return Ok(Some(match existing {
             Some(c @ TtsChoice::KokoroLocal { .. }) => c.clone(),
             _ => TtsChoice::Off,
         }));
     }
 
-    // onnxruntime: the `ort` crate's `load-dynamic` searches the default
-    // dyld paths, which DON'T include `/opt/homebrew/lib` on Apple
-    // Silicon. We probe, install if missing, and the caller writes the
-    // resolved full path to `ORT_DYLIB_PATH` in the env file.
     let ort_outcome = super::super::onnxruntime::ensure_or_install(theme)
         .context("probing / installing onnxruntime")?;
     let ort_path = match ort_outcome {
@@ -383,7 +485,6 @@ fn configure_kokoro_remote(
         .allow_empty(true)
         .interact_text()
         .context("prompt: remote api key")?;
-    // Trim — a trailing space would break the Bearer header silently.
     let api_key_trimmed = api_key_raw.trim();
     let api_key = if api_key_trimmed.is_empty() {
         None

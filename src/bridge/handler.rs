@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use super::session::SessionState;
-use crate::sanitize;
 use crate::platform::multiplexer::Mux;
+use crate::sanitize;
 
 pub enum Command {
     List,
@@ -44,6 +44,7 @@ pub enum TtsVerb {
     Status,
     Off,
     Say,
+    WinRt,
     KokoroLocal,
     KokoroRemote,
     Unknown(String),
@@ -138,7 +139,7 @@ pub fn parse(text: &str) -> Command {
     }
 
     // `/tts` — backend picker. `/tts` alone (or `/tts status`) reports;
-    // `/tts {off,say,kokoro-local,kokoro-remote}` switches (via env-file
+    // `/tts {off,say,winrt,kokoro-local,kokoro-remote}` switches (via env-file
     // write + graceful restart in `bridge::handle_update`).
     if text.eq_ignore_ascii_case("/tts") {
         return Command::Tts(TtsVerb::Status);
@@ -148,6 +149,7 @@ pub fn parse(text: &str) -> Command {
             "" | "status" => TtsVerb::Status,
             "off" | "none" | "disable" | "disabled" => TtsVerb::Off,
             "say" => TtsVerb::Say,
+            "winrt" => TtsVerb::WinRt,
             "kokoro-local" | "kokoro_local" | "local" => TtsVerb::KokoroLocal,
             "kokoro-remote" | "kokoro_remote" | "remote" => TtsVerb::KokoroRemote,
             other => TtsVerb::Unknown(other.to_string()),
@@ -194,7 +196,9 @@ async fn handle(cmd: Command, deps: &Deps<'_>) -> HandleResult {
 async fn list(deps: &Deps<'_>) -> HandleResult {
     let live = deps.tmux.list_sessions().await.map_err(|e| e.to_string())?;
     if live.is_empty() {
-        return Ok(Response::Text("No active tmux sessions.".to_string()));
+        return Ok(Response::Text(
+            "No active multiplexer sessions.".to_string(),
+        ));
     }
 
     let permissive = deps.tmux.is_permissive();
@@ -412,15 +416,15 @@ fn format_uptime(d: std::time::Duration) -> String {
 
 const HELP_BASE: &str = concat!(
     "<b>Commands:</b>\n",
-    "/list — list tmux sessions (✓ = allowlisted)\n",
+    "/list — list multiplexer sessions (✓ = allowlisted)\n",
     "/status — show bridge state\n",
     "/send &lt;session&gt; &lt;text&gt; — send text to session\n",
     "/read [session] [lines] — read pane output\n",
     "/target &lt;session&gt; — set default session\n",
-    "/new &lt;session&gt; — create an empty detached tmux session\n",
-    "/kill &lt;session&gt; — kill a tmux session\n",
+    "/new &lt;session&gt; — create an empty detached multiplexer session\n",
+    "/kill &lt;session&gt; — kill a multiplexer session\n",
     "/restart — kill autostart session, re-provision on next message\n",
-    "/tts [off|say|kokoro-local|kokoro-remote|status] — pick or disable voice replies\n",
+    "/tts [off|say|winrt|kokoro-local|kokoro-remote|status] — pick or disable voice replies\n",
     "/help — show this help\n\n",
     "Plain text is sent to the default target session. If autostart is ",
     "configured and no target is set, the first plain-text message ",
@@ -514,6 +518,7 @@ mod tests {
         assert_eq!(verb(&parse("/tts none")), &TtsVerb::Off);
         assert_eq!(verb(&parse("/tts disable")), &TtsVerb::Off);
         assert_eq!(verb(&parse("/tts say")), &TtsVerb::Say);
+        assert_eq!(verb(&parse("/tts winrt")), &TtsVerb::WinRt);
         assert_eq!(verb(&parse("/tts kokoro-local")), &TtsVerb::KokoroLocal);
         assert_eq!(verb(&parse("/tts kokoro_local")), &TtsVerb::KokoroLocal);
         assert_eq!(verb(&parse("/tts local")), &TtsVerb::KokoroLocal);

@@ -19,7 +19,11 @@ pub(super) fn print_welcome() {
     );
     println!(
         "{}",
-        style("Telegram → tmux bridge · first-run setup").dim(),
+        style(format!(
+            "Telegram → {} bridge · first-run setup",
+            crate::platform::multiplexer::BINARY
+        ))
+        .dim(),
     );
     println!();
 }
@@ -184,6 +188,14 @@ pub(super) fn print_summary(
                 TtsChoice::Off => style("(disabled)").dim().to_string(),
                 TtsChoice::Say { voice, .. } => {
                     format!("macOS `say` · voice: {} · {scope}", style(voice).bold())
+                }
+                TtsChoice::WinRt { voice, .. } => {
+                    let v = if voice.is_empty() {
+                        "default"
+                    } else {
+                        voice.as_str()
+                    };
+                    format!("Windows WinRT · voice: {} · {scope}", style(v).bold())
                 }
                 TtsChoice::KokoroLocal { model, voice, .. } => {
                     format!(

@@ -5,6 +5,7 @@ use std::path::Path;
 
 use super::{Autostart, HooksChoice, TtsChoice, VoiceChoice};
 use crate::env_file;
+use crate::platform::tts_support::{NativeTtsKind, native_tts_kind};
 
 /// Pre-fill values from an existing env file; missing → fresh defaults.
 #[derive(Default)]
@@ -114,7 +115,8 @@ pub(super) fn discover(env_path: &Path) -> Discovered {
                 tts_remote_model = Some(value.to_string());
             }
             "TELEGRAM_TTS_REMOTE_TIMEOUT_SEC" => {
-                tts_remote_timeout_sec = value.parse().ok().filter(|&n: &u32| (1..=300).contains(&n));
+                tts_remote_timeout_sec =
+                    value.parse().ok().filter(|&n: &u32| (1..=300).contains(&n));
             }
             "TELEGRAM_TTS_REMOTE_ALLOW_HTTP" => {
                 tts_remote_allow_http = crate::env_file::parse_toggle(value).ok().flatten();
@@ -136,7 +138,7 @@ pub(super) fn discover(env_path: &Path) -> Discovered {
         });
     }
 
-    // Priority: explicit BACKEND → legacy `TELEGRAM_TTS=on` (Say) → None.
+    // Priority: explicit BACKEND → legacy `TELEGRAM_TTS=on` (native) → None.
     d.tts = resolve_tts_choice(
         tts_backend.as_deref(),
         legacy_tts_on,
@@ -152,7 +154,10 @@ pub(super) fn discover(env_path: &Path) -> Discovered {
     d
 }
 
-#[allow(clippy::too_many_arguments, reason = "wizard-internal helper; grouping adds nothing")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "wizard-internal helper; grouping adds nothing"
+)]
 fn resolve_tts_choice(
     backend: Option<&str>,
     legacy_on: Option<bool>,
@@ -169,10 +174,17 @@ fn resolve_tts_choice(
         Some(s) => s,
         None => {
             return match legacy_on {
-                Some(true) => Some(TtsChoice::Say {
-                    voice: voice.unwrap_or_else(|| "Samantha".to_string()),
-                    respond_to_all,
-                }),
+                Some(true) => match native_tts_kind() {
+                    Some(NativeTtsKind::Say) => Some(TtsChoice::Say {
+                        voice: voice.unwrap_or_else(|| "Samantha".to_string()),
+                        respond_to_all,
+                    }),
+                    Some(NativeTtsKind::WinRt) => Some(TtsChoice::WinRt {
+                        voice: voice.unwrap_or_default(),
+                        respond_to_all,
+                    }),
+                    None => None,
+                },
                 Some(false) => Some(TtsChoice::Off),
                 None => None,
             };
@@ -183,6 +195,10 @@ fn resolve_tts_choice(
         "none" | "off" | "false" | "0" => Some(TtsChoice::Off),
         "say" => Some(TtsChoice::Say {
             voice: voice.unwrap_or_else(|| "Samantha".to_string()),
+            respond_to_all,
+        }),
+        "winrt" => Some(TtsChoice::WinRt {
+            voice: voice.unwrap_or_default(),
             respond_to_all,
         }),
         "kokoro-local" | "kokoro_local" | "local" => Some(TtsChoice::KokoroLocal {
@@ -323,7 +339,10 @@ INSPECT_PORT=51624
         .unwrap();
         let d = discover(&tmp);
         match d.tts.expect("tts choice") {
-            TtsChoice::Say { voice, respond_to_all } => {
+            TtsChoice::Say {
+                voice,
+                respond_to_all,
+            } => {
                 assert_eq!(voice, "Alex");
                 assert!(respond_to_all);
             }
@@ -334,8 +353,10 @@ INSPECT_PORT=51624
 
     #[test]
     fn discover_reads_tts_backend_remote() {
-        let tmp = std::env::temp_dir()
-            .join(format!("tebis-discover-tts-remote-{}.env", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!(
+            "tebis-discover-tts-remote-{}.env",
+            std::process::id()
+        ));
         fs::write(
             &tmp,
             "TELEGRAM_TTS_BACKEND=kokoro-remote\n\
@@ -371,8 +392,10 @@ INSPECT_PORT=51624
 
     #[test]
     fn discover_remote_without_url_returns_none() {
-        let tmp = std::env::temp_dir()
-            .join(format!("tebis-discover-tts-noremote-{}.env", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!(
+            "tebis-discover-tts-noremote-{}.env",
+            std::process::id()
+        ));
         fs::write(&tmp, "TELEGRAM_TTS_BACKEND=kokoro-remote\n").unwrap();
         let d = discover(&tmp);
         assert!(d.tts.is_none());
@@ -380,26 +403,29 @@ INSPECT_PORT=51624
     }
 
     #[test]
-    fn discover_legacy_tts_on_interpreted_as_say() {
-        let tmp = std::env::temp_dir()
-            .join(format!("tebis-discover-legacy-{}.env", std::process::id()));
-        fs::write(
-            &tmp,
-            "TELEGRAM_TTS=on\nTELEGRAM_TTS_VOICE=Samantha\n",
-        )
-        .unwrap();
+    fn discover_legacy_tts_on_interpreted_as_native_backend() {
+        let tmp =
+            std::env::temp_dir().join(format!("tebis-discover-legacy-{}.env", std::process::id()));
+        fs::write(&tmp, "TELEGRAM_TTS=on\nTELEGRAM_TTS_VOICE=Samantha\n").unwrap();
         let d = discover(&tmp);
-        match d.tts.expect("legacy tts on") {
-            TtsChoice::Say { voice, .. } => assert_eq!(voice, "Samantha"),
-            other => panic!("expected Say, got {other:?}"),
+        match native_tts_kind() {
+            Some(NativeTtsKind::Say) => match d.tts.expect("legacy tts on") {
+                TtsChoice::Say { voice, .. } => assert_eq!(voice, "Samantha"),
+                other => panic!("expected Say, got {other:?}"),
+            },
+            Some(NativeTtsKind::WinRt) => match d.tts.expect("legacy tts on") {
+                TtsChoice::WinRt { voice, .. } => assert_eq!(voice, "Samantha"),
+                other => panic!("expected WinRt, got {other:?}"),
+            },
+            None => assert!(d.tts.is_none()),
         }
         let _ = fs::remove_file(&tmp);
     }
 
     #[test]
     fn discover_tts_backend_none_is_off() {
-        let tmp = std::env::temp_dir()
-            .join(format!("tebis-discover-ttsnone-{}.env", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("tebis-discover-ttsnone-{}.env", std::process::id()));
         fs::write(&tmp, "TELEGRAM_TTS_BACKEND=none\n").unwrap();
         let d = discover(&tmp);
         assert!(matches!(d.tts, Some(TtsChoice::Off)));

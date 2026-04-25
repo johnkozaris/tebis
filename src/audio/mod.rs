@@ -1,4 +1,4 @@
-//! Voice bridge subsystem. STT via whisper-rs; TTS via `say` / Kokoro.
+//! Voice bridge subsystem. STT via whisper-rs; TTS via native / Kokoro / remote backends.
 
 pub mod cache;
 pub mod codec;
@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use self::stt::{Stt as _, SttConfig, SttError, Transcription};
-#[cfg(any(target_os = "macos", feature = "kokoro"))]
+#[cfg(any(target_os = "macos", target_os = "windows", feature = "kokoro-local"))]
 use self::tts::Tts as _;
 use self::tts::{TtsConfig, TtsError};
 
@@ -65,7 +65,7 @@ pub struct AudioSubsystem {
     stt_language: Option<String>,
     tts_voice: Option<String>,
     tts_respond_to_all: bool,
-    /// `"none"`, `"say"`, `"kokoro-local"`, or `"kokoro-remote"`.
+    /// `"none"`, `"say"`, `"winrt"`, `"kokoro-local"`, or `"kokoro-remote"`.
     tts_backend_kind: &'static str,
     /// Redacted host for remote, manifest model key for local.
     tts_detail: Option<String>,
@@ -151,7 +151,10 @@ impl AudioSubsystem {
 
     /// Transcribe 16 kHz mono `f32` PCM.
     pub async fn transcribe(&self, pcm: &[f32], lang: &str) -> Result<Transcription, AudioError> {
-        let stt = self.stt.as_ref().ok_or(AudioError::NotEnabled { feature: "stt" })?;
+        let stt = self
+            .stt
+            .as_ref()
+            .ok_or(AudioError::NotEnabled { feature: "stt" })?;
         Ok(stt.transcribe(pcm, lang).await?)
     }
 
@@ -205,8 +208,16 @@ impl AudioSubsystem {
                 let opus = codec::encode_pcm_to_opus(&synthesis.pcm, synthesis.sample_rate)?;
                 Ok((opus, duration_sec))
             }
+            #[cfg(target_os = "windows")]
+            tts::Backend::WinRt(b) => {
+                let voice = self.tts_voice.as_deref().unwrap_or("");
+                let synthesis = b.synthesize(text, voice).await?;
+                let duration_sec = synthesis.audio_duration_sec();
+                let opus = codec::encode_pcm_to_opus(&synthesis.pcm, synthesis.sample_rate)?;
+                Ok((opus, duration_sec))
+            }
             tts::Backend::Remote(b) => Ok(b.synthesize_to_opus(text).await?),
-            #[cfg(feature = "kokoro")]
+            #[cfg(feature = "kokoro-local")]
             tts::Backend::Kokoro(b) => {
                 let voice = self.tts_voice.as_deref().unwrap_or("");
                 let synthesis = b.synthesize(text, voice).await?;
@@ -223,7 +234,7 @@ impl AudioSubsystem {
     }
 }
 
-#[cfg_attr(not(feature = "kokoro"), allow(unused_variables))]
+#[cfg_attr(not(feature = "kokoro-local"), allow(unused_variables))]
 async fn build_tts(
     cfg: &TtsConfig,
     shutdown: &CancellationToken,
@@ -240,19 +251,30 @@ async fn build_tts(
                 Err(TtsError::UnsupportedPlatform)
             }
         }
+        tts::BackendConfig::WinRt { voice } => {
+            #[cfg(target_os = "windows")]
+            {
+                tts::winrt::WinRtTts::probe(voice).await?;
+                Ok(tts::Backend::WinRt(tts::winrt::WinRtTts::new()))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Err(TtsError::UnsupportedPlatform)
+            }
+        }
         tts::BackendConfig::KokoroLocal { model, voice } => {
-            #[cfg(feature = "kokoro")]
+            #[cfg(feature = "kokoro-local")]
             {
                 // Thread shutdown so Ctrl-C cancels the 346 MB download promptly.
                 build_kokoro_local(model, voice, shutdown.clone()).await
             }
-            #[cfg(not(feature = "kokoro"))]
+            #[cfg(not(feature = "kokoro-local"))]
             {
                 let _ = (model, voice);
                 Err(TtsError::Init(
-                    "backend=kokoro-local needs the `kokoro` cargo feature \
-                     (rebuild with `cargo build --features kokoro`). \
-                     Alternatively use kokoro-remote or say."
+                    "backend=kokoro-local needs the `kokoro-local` cargo feature \
+                     (rebuild with `cargo build --features kokoro-local`). \
+                     Alternatively use a native backend or kokoro-remote."
                         .to_string(),
                 ))
             }
@@ -291,12 +313,10 @@ async fn build_local_stt(
         .context("resolving local STT model from manifest")?;
 
     let file_name = filename_from_url(&asset.url);
-    let model_path = cache::model_path(&file_name)
-        .context("resolving model cache path")?;
+    let model_path = cache::model_path(&file_name).context("resolving model cache path")?;
 
     let models_dir = cache::models_dir()?;
-    cache::reap_stale_tmps(&models_dir)
-        .context("reaping stale .tmp files in models dir")?;
+    cache::reap_stale_tmps(&models_dir).context("reaping stale .tmp files in models dir")?;
 
     let was_cached = model_path.exists();
     if was_cached {
@@ -340,10 +360,8 @@ async fn download_stt_model(
         asset.display_name
     );
 
-    let mut reporter = progress::Reporter::new(
-        &format!("Whisper {model_key}"),
-        Some(asset.size_bytes),
-    );
+    let mut reporter =
+        progress::Reporter::new(&format!("Whisper {model_key}"), Some(asset.size_bytes));
     let result = client
         .download_verified(
             &asset.url,
@@ -365,7 +383,7 @@ async fn download_stt_model(
 }
 
 /// Probe espeak-ng early; SHA-verified model + voice download; ort load.
-#[cfg(feature = "kokoro")]
+#[cfg(feature = "kokoro-local")]
 async fn build_kokoro_local(
     model_key: &str,
     voice: &str,
@@ -375,8 +393,7 @@ async fn build_kokoro_local(
     if espeak::probe().is_none() {
         return Err(TtsError::Init(
             "espeak-ng not found on PATH — local Kokoro requires it. \
-             macOS: `brew install espeak-ng`; Linux: `apt/dnf/pacman \
-             install espeak-ng`. Alternatively set \
+             Install espeak-ng for your OS and open a new terminal. Alternatively set \
              TELEGRAM_TTS_BACKEND=kokoro-remote or none."
                 .to_string(),
         ));
@@ -394,8 +411,7 @@ async fn build_kokoro_local(
         .map_err(|e| TtsError::Init(format!("TTS voice: {e}")))?;
 
     // Voices colocate with ONNX in `models/` — `KokoroTts::load` just concatenates.
-    let models_dir = cache::models_dir()
-        .map_err(|e| TtsError::Init(format!("models dir: {e}")))?;
+    let models_dir = cache::models_dir().map_err(|e| TtsError::Init(format!("models dir: {e}")))?;
     cache::reap_stale_tmps(&models_dir)
         .map_err(|e| TtsError::Init(format!("reap stale tmps: {e}")))?;
     let model_file_name = filename_from_url(&model_entry.onnx_url);
@@ -460,9 +476,7 @@ async fn build_kokoro_local(
             })
             .await
             .map_err(|e| TtsError::Init(format!("Kokoro load retry join: {e}")))?
-                .map_err(|e| {
-                    TtsError::Init(format!("Kokoro load retry after refetch: {e}"))
-                })?
+            .map_err(|e| TtsError::Init(format!("Kokoro load retry after refetch: {e}")))?
         }
         Err(e) => return Err(TtsError::Init(format!("Kokoro load: {e}"))),
     };
@@ -471,7 +485,7 @@ async fn build_kokoro_local(
 }
 
 /// No-op when both assets cached. Shared between first-run + corrupt-cache retry.
-#[cfg(feature = "kokoro")]
+#[cfg(feature = "kokoro-local")]
 #[allow(
     clippy::too_many_arguments,
     reason = "keeps the retry path's call-site free of helper-struct plumbing"
@@ -522,10 +536,8 @@ async fn download_kokoro_if_missing(
         let tmp = cache::tmp_path_for(voice_path);
         // Voice files are tiny (~510 KB); still show a bar on TTY for
         // consistency, but total is the manifest's declared size.
-        let mut reporter = progress::Reporter::new(
-            &format!("Voice {voice}"),
-            Some(voice_asset.size_bytes),
-        );
+        let mut reporter =
+            progress::Reporter::new(&format!("Voice {voice}"), Some(voice_asset.size_bytes));
         let result = client
             .download_verified(
                 &voice_asset.url,
@@ -549,7 +561,7 @@ async fn download_kokoro_if_missing(
 /// Dashboard detail — remote URLs are host-only (path could carry secrets).
 fn display_detail_for(cfg: &tts::BackendConfig) -> Option<String> {
     match cfg {
-        tts::BackendConfig::Say { .. } => None,
+        tts::BackendConfig::Say { .. } | tts::BackendConfig::WinRt { .. } => None,
         tts::BackendConfig::KokoroLocal { model, .. } => Some(model.clone()),
         tts::BackendConfig::Remote { url, .. } => Some(redacted_host_from_url(url)),
     }
@@ -558,9 +570,7 @@ fn display_detail_for(cfg: &tts::BackendConfig) -> Option<String> {
 /// Extract `host[:port]` from a URL. Falls through on missing scheme.
 fn redacted_host_from_url(url: &str) -> String {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let host_end = after_scheme
-        .find('/')
-        .unwrap_or(after_scheme.len());
+    let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
     after_scheme[..host_end].to_string()
 }
 
@@ -605,7 +615,10 @@ mod tests {
 
     #[test]
     fn audio_config_any_enabled_tracks_stt() {
-        let off = AudioConfig { stt: None, tts: None };
+        let off = AudioConfig {
+            stt: None,
+            tts: None,
+        };
         assert!(!off.any_enabled());
     }
 

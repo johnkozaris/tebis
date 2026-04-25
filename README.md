@@ -4,8 +4,8 @@
 
 **Chat with your AI coding agents from your phone.**
 
-You're away from the laptop. Claude Code is deep in a refactor in a tmux
-session. Tebis lets you open Telegram and:
+You're away from the laptop. Claude Code is deep in a refactor in a
+multiplexer session. Tebis lets you open Telegram and:
 
 - see what it last said,
 - send a nudge,
@@ -27,7 +27,7 @@ That's the whole product. A small Rust daemon, one user, one bot, no cloud.
 
 ## What it does
 
-Tebis is a bridge between Telegram and a tmux session on your workstation.
+Tebis is a bridge between Telegram and a tmux/psmux session on your workstation.
 
 - **You type on your phone →** the text lands as keystrokes in the pane.
 - **The agent replies →** the tail of its reply lands in your chat.
@@ -35,7 +35,7 @@ Tebis is a bridge between Telegram and a tmux session on your workstation.
 - **Reply audio (optional) →** the agent's text is read back to you as a voice message.
 
 It was built for Claude Code but works with `aider`, Copilot CLI, or
-anything that runs in tmux. Replies come via native agent hooks when
+anything that runs in tmux/psmux. Replies come via native agent hooks when
 available (Claude Code, Copilot CLI) and via pane-watching otherwise.
 
 ## Why it's different
@@ -46,8 +46,7 @@ available (Claude Code, Copilot CLI) and via pane-watching otherwise.
   voice transcription runs in-process via whisper.cpp.
 - **~4 MB binary.** Built on `hyper` + `rustls` directly; `deny.toml`
   bans OpenSSL, native-TLS, `reqwest`, and `aws-lc-rs`.
-- **Boring by choice.** Single binary, two files on disk (env + launchd
-  or systemd unit).
+- **Boring by choice.** Single binary, plus an env file and one OS service entry.
 
 ## Get started
 
@@ -71,10 +70,28 @@ cargo build --release
 ```
 
 **You'll need:** Rust 1.95+, [psmux][psmux] (tmux-compatible multiplexer),
-Visual Studio Build Tools (C++ workload, for `ring`'s C compile), and
-PowerShell 5.1+ (built into Windows). Claude Code and Copilot CLI both
-have native Windows installers as of 2026; install whichever you want to
-drive from Telegram.
+Visual Studio Build Tools (C++ workload), CMake for local STT builds, and
+PowerShell 7+ recommended for psmux (PowerShell 5.1 is still enough for
+tebis hook scripts). Claude Code and Copilot CLI both have native Windows
+installers as of 2026; install whichever you want to drive from Telegram.
+
+psmux v3.3+ is the current target. It ships `psmux.exe`, `pmux.exe`, and a
+`tmux.exe` compatibility alias; tebis calls `psmux.exe` directly. Install
+with one of:
+
+```powershell
+scoop bucket add psmux https://github.com/psmux/scoop-psmux
+scoop install psmux
+# or:
+winget install marlocarlo.psmux
+choco install psmux
+cargo install psmux
+```
+
+Windows TTS uses the built-in WinRT `SpeechSynthesizer` backend
+(`TELEGRAM_TTS_BACKEND=winrt`) with no extra install. Windows 11
+Narrator “Natural” voices are not exposed to third-party apps, so WinRT
+uses the installed OneCore voices (for example Zira/David/Mark).
 
 The wizard walks through creating a bot on [`@BotFather`][botfather],
 finding your numeric ID via [`@userinfobot`][userinfobot], and picking
@@ -91,20 +108,20 @@ invariants, per-OS primitives behind a single `platform::` abstraction
 
 ## Using it
 
-Once running, message your bot. Plain text is sent to the current tmux
+Once running, message your bot. Plain text is sent to the current multiplexer
 target; slash commands control the bridge.
 
 | Command | What it does |
 |---|---|
 | *plain text* | Sends to the current session (or spawns the autostart one) |
-| `/list` | Lists tmux sessions (`✓` = allowlisted) |
+| `/list` | Lists multiplexer sessions (`✓` = allowlisted) |
 | `/status` | Current target, autostart config, uptime |
 | `/send <session> <text>` | Sends to a specific session |
 | `/read [session] [lines]` | Grabs the last N lines of pane output |
 | `/target <session>` | Sets the default target |
 | `/new <session>` / `/kill <session>` | Create or kill a session |
 | `/restart` | Kills the autostart session; the next message re-provisions |
-| `/tts [off\|say\|kokoro-local\|kokoro-remote]` | Switches voice-reply backend |
+| `/tts [off\|say\|winrt\|kokoro-local\|kokoro-remote]` | Switches voice-reply backend |
 | `/help` | Usage |
 
 Short commands (set target, new, kill) react with 👍 instead of replying
@@ -129,7 +146,7 @@ in `tebis --help`.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `TELEGRAM_AUTOSTART_SESSION` | — | tmux session name |
+| `TELEGRAM_AUTOSTART_SESSION` | — | Multiplexer session name |
 | `TELEGRAM_AUTOSTART_DIR` | — | Working directory |
 | `TELEGRAM_AUTOSTART_COMMAND` | — | e.g. `claude` |
 
@@ -140,11 +157,11 @@ Set all three or none.
 | Variable | Default | Notes |
 |---|---|---|
 | `TELEGRAM_STT` | `off` | `on` enables in-process voice-to-text (whisper.cpp) |
-| `TELEGRAM_STT_MODEL` | `base.en` | whisper model (e.g. `small.en`) |
+| `TELEGRAM_STT_MODEL` | `small.en` | whisper model (e.g. `base.en`) |
 | `TELEGRAM_STT_LANGUAGE` | `en` | ISO 639-1 code |
 | `TELEGRAM_STT_MAX_DURATION_SEC` | `120` | Per-clip cap |
-| `TELEGRAM_TTS_BACKEND` | `off` | `say` (macOS), `kokoro-local`, `kokoro-remote` |
-| `TELEGRAM_TTS_VOICE` | backend default | e.g. `Samantha` (say), `af_sarah` (Kokoro) |
+| `TELEGRAM_TTS_BACKEND` | `off` | `say` (macOS), `winrt` (Windows), `kokoro-local`, `kokoro-remote` |
+| `TELEGRAM_TTS_VOICE` | backend default | e.g. `Samantha` (say), `Zira` (winrt), `af_sarah` (Kokoro) |
 | `TELEGRAM_TTS_RESPOND_TO_ALL` | `off` | `on` → voice-reply every message, not just voice-in |
 | `TELEGRAM_TTS_REMOTE_URL` | — | OpenAI-compatible TTS endpoint (for `kokoro-remote`) |
 
@@ -190,16 +207,17 @@ tebis hooks list                # every install host-wide
 tebis hooks prune               # drop manifest entries for deleted dirs
 ```
 
-| Event (Claude / Copilot) | Sent | Tag |
+| Agent event | Sent | Tag |
 |---|---|---|
-| `Stop` / `agentStop` | tail of agent's reply | *(none)* |
-| `SubagentStop` / `subagentStop` | subagent reply | `[agent]` |
-| `Notification` permission / — | "needs permission to …" | `[ask]` |
-| `Notification` idle / — | "idle waiting for input" | `[idle]` |
+| Claude `Stop` | tail of agent's reply | *(none)* |
+| Claude `SubagentStop` | subagent reply | `[agent]` |
+| Claude `Notification` | permission / idle message | `[ask]` / `[idle]` |
+| Copilot `notification` | completion / permission / idle message | notification kind |
 
-Tebis only touches these four events per agent, and only entries whose
-command path is under `$XDG_DATA_HOME/tebis/` — your other hooks are
-never modified.
+Tebis only installs the supported events for each agent, and only entries
+whose command path is under `$XDG_DATA_HOME/tebis/` — your other hooks are
+never modified. Copilot CLI does not expose Claude-style `agentStop` or
+`subagentStop` hooks.
 
 **Runtime deps:** `jq` + `nc` (BSD netcat; `netcat-openbsd` on Linux).
 
@@ -213,11 +231,12 @@ settings from the browser.
 ## Security model
 
 - Auth by numeric Telegram ID — never username (recyclable).
-- All tmux argv validated against `[A-Za-z0-9._-]{1,64}`.
-- Keystrokes sent as literal bytes, not tmux key names.
+- All multiplexer session names validated against `[A-Za-z0-9._-]{1,64}`.
+- Keystrokes sent as literal bytes, not shell-interpolated key strings.
 - All Telegram replies HTML-escaped.
 - Bot token in `SecretString`, redacted from logs and error chains.
-- Notify UDS mode 0600 + kernel peer-cred check.
+- Notify listener is local-user-only: UDS mode 0600 + peer creds on Unix,
+  owner-only Named Pipe + SID check on Windows.
 - Per-chat rate limit + global handler cap.
 
 Full invariants in [CLAUDE.md](CLAUDE.md); vuln reports in

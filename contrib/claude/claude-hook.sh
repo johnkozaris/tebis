@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Multi-event Claude Code hook for tebis (the Telegram-tmux bridge).
+# Multi-event Claude Code hook for tebis (Telegram-to-multiplexer bridge).
 #
 # Dispatches on `hook_event_name`:
 #

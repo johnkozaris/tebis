@@ -39,7 +39,7 @@ pub struct Snapshot {
 pub struct VoiceInfo {
     pub stt_model: Option<String>,
     pub stt_ready: bool,
-    /// `"none"`, `"say"`, `"kokoro-local"`, or `"kokoro-remote"`.
+    /// `"none"`, `"say"`, `"winrt"`, `"kokoro-local"`, or `"kokoro-remote"`.
     pub tts_backend: &'static str,
     pub tts_voice: Option<String>,
     /// Redacted host for remote, model key for local, empty otherwise.

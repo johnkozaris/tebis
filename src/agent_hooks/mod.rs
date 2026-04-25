@@ -47,7 +47,6 @@ const COPILOT_HOOK_SCRIPT: &str = include_str!("../../contrib/copilot/copilot-ho
 /// Per-agent install / uninstall / status. All methods are idempotent; ours
 /// are identified by the sentinel script path.
 pub trait HookManager: Send + Sync {
-    fn agent(&self) -> AgentKind;
     fn install(&self, project_dir: &Path, script_path: &Path) -> Result<InstallReport>;
     fn uninstall(&self, project_dir: &Path) -> Result<UninstallReport>;
     fn status(&self, project_dir: &Path) -> Result<StatusReport>;

@@ -20,10 +20,9 @@ pub(in crate::setup) fn step_voice(
     );
     println!("no cloud round-trip, no extra service. The model downloads on");
     println!(
-        "first run to {} (about {} for {}).",
-        style("$XDG_DATA_HOME/tebis/models/").dim(),
-        style("148 MB").bold(),
-        style("base.en").bold(),
+        "first run to the per-user tebis data dir (about {} for {}).",
+        style("181 MB").bold(),
+        style("small.en").bold(),
     );
     println!();
 

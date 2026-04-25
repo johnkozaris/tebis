@@ -11,15 +11,15 @@ use dialoguer::Confirm;
 use dialoguer::theme::ColorfulTheme;
 
 pub use super::installer::EnsureOutcome;
-use super::installer::{
-    PackageManager, detect_package_manager, install_argv, install_cmd_display,
-};
+use super::installer::{PackageManager, detect_package_manager, install_argv, install_cmd_display};
 
 #[cfg(target_os = "macos")]
 const DYLIB_NAME: &str = "libonnxruntime.dylib";
 #[cfg(target_os = "linux")]
 const DYLIB_NAME: &str = "libonnxruntime.so";
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
+const DYLIB_NAME: &str = "onnxruntime.dll";
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 const DYLIB_NAME: &str = "libonnxruntime";
 
 /// Standard install locations, checked in order. `ORT_DYLIB_PATH` wins
@@ -34,8 +34,8 @@ fn candidate_paths() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         out.push(PathBuf::from("/opt/homebrew/lib").join(DYLIB_NAME)); // Apple Silicon brew
-        out.push(PathBuf::from("/usr/local/lib").join(DYLIB_NAME));    // Intel brew
-        out.push(PathBuf::from("/opt/local/lib").join(DYLIB_NAME));    // MacPorts
+        out.push(PathBuf::from("/usr/local/lib").join(DYLIB_NAME)); // Intel brew
+        out.push(PathBuf::from("/opt/local/lib").join(DYLIB_NAME)); // MacPorts
     }
     #[cfg(target_os = "linux")]
     {
@@ -43,6 +43,35 @@ fn candidate_paths() -> Vec<PathBuf> {
         out.push(PathBuf::from("/usr/lib64").join(DYLIB_NAME));
         out.push(PathBuf::from("/usr/lib/x86_64-linux-gnu").join(DYLIB_NAME));
         out.push(PathBuf::from("/usr/lib/aarch64-linux-gnu").join(DYLIB_NAME));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Windows has no `/usr/lib` convention — users typically unzip
+        // the Microsoft ONNX Runtime release to one of these spots, or
+        // the `ort` crate's `download-binaries` feature populates the
+        // second path. Either way, `ORT_DYLIB_PATH` is the canonical
+        // hint; these are fallbacks for "I unzipped it to the obvious
+        // place" UX.
+        if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+            let base = PathBuf::from(local_appdata).join("Programs");
+            out.push(base.join("onnxruntime").join("lib").join(DYLIB_NAME));
+        }
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            out.push(
+                PathBuf::from(program_files)
+                    .join("onnxruntime")
+                    .join("lib")
+                    .join(DYLIB_NAME),
+            );
+        }
+        if let Some(program_w6432) = std::env::var_os("ProgramW6432") {
+            out.push(
+                PathBuf::from(program_w6432)
+                    .join("onnxruntime")
+                    .join("lib")
+                    .join(DYLIB_NAME),
+            );
+        }
     }
     out
 }
@@ -86,7 +115,25 @@ pub fn ensure_or_install(theme: &ColorfulTheme) -> Result<EnsureOutcome> {
             );
             println!("   Then re-run {}.", style("tebis setup").bold());
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            println!("   Windows Kokoro-local is manual/Advanced only.");
+            println!("   Set ORT_DYLIB_PATH to your ONNX Runtime DLL, e.g.:");
+            println!();
+            println!(
+                "     {}",
+                style(r#"ORT_DYLIB_PATH=C:\path\to\onnxruntime.dll"#).dim()
+            );
+            println!();
+            println!("   Or place onnxruntime.dll under one of:");
+            println!(
+                "     {}",
+                style(r#"%LOCALAPPDATA%\Programs\onnxruntime\lib\"#).dim()
+            );
+            println!("     {}", style(r#"%ProgramFiles%\onnxruntime\lib\"#).dim());
+            println!("   Then re-run {}.", style("tebis setup").bold());
+        }
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         {
             println!(
                 "   Install `onnxruntime` manually, then re-run {}.",
@@ -127,7 +174,10 @@ pub fn ensure_or_install(theme: &ColorfulTheme) -> Result<EnsureOutcome> {
             style("ORT_DYLIB_PATH=/path/to/libonnxruntime.so.1").dim()
         );
         println!();
-        println!("   Re-run {} once that's done.", style("tebis setup").bold());
+        println!(
+            "   Re-run {} once that's done.",
+            style("tebis setup").bold()
+        );
         return Ok(EnsureOutcome::NoPackageManager);
     }
 
@@ -192,9 +242,7 @@ pub fn ensure_or_install(theme: &ColorfulTheme) -> Result<EnsureOutcome> {
             "  {} install succeeded but {DYLIB_NAME} still not found at any known location.",
             style("⚠").yellow(),
         );
-        println!(
-            "   Try `brew --prefix onnxruntime` (macOS) or your distro's file-list, then",
-        );
+        println!("   Try `brew --prefix onnxruntime` (macOS) or your distro's file-list, then",);
         println!("   set `ORT_DYLIB_PATH=<full-path>` in ~/.config/tebis/env by hand.");
         Ok(EnsureOutcome::InstallFailed)
     }
@@ -204,8 +252,10 @@ const fn package_name_for(pm: PackageManager) -> &'static str {
     match pm {
         PackageManager::Brew | PackageManager::MacPorts => "onnxruntime",
         PackageManager::Apt => "libonnxruntime-dev",
-        PackageManager::Dnf | PackageManager::Pacman
-        | PackageManager::Zypper | PackageManager::Apk => "onnxruntime",
+        PackageManager::Dnf
+        | PackageManager::Pacman
+        | PackageManager::Zypper
+        | PackageManager::Apk => "onnxruntime",
     }
 }
 
@@ -220,7 +270,10 @@ mod tests {
     #[test]
     fn candidate_paths_non_empty() {
         let paths = candidate_paths();
-        assert!(!paths.is_empty(), "at least one candidate for this platform");
+        assert!(
+            !paths.is_empty(),
+            "at least one candidate for this platform"
+        );
     }
 
     #[test]

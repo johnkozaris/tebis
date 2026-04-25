@@ -17,7 +17,9 @@ pub(super) enum Reporter {
     Bar(ProgressBar),
     /// Throttled log. `last_logged` is the last value we emitted at;
     /// we fire a new line every `LOG_EVERY` bytes.
-    Log { last_logged: u64 },
+    Log {
+        last_logged: u64,
+    },
 }
 
 impl Reporter {
@@ -27,10 +29,9 @@ impl Reporter {
     pub(super) fn new(label: &str, total_hint: Option<u64>) -> Self {
         if console::Term::stderr().is_term() {
             let pb = match total_hint {
-                Some(total) if total > 0 => ProgressBar::with_draw_target(
-                    Some(total),
-                    ProgressDrawTarget::stderr(),
-                ),
+                Some(total) if total > 0 => {
+                    ProgressBar::with_draw_target(Some(total), ProgressDrawTarget::stderr())
+                }
                 _ => ProgressBar::new_spinner().with_message(label.to_string()),
             };
             // Redraw at most 5× per second so fast LANs don't burn CPU on ANSI.

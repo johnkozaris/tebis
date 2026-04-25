@@ -22,9 +22,7 @@ pub(super) fn build_bot_rows(bot: Option<&crate::inspect::BotInfo>) -> String {
     )
 }
 
-pub(super) fn build_autostart_rows(
-    autostart: Option<&crate::inspect::AutostartInfo>,
-) -> String {
+pub(super) fn build_autostart_rows(autostart: Option<&crate::inspect::AutostartInfo>) -> String {
     autostart.map_or_else(
         || r#"<dt>Autostart</dt><dd class="muted">not configured</dd>"#.to_string(),
         |a| {

@@ -26,10 +26,6 @@ fn settings_path(project_dir: &Path) -> PathBuf {
 }
 
 impl super::HookManager for ClaudeHooks {
-    fn agent(&self) -> AgentKind {
-        AgentKind::Claude
-    }
-
     fn install(&self, project_dir: &Path, script_path: &Path) -> Result<super::InstallReport> {
         let path = settings_path(project_dir);
         let mut settings = jsonfile::load_or_empty(&path)?;

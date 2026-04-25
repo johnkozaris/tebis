@@ -7,9 +7,9 @@ use console::style;
 use dialoguer::Confirm;
 use dialoguer::theme::ColorfulTheme;
 
-pub use crate::audio::espeak::{EspeakInfo, probe as probe_espeak_ng};
 pub use super::installer::{EnsureOutcome, PackageManager, detect_package_manager};
 use super::installer::{install_argv, install_cmd_display};
+pub use crate::audio::espeak::{EspeakInfo, probe as probe_espeak_ng};
 
 const PKG: &str = "espeak-ng";
 

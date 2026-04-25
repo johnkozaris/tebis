@@ -3,14 +3,15 @@
 //! permissive allowlist.
 //!
 //! Both backends — `tmux` on Unix and `psmux` on Windows — share the
-//! tmux-compatible CLI (`new-session`, `send-keys -l` / `-H 0d`,
-//! `capture-pane`, etc.), so this module is one implementation with a
+//! tmux-compatible CLI (`new-session`, `send-keys -l`, `capture-pane`,
+//! etc.), so this module is one implementation with a
 //! single `BINARY` name that switches per-OS. Any behavioral quirks
 //! unique to psmux get handled inside `classify_status`, which is
 //! already fuzzy-tolerant ("no such session" / "session not found"
 //! already fold into `NotFound`).
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,12 +25,64 @@ const SUBMIT_GAP: Duration = Duration::from_millis(300);
 
 /// Binary to invoke. tmux on Unix, psmux on Windows (tmux-compatible
 /// Rust port — reads `~/.tmux.conf`, same command language). psmux
-/// needs to be on PATH for the Windows build to actually drive
-/// sessions; `has_on_path` probes will surface a setup-time warning.
+/// v3.3+ is the verified Windows target; `binary_on_path` probes
+/// surface a setup-time warning when it is missing.
 #[cfg(unix)]
 pub const BINARY: &str = "tmux";
 #[cfg(windows)]
 pub const BINARY: &str = "psmux";
+
+/// Whether the platform multiplexer binary is currently discoverable on PATH.
+#[must_use]
+pub fn binary_on_path() -> bool {
+    which_on_path(BINARY).is_some()
+}
+
+fn which_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for candidate in executable_candidates(name) {
+            let full = dir.join(candidate);
+            if executable_exists(&full) {
+                return Some(full);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn executable_exists(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+}
+
+#[cfg(windows)]
+fn executable_exists(path: &Path) -> bool {
+    path.is_file()
+}
+
+#[cfg(not(windows))]
+fn executable_candidates(name: &str) -> Vec<String> {
+    vec![name.to_string()]
+}
+
+#[cfg(windows)]
+fn executable_candidates(name: &str) -> Vec<String> {
+    if Path::new(name).extension().is_some() {
+        return vec![name.to_string()];
+    }
+    let mut out = vec![name.to_string()];
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    out.extend(
+        pathext
+            .split(';')
+            .filter(|ext| !ext.is_empty())
+            .map(|ext| format!("{name}{ext}")),
+    );
+    out
+}
 
 /// `BINARY -V` dashboard probe. Returns `"(unknown)"` if the
 /// multiplexer isn't installed — no hard failure, just signals the
@@ -147,9 +200,7 @@ impl Mux {
     /// Lazily-allocated slot count (permissive mode). Exposed for the dashboard.
     #[must_use]
     pub fn dynamic_slot_count(&self) -> usize {
-        self.dynamic
-            .lock()
-            .map_or(0, |g| g.len())
+        self.dynamic.lock().map_or(0, |g| g.len())
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<String>> {
@@ -381,16 +432,18 @@ async fn run_mux(op: &'static str, args: &[&str]) -> Result<std::process::Output
         Ok(Ok(output)) => Ok(output),
         Ok(Err(e)) => Err(MuxError::Spawn(format!("{BINARY} io error: {e}"))),
         Err(_) => {
-            tracing::warn!(?args, bin = BINARY, "multiplexer command timed out (5s); killed on drop");
+            tracing::warn!(
+                ?args,
+                bin = BINARY,
+                "multiplexer command timed out (5s); killed on drop"
+            );
             Err(MuxError::Timeout { op })
         }
     }
 }
 
-// These tests cover tmux's stderr wording for error classification —
-// inherently Unix (tmux doesn't run natively on Windows; psmux gets
-// its own classifier in Phase 5) and uses `ExitStatus::from_raw` for
-// synthetic outputs, which is itself Unix-only.
+// These tests cover tmux's stderr wording for error classification and
+// use Unix `ExitStatus::from_raw` for synthetic outputs.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -512,10 +565,7 @@ mod tests {
         let t = Mux::new(Vec::new(), 4000);
         assert!(t.is_permissive());
         // Regex still enforced.
-        assert!(matches!(
-            t.validate_session(""),
-            Err(MuxError::InvalidName),
-        ));
+        assert!(matches!(t.validate_session(""), Err(MuxError::InvalidName),));
         assert!(matches!(
             t.validate_session("session name"),
             Err(MuxError::InvalidName),
@@ -534,5 +584,86 @@ mod tests {
         let a = t.slot("sess").unwrap();
         let b = t.slot("sess").unwrap();
         assert!(Arc::ptr_eq(&a, &b));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    fn fake_output(status: u32, stderr: &str) -> std::process::Output {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn psmux_targets_do_not_use_tmux_exact_match_prefix() {
+        assert_eq!(exact_target_for("demo"), "demo:0");
+    }
+
+    #[test]
+    fn classify_recognizes_psmux_no_server_running() {
+        let out = fake_output(1, "psmux: no server running on session 'demo'\n");
+        let err = classify_status(&out, "capture-pane", "demo").unwrap_err();
+        assert!(matches!(err, MuxError::NotFound(ref s) if s == "demo"));
+        assert!(err.is_not_found());
+    }
+
+    #[test]
+    fn classify_recognizes_psmux_session_not_found() {
+        let out = fake_output(1, "session not found: demo\n");
+        let err = classify_status(&out, "send-keys", "demo").unwrap_err();
+        assert!(matches!(err, MuxError::NotFound(ref s) if s == "demo"));
+    }
+
+    #[test]
+    fn classify_recognizes_psmux_no_such_session() {
+        let out = fake_output(1, "no such session: demo\n");
+        let err = classify_status(&out, "has-session", "demo").unwrap_err();
+        assert!(matches!(err, MuxError::NotFound(ref s) if s == "demo"));
+    }
+
+    #[test]
+    #[ignore = "requires psmux v3.3+ on PATH and creates/kills a temporary session"]
+    fn psmux_does_not_prefix_match_targets() {
+        assert!(
+            binary_on_path(),
+            "psmux must be on PATH for this integration test"
+        );
+        let suffix = format!("{}", std::process::id());
+        let prefix = format!("tebis_prefix_{suffix}_foo");
+        let full = format!("{prefix}bar");
+
+        let _ = std::process::Command::new(BINARY)
+            .args(["kill-session", "-t", &full])
+            .output();
+
+        let created = std::process::Command::new(BINARY)
+            .args(["new-session", "-d", "-s", &full])
+            .output()
+            .expect("spawn psmux new-session");
+        assert!(
+            created.status.success(),
+            "create psmux session failed: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+
+        let prefix_target = format!("{prefix}:0");
+        let send_prefix = std::process::Command::new(BINARY)
+            .args(["send-keys", "-t", &prefix_target, "-l", "x"])
+            .output()
+            .expect("spawn psmux send-keys");
+        let _ = std::process::Command::new(BINARY)
+            .args(["kill-session", "-t", &full])
+            .output();
+
+        assert!(
+            !send_prefix.status.success(),
+            "psmux prefix target unexpectedly matched {full}"
+        );
     }
 }

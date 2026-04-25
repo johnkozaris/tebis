@@ -12,7 +12,7 @@
 # `systemd-analyze --user security tebis` to audit.
 
 [Unit]
-Description=tebis — Telegram-tmux bridge
+Description=tebis — Telegram-to-multiplexer bridge
 After=network-online.target
 Wants=network-online.target
 

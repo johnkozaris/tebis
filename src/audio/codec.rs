@@ -41,10 +41,7 @@ const OUTPUT_RATE: u32 = 16_000;
 /// OGG/Opus → 16 kHz mono `f32` in `[-1.0, 1.0]`. `max_samples` caps
 /// output — byte-input cap alone isn't enough (Opus compresses hard).
 /// Rejects multi-channel; downmixing silently would be a footgun.
-pub fn decode_opus_to_pcm16k(
-    oga_bytes: &[u8],
-    max_samples: usize,
-) -> Result<Vec<f32>, CodecError> {
+pub fn decode_opus_to_pcm16k(oga_bytes: &[u8], max_samples: usize) -> Result<Vec<f32>, CodecError> {
     if oga_bytes.is_empty() {
         return Err(CodecError::Decode("empty input".to_string()));
     }
@@ -160,7 +157,10 @@ pub fn encode_pcm_to_opus(pcm: &[f32], sample_rate: u32) -> Result<Bytes, CodecE
     }
 
     // OGG serial is arbitrary but required to be unique — use clock micros.
-    #[allow(clippy::cast_possible_truncation, reason = "masked to 32 bits explicitly")]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "masked to 32 bits explicitly"
+    )]
     let serial: u32 = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_micros() & 0xFFFF_FFFF)) as u32;
@@ -229,11 +229,7 @@ mod tests {
                 .to_string()
                 .contains("opus encode")
         );
-        assert!(
-            CodecError::UnsupportedChannels(2)
-                .to_string()
-                .contains('2')
-        );
+        assert!(CodecError::UnsupportedChannels(2).to_string().contains('2'));
         assert!(CodecError::NotOpus.to_string().contains("OpusHead"));
     }
 

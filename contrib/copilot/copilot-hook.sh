@@ -7,9 +7,7 @@
 # Events handled (all confirmed in the Copilot CLI changelog; see
 # src/agent_hooks/copilot.rs for the version-added map):
 #   userPromptSubmitted → inject "conclude with a summary" context
-#   agentStop           → forward tail of last assistant message
-#   subagentStop        → forward subagent tail tagged by agentName
-#   notification        → forward the message text with kind tag
+#   notification        → forward completion / permission / idle messages
 #
 # sessionStart / sessionEnd intentionally not handled — same
 # rationale as Claude: the agent reply itself proves the session is
@@ -20,7 +18,6 @@
 # - Never echoes transcript content to stdout (would leak to Copilot's
 #   log); userPromptSubmitted writes hookSpecificOutput JSON which is
 #   the documented contract.
-# - Reads the JSONL transcript file, not the terminal.
 
 set -u
 set -o pipefail
@@ -50,32 +47,6 @@ resolve_socket() {
 SOCKET="$(resolve_socket)"
 
 # -------- helpers ----------------------------------------------------------
-
-# Extract the last assistant text from a Copilot transcript (JSONL) and
-# return the TAIL (not head) of MAX_CHARS codepoints.
-tail_of_last_assistant() {
-    local transcript="$1"
-    # The exact field name for assistant-role entries varies slightly
-    # across Copilot CLI versions. Match the common shapes: entries with
-    # role "assistant" and either .content (string) or .message.content
-    # (string or array of {type:"text",text}).
-    jq -rs --argjson max "$MAX_CHARS" '
-        def extract_text: (
-            if type == "string" then .
-            elif type == "array" then
-              (map(select(.type == "text") | .text) | join("\n\n"))
-            elif type == "object" and (.content // empty) != empty then
-              (.content | extract_text)
-            else empty end
-        );
-        (map(select(.role == "assistant" or (.type // "") == "assistant"))
-         | last // empty
-         | ((.content // .message.content // empty) | extract_text)) as $s |
-        if ($s | length) == 0 then empty
-        elif ($s | length) > $max then ("…" + $s[-$max:])
-        else $s end
-    ' "$transcript" 2>/dev/null
-}
 
 tail_trim() {
     local s="$1"
@@ -117,8 +88,6 @@ EVENT="$(
     jq -r '(.hook_event_name // .eventName // "") | ascii_downcase' <<<"$INPUT"
 )"
 
-# Transcript + cwd + session id are named consistently across both forms.
-TRANSCRIPT="$(jq -r '.transcriptPath // .transcript_path // ""' <<<"$INPUT")"
 CWD="$(jq -r '.cwd // ""' <<<"$INPUT")"
 SESSION="$(jq -r '.sessionId // .session_id // ""' <<<"$INPUT")"
 
@@ -132,29 +101,6 @@ case "$EVENT" in
             }
         }'
         exit 0
-        ;;
-
-    agentstop | stop)
-        if [[ -z "$TRANSCRIPT" || ! -f "$TRANSCRIPT" ]]; then
-            exit 0
-        fi
-        SUMMARY="$(tail_of_last_assistant "$TRANSCRIPT")"
-        if [[ -n "$SUMMARY" ]]; then
-            forward "$SUMMARY" "stop" "$CWD" "$SESSION"
-        fi
-        ;;
-
-    subagentstop)
-        # Copilot passes us the agent name so the header can distinguish
-        # named subagents. The transcript still has the text.
-        AGENT_NAME="$(jq -r '.agentName // .agent_name // "subagent"' <<<"$INPUT")"
-        if [[ -z "$TRANSCRIPT" || ! -f "$TRANSCRIPT" ]]; then
-            exit 0
-        fi
-        SUMMARY="$(tail_of_last_assistant "$TRANSCRIPT")"
-        if [[ -n "$SUMMARY" ]]; then
-            forward "$SUMMARY" "subagent_stop" "$CWD" "$AGENT_NAME"
-        fi
         ;;
 
     notification)

@@ -5,6 +5,7 @@ pub mod handler;
 pub mod session;
 pub mod typing;
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,10 +19,10 @@ use session::SessionState;
 
 use crate::audio::AudioSubsystem;
 use crate::metrics::Metrics;
+use crate::platform::multiplexer::Mux;
 use crate::sanitize;
 use crate::security::RateLimiter;
 use crate::telegram::TelegramClient;
-use crate::platform::multiplexer::Mux;
 
 pub enum Payload {
     Text(String),
@@ -55,12 +56,7 @@ pub struct HandlerContext {
     pub env_file_path: Option<std::path::PathBuf>,
 }
 
-pub async fn handle_update(
-    ctx: HandlerContext,
-    chat_id: i64,
-    message_id: i64,
-    payload: Payload,
-) {
+pub async fn handle_update(ctx: HandlerContext, chat_id: i64, message_id: i64, payload: Payload) {
     let handler_start = Instant::now();
     ctx.metrics.record_update_received();
 
@@ -139,10 +135,7 @@ pub async fn handle_update(
                 let metrics = ctx.metrics.clone();
                 let audio = audio.clone();
                 ctx.tracker.spawn(async move {
-                    synthesize_and_send_voice_detached(
-                        &tg, &metrics, &audio, chat_id, &body,
-                    )
-                    .await;
+                    synthesize_and_send_voice_detached(&tg, &metrics, &audio, chat_id, &body).await;
                 });
             }
         }
@@ -189,7 +182,7 @@ async fn react_ok(ctx: &HandlerContext, chat_id: i64, message_id: i64) {
 }
 
 /// `/tts` verb dispatcher. Mutative verbs write env + trigger graceful restart.
-/// `Say` on non-macOS is rejected here so Linux users can't brick the config.
+/// Native backends are rejected on the wrong OS so users can't brick the config.
 fn handle_tts_command(ctx: &HandlerContext, v: &handler::TtsVerb) -> Response {
     use handler::TtsVerb;
     use sanitize::escape_html;
@@ -203,24 +196,32 @@ fn handle_tts_command(ctx: &HandlerContext, v: &handler::TtsVerb) -> Response {
     match v {
         TtsVerb::Status => {
             let msg = format!(
-                "TTS: <code>{}</code>\n\nPick one with:\n  /tts off\n  /tts say\n  /tts kokoro-local\n  /tts kokoro-remote",
+                "TTS: <code>{}</code>\n\nPick one with:\n  /tts off\n  /tts say\n  /tts winrt\n  /tts kokoro-local\n  /tts kokoro-remote",
                 escape_html(current_label),
             );
             Response::Text(msg)
         }
         TtsVerb::Unknown(got) => {
             let msg = format!(
-                "Unknown /tts argument: <code>{}</code>\n\nValid: off, say, kokoro-local, kokoro-remote, status.",
+                "Unknown /tts argument: <code>{}</code>\n\nValid: off, say, winrt, kokoro-local, kokoro-remote, status.",
                 escape_html(got),
             );
             Response::Text(msg)
         }
         #[cfg(not(target_os = "macos"))]
         TtsVerb::Say => Response::Text(
-            "/tts say is macOS-only — try kokoro-local or kokoro-remote.".to_string(),
+            "/tts say is macOS-only — try winrt on Windows, or kokoro-local/kokoro-remote."
+                .to_string(),
         ),
         #[cfg(target_os = "macos")]
         TtsVerb::Say => switch_tts_backend(ctx, "say"),
+        #[cfg(not(target_os = "windows"))]
+        TtsVerb::WinRt => Response::Text(
+            "/tts winrt is Windows-only — try say on macOS, or kokoro-local/kokoro-remote."
+                .to_string(),
+        ),
+        #[cfg(target_os = "windows")]
+        TtsVerb::WinRt => switch_tts_backend(ctx, "winrt"),
         TtsVerb::Off => switch_tts_backend(ctx, "none"),
         TtsVerb::KokoroLocal => switch_tts_backend(ctx, "kokoro-local"),
         TtsVerb::KokoroRemote => switch_tts_backend(ctx, "kokoro-remote"),
@@ -235,29 +236,26 @@ fn switch_tts_backend(ctx: &HandlerContext, value: &str) -> Response {
     let Some(env_path) = ctx.env_file_path.as_ref() else {
         return Response::Text(
             "Can't switch TTS at runtime: BRIDGE_ENV_FILE isn't set. \
-             Set it in the systemd unit / launchd plist and restart tebis."
+             Set it in the service environment (Task Scheduler, systemd, or launchd) \
+             and restart tebis."
                 .to_string(),
         );
     };
 
+    if value == "kokoro-remote"
+        && let Err(msg) = validate_remote_tts_env(env_path)
+    {
+        return Response::Text(msg);
+    }
+
     // Build the upsert list. For kokoro-local we need ORT_DYLIB_PATH too.
-    let mut updates: Vec<(&str, String)> =
-        vec![("TELEGRAM_TTS_BACKEND", value.to_string())];
+    let mut updates: Vec<(&str, String)> = vec![("TELEGRAM_TTS_BACKEND", value.to_string())];
     if value == "kokoro-local" {
-        match crate::setup::onnxruntime::probe() {
-            Some(p) => updates.push((
-                "ORT_DYLIB_PATH",
-                p.to_string_lossy().into_owned(),
-            )),
-            None => {
-                return Response::Text(
-                    "Can't switch to <code>kokoro-local</code>: <code>libonnxruntime</code> \
-                     isn't on any known path. Run <code>brew install onnxruntime</code> \
-                     (macOS) or your distro's equivalent, then retry. \
-                     <code>tebis setup</code> installs it for you."
-                        .to_string(),
-                );
+        match validate_kokoro_local_tts_env() {
+            Ok(ort_path) => {
+                updates.push(("ORT_DYLIB_PATH", ort_path.to_string_lossy().into_owned()))
             }
+            Err(msg) => return Response::Text(msg),
         }
     }
 
@@ -290,6 +288,119 @@ fn switch_tts_backend(ctx: &HandlerContext, value: &str) -> Response {
         sanitize::escape_html(value),
     );
     Response::Text(msg)
+}
+
+fn validate_kokoro_local_tts_env() -> Result<std::path::PathBuf, String> {
+    #[cfg(not(feature = "kokoro-local"))]
+    {
+        return Err(
+            "Can't switch to <code>kokoro-local</code>: this binary was built without the \
+             <code>kokoro-local</code> cargo feature. Rebuild with \
+             <code>cargo build --features kokoro-local</code>, or use \
+             <code>kokoro-remote</code>."
+                .to_string(),
+        );
+    }
+
+    #[cfg(feature = "kokoro-local")]
+    {
+        if crate::audio::espeak::probe().is_none() {
+            return Err(kokoro_local_missing_espeak_msg());
+        }
+        crate::setup::onnxruntime::probe().ok_or_else(kokoro_local_missing_ort_msg)
+    }
+}
+
+#[cfg(feature = "kokoro-local")]
+fn kokoro_local_missing_espeak_msg() -> String {
+    #[cfg(windows)]
+    {
+        "Can't switch to <code>kokoro-local</code>: <code>espeak-ng</code> is not on \
+         PATH. Windows Kokoro-local is manual/Advanced only; install espeak-ng, \
+         open a new terminal, then retry. <code>kokoro-remote</code> or \
+         <code>winrt</code> are the recommended Windows paths."
+            .to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        "Can't switch to <code>kokoro-local</code>: <code>espeak-ng</code> is not on \
+         PATH. Install it with your OS package manager or rerun <code>tebis setup</code>."
+            .to_string()
+    }
+}
+
+#[cfg(feature = "kokoro-local")]
+fn kokoro_local_missing_ort_msg() -> String {
+    #[cfg(windows)]
+    {
+        "Can't switch to <code>kokoro-local</code>: <code>onnxruntime.dll</code> is not \
+         on any known path. Set <code>ORT_DYLIB_PATH=C:\\path\\to\\onnxruntime.dll</code> \
+         or place it under <code>%LOCALAPPDATA%\\Programs\\onnxruntime\\lib\\</code> or \
+         <code>%ProgramFiles%\\onnxruntime\\lib\\</code>, then retry."
+            .to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        "Can't switch to <code>kokoro-local</code>: <code>libonnxruntime</code> is not \
+         on any known path. Run <code>tebis setup</code> or set \
+         <code>ORT_DYLIB_PATH=/path/to/libonnxruntime</code>, then retry."
+            .to_string()
+    }
+}
+
+fn validate_remote_tts_env(env_path: &Path) -> Result<(), String> {
+    let url = read_env_key_for_tts(env_path, "TELEGRAM_TTS_REMOTE_URL")?;
+    let Some(url) = url.filter(|s| !s.trim().is_empty()) else {
+        return Err("Can't switch to <code>kokoro-remote</code>: set \
+             <code>TELEGRAM_TTS_REMOTE_URL=https://...</code> in the env file \
+             or run <code>tebis setup</code> first."
+            .to_string());
+    };
+
+    let allow_http = match read_env_key_for_tts(env_path, "TELEGRAM_TTS_REMOTE_ALLOW_HTTP")? {
+        Some(raw) => crate::env_file::parse_toggle(&raw)
+            .map_err(|e| {
+                format!(
+                    "Can't switch to <code>kokoro-remote</code>: \
+                     <code>TELEGRAM_TTS_REMOTE_ALLOW_HTTP</code> is invalid: <code>{}</code>.",
+                    sanitize::escape_html(&e.to_string())
+                )
+            })?
+            .unwrap_or(false),
+        None => false,
+    };
+
+    if let Some(raw) = read_env_key_for_tts(env_path, "TELEGRAM_TTS_REMOTE_TIMEOUT_SEC")? {
+        let timeout_sec = raw.parse::<u32>().map_err(|_| {
+            "Can't switch to <code>kokoro-remote</code>: \
+             <code>TELEGRAM_TTS_REMOTE_TIMEOUT_SEC</code> must be a positive integer."
+                .to_string()
+        })?;
+        if !(1..=300).contains(&timeout_sec) {
+            return Err("Can't switch to <code>kokoro-remote</code>: \
+                 <code>TELEGRAM_TTS_REMOTE_TIMEOUT_SEC</code> must be 1..=300."
+                .to_string());
+        }
+    }
+
+    let lower = url.trim().to_ascii_lowercase();
+    if !(lower.starts_with("https://") || allow_http && lower.starts_with("http://")) {
+        return Err("Can't switch to <code>kokoro-remote</code>: \
+         <code>TELEGRAM_TTS_REMOTE_URL</code> must start with <code>https://</code> \
+         (or set <code>TELEGRAM_TTS_REMOTE_ALLOW_HTTP=true</code> for LAN HTTP)."
+            .to_string());
+    }
+
+    Ok(())
+}
+
+fn read_env_key_for_tts(env_path: &Path, key: &str) -> Result<Option<String>, String> {
+    crate::env_file::read_key(env_path, key).map_err(|e| {
+        format!(
+            "Can't switch TTS at runtime: failed to read env file: <code>{}</code>.",
+            sanitize::escape_html(&e.to_string())
+        )
+    })
 }
 
 /// Invariant 18: cap transcript bytes fed into `parse` so long voice
@@ -340,8 +451,7 @@ async fn transcribe_voice(
         .map_err(|e| format!("Could not fetch voice file: {e}"))?;
     let Some(path) = file.file_path else {
         return Err(
-            "Voice file expired on Telegram's side (>1 h since upload). Resend it."
-                .to_string(),
+            "Voice file expired on Telegram's side (>1 h since upload). Resend it.".to_string(),
         );
     };
 
@@ -369,7 +479,9 @@ async fn transcribe_voice(
     );
 
     // ×2 sample budget covers Opus preskip + trailing silence whisper ignores.
-    let max_samples = (limits.max_duration_sec as usize).saturating_mul(16_000).saturating_mul(2);
+    let max_samples = (limits.max_duration_sec as usize)
+        .saturating_mul(16_000)
+        .saturating_mul(2);
     let pcm = codec::decode_opus_to_pcm16k(&oga_bytes, max_samples).map_err(|e| {
         format!("Voice decode failed: {e}. Tebis only accepts OGG/Opus voice notes — music files in other formats aren't supported.")
     })?;
@@ -440,7 +552,10 @@ async fn synthesize_and_send_voice_detached(
         }
     };
     let synth_ms = u64::try_from(synth_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-    if let Err(e) = tg.send_voice(chat_id, voice_bytes, Some(duration_sec)).await {
+    if let Err(e) = tg
+        .send_voice(chat_id, voice_bytes, Some(duration_sec))
+        .await
+    {
         metrics.record_tts_failure();
         tracing::warn!(err = %e, "sendVoice failed; text reply already sent");
         return;
@@ -478,10 +593,7 @@ mod strip_html_tests {
 
     #[test]
     fn strips_pre_and_code_tags() {
-        assert_eq!(
-            strip_html_for_tts("<pre>hello</pre>"),
-            "hello"
-        );
+        assert_eq!(strip_html_for_tts("<pre>hello</pre>"), "hello");
         assert_eq!(
             strip_html_for_tts("before <code>mid</code> after"),
             "before mid after"
@@ -549,6 +661,106 @@ mod strip_html_tests {
                 format!("prefix {raw} suffix"),
                 "code-wrapper roundtrip failed for {raw:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tts_switch_tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::validate_remote_tts_env;
+
+    fn env_file(body: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "tebis-tts-remote-{pid}-{nonce}.env",
+            pid = std::process::id()
+        ));
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn kokoro_remote_switch_requires_url() {
+        let path = env_file("TELEGRAM_TTS_BACKEND=none\n");
+        let err = validate_remote_tts_env(&path).unwrap_err();
+        assert!(err.contains("TELEGRAM_TTS_REMOTE_URL"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn kokoro_remote_switch_accepts_https_url() {
+        let path = env_file("TELEGRAM_TTS_REMOTE_URL=https://kokoro.example.com\n");
+        validate_remote_tts_env(&path).unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn kokoro_remote_switch_rejects_http_by_default() {
+        let path = env_file("TELEGRAM_TTS_REMOTE_URL=http://127.0.0.1:8880\n");
+        let err = validate_remote_tts_env(&path).unwrap_err();
+        assert!(err.contains("https://"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn kokoro_remote_switch_allows_http_when_enabled() {
+        let path = env_file(
+            "TELEGRAM_TTS_REMOTE_URL=http://127.0.0.1:8880\n\
+             TELEGRAM_TTS_REMOTE_ALLOW_HTTP=true\n",
+        );
+        validate_remote_tts_env(&path).unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn kokoro_remote_switch_rejects_invalid_allow_http_toggle() {
+        let path = env_file(
+            "TELEGRAM_TTS_REMOTE_URL=http://127.0.0.1:8880\n\
+             TELEGRAM_TTS_REMOTE_ALLOW_HTTP=maybe\n",
+        );
+        let err = validate_remote_tts_env(&path).unwrap_err();
+        assert!(err.contains("TELEGRAM_TTS_REMOTE_ALLOW_HTTP"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn kokoro_remote_switch_rejects_invalid_timeout() {
+        let path = env_file(
+            "TELEGRAM_TTS_REMOTE_URL=https://kokoro.example.com\n\
+             TELEGRAM_TTS_REMOTE_TIMEOUT_SEC=slow\n",
+        );
+        let err = validate_remote_tts_env(&path).unwrap_err();
+        assert!(err.contains("TELEGRAM_TTS_REMOTE_TIMEOUT_SEC"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn kokoro_remote_switch_rejects_out_of_range_timeout() {
+        let path = env_file(
+            "TELEGRAM_TTS_REMOTE_URL=https://kokoro.example.com\n\
+             TELEGRAM_TTS_REMOTE_TIMEOUT_SEC=301\n",
+        );
+        let err = validate_remote_tts_env(&path).unwrap_err();
+        assert!(err.contains("1..=300"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn kokoro_remote_switch_accepts_timeout_range_edges() {
+        for timeout in ["1", "300"] {
+            let path = env_file(&format!(
+                "TELEGRAM_TTS_REMOTE_URL=https://kokoro.example.com\n\
+                 TELEGRAM_TTS_REMOTE_TIMEOUT_SEC={timeout}\n"
+            ));
+            validate_remote_tts_env(&path).unwrap();
+            let _ = fs::remove_file(path);
         }
     }
 }

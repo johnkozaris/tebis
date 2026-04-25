@@ -7,10 +7,7 @@ use dialoguer::theme::ColorfulTheme;
 
 use super::super::ui;
 
-pub(in crate::setup) fn step_user_id(
-    theme: &ColorfulTheme,
-    existing: Option<i64>,
-) -> Result<i64> {
+pub(in crate::setup) fn step_user_id(theme: &ColorfulTheme, existing: Option<i64>) -> Result<i64> {
     ui::step_header(2, "Lock the bot to your user id");
     println!(
         "Telegram bots are {} — anyone who discovers yours can DM it.",

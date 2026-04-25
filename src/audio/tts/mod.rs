@@ -3,10 +3,14 @@
 #[cfg(target_os = "macos")]
 pub mod say;
 
-#[cfg(feature = "kokoro")]
+#[cfg(target_os = "windows")]
+pub mod winrt;
+
+#[cfg(feature = "kokoro-local")]
 pub mod kokoro;
 
 pub mod remote;
+pub mod wav;
 
 use secrecy::SecretString;
 
@@ -19,8 +23,19 @@ pub struct TtsConfig {
 
 #[derive(Debug, Clone)]
 pub enum BackendConfig {
-    Say { voice: String },
-    KokoroLocal { model: String, voice: String },
+    Say {
+        voice: String,
+    },
+    /// Windows built-in WinRT `SpeechSynthesizer`. `voice` is a voice
+    /// display name substring (e.g. `"Zira"` / `"David"`) — empty
+    /// means "system default".
+    WinRt {
+        voice: String,
+    },
+    KokoroLocal {
+        model: String,
+        voice: String,
+    },
     Remote {
         /// Base URL — client appends `/v1/audio/speech`.
         url: String,
@@ -36,6 +51,7 @@ impl BackendConfig {
     pub fn voice(&self) -> &str {
         match self {
             Self::Say { voice }
+            | Self::WinRt { voice }
             | Self::KokoroLocal { voice, .. }
             | Self::Remote { voice, .. } => voice,
         }
@@ -44,6 +60,7 @@ impl BackendConfig {
     pub const fn kind_str(&self) -> &'static str {
         match self {
             Self::Say { .. } => "say",
+            Self::WinRt { .. } => "winrt",
             Self::KokoroLocal { .. } => "kokoro-local",
             Self::Remote { .. } => "kokoro-remote",
         }
@@ -66,8 +83,7 @@ impl Synthesis {
         if self.sample_rate == 0 {
             return 0;
         }
-        u32::try_from(self.pcm.len() as u64 / u64::from(self.sample_rate))
-            .unwrap_or(u32::MAX)
+        u32::try_from(self.pcm.len() as u64 / u64::from(self.sample_rate)).unwrap_or(u32::MAX)
     }
 }
 
@@ -151,7 +167,9 @@ pub trait Tts: Send + Sync + 'static {
 pub enum Backend {
     #[cfg(target_os = "macos")]
     Say(say::SayTts),
+    #[cfg(target_os = "windows")]
+    WinRt(winrt::WinRtTts),
     Remote(Box<remote::RemoteTts>),
-    #[cfg(feature = "kokoro")]
+    #[cfg(feature = "kokoro-local")]
     Kokoro(Box<kokoro::KokoroTts>),
 }

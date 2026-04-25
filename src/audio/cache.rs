@@ -134,7 +134,10 @@ mod tests {
         let tmp = unique_tmpdir("mkdir");
         let nested = tmp.join("a/b/c");
         secure_file::ensure_private_dir(&nested).unwrap();
-        assert_eq!(fs::metadata(&nested).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         fs::remove_dir_all(&tmp).ok();
     }
 
@@ -147,7 +150,10 @@ mod tests {
         fs::create_dir(&d).unwrap();
         fs::set_permissions(&d, fs::Permissions::from_mode(0o777)).unwrap();
         secure_file::ensure_private_dir(&d).unwrap();
-        assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(&d).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         fs::remove_dir_all(&tmp).ok();
     }
 
@@ -158,7 +164,10 @@ mod tests {
         let tmp = unique_tmpdir("open0644");
         let p = tmp.join("m.bin");
         let _f = open_model_tmp(&p).unwrap();
-        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
         fs::remove_dir_all(&tmp).ok();
     }
 

@@ -39,9 +39,7 @@ pub enum FetchError {
     #[error("download failed: HTTP {status} for {url_host}")]
     HttpStatus { status: u16, url_host: String },
 
-    #[error(
-        "download failed: checksum mismatch (expected sha256 {expected}, got {got})"
-    )]
+    #[error("download failed: checksum mismatch (expected sha256 {expected}, got {got})")]
     ChecksumMismatch { expected: String, got: String },
 
     #[error("download failed: response body ended after {bytes_read} bytes")]
@@ -158,9 +156,9 @@ impl FetchClient {
                     "too many redirects (> {MAX_REDIRECTS}) starting from original URL"
                 )));
             }
-            let uri: hyper::Uri = current_url.parse().map_err(
-                |e: hyper::http::uri::InvalidUri| FetchError::Network(e.to_string()),
-            )?;
+            let uri: hyper::Uri = current_url
+                .parse()
+                .map_err(|e: hyper::http::uri::InvalidUri| FetchError::Network(e.to_string()))?;
             let host = uri.host().unwrap_or("<unknown>").to_string();
 
             let req = Request::builder()

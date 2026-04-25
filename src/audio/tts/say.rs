@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use super::{Synthesis, Tts, TtsError};
+use super::{Synthesis, Tts, TtsError, wav};
 
 const SAY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -100,7 +100,7 @@ impl Tts for SayTts {
             .map_err(|e| TtsError::Synthesis(format!("read {}: {e}", tmp.display())))?;
         let _ = fs::remove_file(&tmp);
 
-        let pcm = parse_le_i16_wav(&wav_bytes)?;
+        let pcm = wav::parse_le_i16_wav(&wav_bytes)?;
         if pcm.is_empty() {
             return Err(TtsError::EmptyOutput);
         }
@@ -113,109 +113,4 @@ impl Tts for SayTts {
     }
 }
 
-/// Minimal WAV reader — assumes `say` produced LEI16 @ 16 kHz mono (what we asked for).
-fn parse_le_i16_wav(bytes: &[u8]) -> Result<Vec<f32>, TtsError> {
-    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return Err(TtsError::Synthesis(
-            "not a RIFF/WAVE file — `say` output unexpected".to_string(),
-        ));
-    }
-
-    let mut cursor = 12;
-    loop {
-        if cursor + 8 > bytes.len() {
-            return Err(TtsError::Synthesis("unterminated WAV chunks".to_string()));
-        }
-        let chunk_id = &bytes[cursor..cursor + 4];
-        let chunk_size = u32::from_le_bytes([
-            bytes[cursor + 4],
-            bytes[cursor + 5],
-            bytes[cursor + 6],
-            bytes[cursor + 7],
-        ]) as usize;
-        let body_start = cursor + 8;
-        // Checked — release has overflow-checks on; u32::MAX chunk_size would panic.
-        let Some(body_end) = body_start.checked_add(chunk_size) else {
-            return Err(TtsError::Synthesis(
-                "WAV chunk size overflow — file is malformed".to_string(),
-            ));
-        };
-        if body_end > bytes.len() {
-            return Err(TtsError::Synthesis(format!(
-                "WAV chunk {:?} runs past end of file",
-                std::str::from_utf8(chunk_id).unwrap_or("??")
-            )));
-        }
-        if chunk_id == b"data" {
-            if !chunk_size.is_multiple_of(2) {
-                return Err(TtsError::Synthesis(
-                    "WAV data chunk has odd byte count — not i16 PCM".to_string(),
-                ));
-            }
-            let sample_count = chunk_size / 2;
-            let mut out = Vec::with_capacity(sample_count);
-            for i in 0..sample_count {
-                let lo = bytes[body_start + 2 * i];
-                let hi = bytes[body_start + 2 * i + 1];
-                let sample = i16::from_le_bytes([lo, hi]);
-                out.push(f32::from(sample) / 32768.0);
-            }
-            return Ok(out);
-        }
-        cursor = body_end;
-        if !chunk_size.is_multiple_of(2) {
-            cursor += 1;
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_minimal_wav() {
-        let mut wav = Vec::new();
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&0u32.to_le_bytes());
-        wav.extend_from_slice(b"WAVE");
-        wav.extend_from_slice(b"fmt ");
-        wav.extend_from_slice(&16u32.to_le_bytes());
-        wav.extend_from_slice(&1u16.to_le_bytes());
-        wav.extend_from_slice(&1u16.to_le_bytes());
-        wav.extend_from_slice(&16_000_u32.to_le_bytes());
-        wav.extend_from_slice(&32_000_u32.to_le_bytes());
-        wav.extend_from_slice(&2u16.to_le_bytes());
-        wav.extend_from_slice(&16u16.to_le_bytes());
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&6u32.to_le_bytes());
-        wav.extend_from_slice(&0i16.to_le_bytes());
-        wav.extend_from_slice(&1i16.to_le_bytes());
-        wav.extend_from_slice(&(-1i16).to_le_bytes());
-
-        let pcm = parse_le_i16_wav(&wav).expect("parse");
-        assert_eq!(pcm.len(), 3);
-        assert!((pcm[0] - 0.0).abs() < 1e-9);
-        assert!(pcm[1] > 0.0 && pcm[1] < 1e-3);
-        assert!(pcm[2] < 0.0 && pcm[2] > -1e-3);
-    }
-
-    #[test]
-    fn parse_wav_rejects_non_riff() {
-        let garbage = vec![0u8; 64];
-        assert!(parse_le_i16_wav(&garbage).is_err());
-    }
-
-    #[test]
-    fn parse_wav_rejects_odd_data_size() {
-        let mut wav = Vec::new();
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&0u32.to_le_bytes());
-        wav.extend_from_slice(b"WAVE");
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&3u32.to_le_bytes());
-        wav.extend_from_slice(&[0, 0, 0]);
-        let err = parse_le_i16_wav(&wav).unwrap_err();
-        assert!(err.to_string().contains("odd byte count"));
-    }
-}
+// WAV decoding lives in `wav` module so the Windows WinRT backend can share it.

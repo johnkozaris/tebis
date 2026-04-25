@@ -29,10 +29,7 @@ pub(super) fn expected_origins_for(port: u16) -> Vec<String> {
 /// Trusted `Host` values — DNS-rebinding defense. A rebound attacker
 /// domain still arrives with its own name in `Host`, so gate on it.
 pub(super) fn expected_hosts_for(port: u16) -> Vec<String> {
-    vec![
-        format!("127.0.0.1:{port}"),
-        format!("localhost:{port}"),
-    ]
+    vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")]
 }
 
 pub(super) async fn accept_loop(
@@ -72,9 +69,7 @@ pub(super) async fn accept_loop(
                 let live = live.clone();
                 let expected_origins = expected_origins.clone();
                 let expected_hosts = expected_hosts.clone();
-                async move {
-                    handle(req, snapshot, live, expected_origins, expected_hosts).await
-                }
+                async move { handle(req, snapshot, live, expected_origins, expected_hosts).await }
             });
             let serve = http1::Builder::new()
                 .timer(TokioTimer::new())
@@ -274,7 +269,9 @@ fn parse_config_form(
                     return Err("autostart_dir must be an existing directory\n");
                 }
                 autostart_dir = Some(
-                    canon.into_os_string().into_string()
+                    canon
+                        .into_os_string()
+                        .into_string()
                         .map_err(|_| "autostart_dir must be valid UTF-8\n")?,
                 );
             }
@@ -329,8 +326,7 @@ fn url_decode(s: &str) -> String {
 /// `&'static str` keys that `parse_config_form` returns, without
 /// forcing the shared helper to fix its key lifetime.
 fn write_env_file(path: &Path, updates: &[(&'static str, String)]) -> anyhow::Result<()> {
-    let borrowed: Vec<(&str, String)> =
-        updates.iter().map(|(k, v)| (*k, v.clone())).collect();
+    let borrowed: Vec<(&str, String)> = updates.iter().map(|(k, v)| (*k, v.clone())).collect();
     env_file::upsert_keys(path, &borrowed)
 }
 

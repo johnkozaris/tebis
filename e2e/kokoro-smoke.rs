@@ -1,18 +1,18 @@
 //! Kokoro local TTS smoke. Writes `/tmp/tebis-kokoro-smoke-{1,2,3}.oga` for
-//! aural check. Needs espeak-ng + onnxruntime + `--features kokoro`.
+//! aural check. Needs espeak-ng + onnxruntime + `--features kokoro-local`.
 //! First CLI arg overrides the voice, e.g. `… -- am_adam`.
 
-#[cfg(not(feature = "kokoro"))]
+#[cfg(not(feature = "kokoro-local"))]
 fn main() {
     eprintln!(
-        "This smoke test requires the `kokoro` cargo feature. Rebuild with:"
+        "This smoke test requires the `kokoro-local` cargo feature. Rebuild with:"
     );
     eprintln!();
-    eprintln!("  cargo run --release --features kokoro --example kokoro-smoke");
+    eprintln!("  cargo run --release --features kokoro-local --example kokoro-smoke");
     std::process::exit(2);
 }
 
-#[cfg(feature = "kokoro")]
+#[cfg(feature = "kokoro-local")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     use std::time::Instant;

@@ -10,8 +10,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use super::typing::TypingGuard;
-use crate::telegram::TelegramClient;
 use crate::platform::multiplexer::Mux;
+use crate::telegram::TelegramClient;
 
 #[derive(Clone)]
 pub struct AutoreplyConfig {

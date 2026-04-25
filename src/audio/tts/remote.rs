@@ -51,9 +51,11 @@ impl RemoteTts {
         timeout_sec: u32,
     ) -> Result<Self, TtsError> {
         let base_url = url.trim_end_matches('/').to_string();
-        let _: Uri = base_url.parse().map_err(|e: hyper::http::uri::InvalidUri| {
-            TtsError::Init(format!("invalid remote TTS URL: {e}"))
-        })?;
+        let _: Uri = base_url
+            .parse()
+            .map_err(|e: hyper::http::uri::InvalidUri| {
+                TtsError::Init(format!("invalid remote TTS URL: {e}"))
+            })?;
 
         let tls = ClientConfig::builder()
             .with_webpki_roots()
@@ -128,10 +130,8 @@ impl RemoteTts {
             .header("content-type", "application/json")
             .header("accept", "audio/ogg");
         if let Some(key) = &self.api_key {
-            req_builder = req_builder.header(
-                "authorization",
-                format!("Bearer {}", key.expose_secret()),
-            );
+            req_builder =
+                req_builder.header("authorization", format!("Bearer {}", key.expose_secret()));
         }
         let req = req_builder
             .body(Full::<Bytes>::from(Bytes::from(body_json)))

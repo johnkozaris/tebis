@@ -102,7 +102,7 @@ mod tests {
     use super::*;
 
     /// Requires espeak-ng on PATH; marked #[ignore] so CI doesn't fail
-    /// on hosts without it. Run with `cargo test --features kokoro -- \
+    /// on hosts without it. Run with `cargo test --features kokoro-local -- \
     /// --ignored espeak_produces_ipa` to exercise the real flow.
     #[tokio::test]
     #[ignore = "requires espeak-ng on PATH"]

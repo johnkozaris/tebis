@@ -18,11 +18,7 @@ pub struct LocalStt {
 
 impl LocalStt {
     /// Blocking (~300 ms base.en on M4) — run once at subsystem init.
-    pub fn load(
-        model_path: &Path,
-        threads: u32,
-        default_language: &str,
-    ) -> Result<Self, SttError> {
+    pub fn load(model_path: &Path, threads: u32, default_language: &str) -> Result<Self, SttError> {
         let path_str = model_path.to_str().ok_or_else(|| {
             SttError::LocalInference(format!(
                 "model path is not valid UTF-8: {}",

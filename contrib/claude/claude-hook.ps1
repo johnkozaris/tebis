@@ -1,4 +1,4 @@
-# Multi-event Claude Code hook for tebis (Telegram-tmux bridge), Windows edition.
+# Multi-event Claude Code hook for tebis (Telegram-to-multiplexer bridge), Windows edition.
 #
 # PowerShell sibling of contrib/claude/claude-hook.sh. Same event dispatch
 # and wire format; transport is a Named Pipe instead of a Unix socket.

@@ -19,7 +19,7 @@ use tebis::{
 };
 
 const HELP: &str = "\
-tebis — Telegram-tmux bridge
+tebis — Telegram-multiplexer bridge
 
 Usage:
   tebis                 Run in foreground (auto-loads ~/.config/tebis/env).
@@ -44,7 +44,7 @@ Required env (set by `tebis setup` or your own scripts):
   TELEGRAM_ALLOWED_USER         Your numeric Telegram user id
 
 Optional env:
-  TELEGRAM_ALLOWED_SESSIONS     Comma-separated tmux session allowlist
+  TELEGRAM_ALLOWED_SESSIONS     Comma-separated multiplexer session allowlist
   TELEGRAM_POLL_TIMEOUT         Long-poll seconds (default 30, 1..=900)
   TELEGRAM_MAX_OUTPUT_CHARS     /read truncation cap (default 4000)
   TELEGRAM_AUTOSTART_SESSION    Autostart session name
@@ -365,15 +365,19 @@ async fn run_bridge() -> Result<()> {
         let voice_info = if config.audio.any_enabled() {
             Some(inspect::VoiceInfo {
                 stt_model: config.audio.stt.as_ref().map(|s| s.model.clone()),
-                stt_ready: audio
-                    .as_ref()
-                    .is_some_and(|a| a.stt_model_name().is_some()),
+                stt_ready: audio.as_ref().is_some_and(|a| a.stt_model_name().is_some()),
                 tts_backend: audio.as_ref().map_or("none", |a| a.tts_backend_kind()),
                 tts_voice: audio.as_ref().and_then(|a| a.tts_voice().map(String::from)),
-                tts_detail: audio.as_ref().and_then(|a| a.tts_detail().map(String::from)),
-                tts_scope: audio
+                tts_detail: audio
                     .as_ref()
-                    .map_or("", |a| if a.tts_respond_to_all() { "all" } else { "voice-only" }),
+                    .and_then(|a| a.tts_detail().map(String::from)),
+                tts_scope: audio.as_ref().map_or("", |a| {
+                    if a.tts_respond_to_all() {
+                        "all"
+                    } else {
+                        "voice-only"
+                    }
+                }),
             })
         } else {
             None
@@ -629,7 +633,7 @@ fn print_startup_banner() {
         "  {}  {}  {}",
         console::style("tebis").bold().cyan(),
         console::style(format!("v{version}")).dim(),
-        console::style("· Telegram → tmux bridge").dim(),
+        console::style(format!("· Telegram → {} bridge", mux::BINARY)).dim(),
     );
 }
 

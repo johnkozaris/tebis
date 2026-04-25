@@ -76,6 +76,13 @@ pub(super) enum TtsChoice {
         voice: String,
         respond_to_all: bool,
     },
+    /// Windows built-in WinRT `SpeechSynthesizer`. `voice` is a
+    /// display-name substring (`"Zira"`, `"David"`, …) or empty for
+    /// the system default. No model field — WinRT picks the engine.
+    WinRt {
+        voice: String,
+        respond_to_all: bool,
+    },
     KokoroLocal {
         model: String,
         voice: String,
@@ -106,6 +113,7 @@ impl TtsChoice {
         match self {
             Self::Off => false,
             Self::Say { respond_to_all, .. }
+            | Self::WinRt { respond_to_all, .. }
             | Self::KokoroLocal { respond_to_all, .. }
             | Self::KokoroRemote { respond_to_all, .. } => *respond_to_all,
         }
@@ -116,6 +124,7 @@ impl TtsChoice {
         match self {
             Self::Off => "",
             Self::Say { voice, .. }
+            | Self::WinRt { voice, .. }
             | Self::KokoroLocal { voice, .. }
             | Self::KokoroRemote { voice, .. } => voice,
         }
@@ -132,6 +141,7 @@ pub enum Next {
 pub fn run() -> Result<Next> {
     let theme = ColorfulTheme::default();
     ui::print_welcome();
+    warn_missing_multiplexer();
 
     let env_path = env_file_path()?;
     let discovered = discover::discover(&env_path);
@@ -219,6 +229,31 @@ pub fn run() -> Result<Next> {
     prompt_next_action(&theme, &env_path, inspect_port)
 }
 
+fn warn_missing_multiplexer() {
+    if crate::platform::multiplexer::binary_on_path() {
+        return;
+    }
+    let bin = crate::platform::multiplexer::BINARY;
+    ui::note_warn(&format!(
+        "`{bin}` is not on PATH yet. Setup can write config, but runtime needs it."
+    ));
+    #[cfg(windows)]
+    {
+        println!("   Install psmux, then open a new terminal:");
+        println!("     scoop bucket add psmux https://github.com/psmux/scoop-psmux");
+        println!("     scoop install psmux");
+        println!(
+            "   Other options: winget install marlocarlo.psmux, choco install psmux, cargo install psmux"
+        );
+        println!("   psmux also ships `tmux.exe` and `pmux.exe` aliases.");
+    }
+    #[cfg(not(windows))]
+    {
+        println!("   Install tmux 3.x with your OS package manager, then re-run or start tebis.");
+    }
+    println!();
+}
+
 fn prompt_next_action(
     theme: &ColorfulTheme,
     env_path: &Path,
@@ -296,7 +331,7 @@ fn build_env_file(
     let _ = writeln!(out, "TELEGRAM_ALLOWED_USER={user_id}");
     if sessions.is_empty() {
         out.push_str(
-            "# TELEGRAM_ALLOWED_SESSIONS unset → any tmux session name is accepted.\n\
+            "# TELEGRAM_ALLOWED_SESSIONS unset → any multiplexer session name is accepted.\n\
              # Uncomment and set a comma-separated list to restrict, e.g.:\n\
              # TELEGRAM_ALLOWED_SESSIONS=claude-code,shell\n",
         );
@@ -332,7 +367,7 @@ fn build_env_file(
     if let Some(v) = voice {
         out.push_str("\n# Voice input (STT). Transcribes Telegram voice notes in-process\n");
         out.push_str("# via whisper-rs. Model downloads on first run to\n");
-        out.push_str("# $XDG_DATA_HOME/tebis/models/ (about 148 MB for base.en).\n");
+        out.push_str("# the per-user tebis data dir (about 181 MB for small.en).\n");
         if v.enabled {
             let _ = writeln!(out, "TELEGRAM_STT=on");
             let _ = writeln!(out, "TELEGRAM_STT_MODEL={}", v.model);
@@ -342,14 +377,15 @@ fn build_env_file(
     }
 
     if let Some(t) = tts {
-        out.push_str(
-            "\n# Voice replies (TTS). See PLAN-TTS-V2.md for the backend story.\n",
-        );
+        out.push_str("\n# Voice replies (TTS). See PLAN-TTS-V2.md for the backend story.\n");
         match t {
             TtsChoice::Off => {
                 let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=none");
             }
-            TtsChoice::Say { voice, respond_to_all } => {
+            TtsChoice::Say {
+                voice,
+                respond_to_all,
+            } => {
                 out.push_str("# macOS `say` shell-out.\n");
                 let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=say");
                 let _ = writeln!(out, "TELEGRAM_TTS_VOICE={voice}");
@@ -357,11 +393,33 @@ fn build_env_file(
                     out.push_str("TELEGRAM_TTS_RESPOND_TO_ALL=on\n");
                 }
             }
-            TtsChoice::KokoroLocal { model, voice, respond_to_all, ort_dylib_path } => {
+            TtsChoice::WinRt {
+                voice,
+                respond_to_all,
+            } => {
                 out.push_str(
-                    "# Local Kokoro ONNX via espeak-ng phonemizer. Requires\n",
+                    "# Windows WinRT `SpeechSynthesizer` — zero-install, uses OneCore voices\n\
+                     # (David/Zira/Mark). Voice is a case-insensitive substring match;\n\
+                     # leave empty for the system default.\n",
                 );
-                out.push_str("# the `kokoro` cargo feature at build time.\n");
+                let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=winrt");
+                if voice.is_empty() {
+                    out.push_str("# TELEGRAM_TTS_VOICE unset → system default voice.\n");
+                } else {
+                    let _ = writeln!(out, "TELEGRAM_TTS_VOICE={voice}");
+                }
+                if *respond_to_all {
+                    out.push_str("TELEGRAM_TTS_RESPOND_TO_ALL=on\n");
+                }
+            }
+            TtsChoice::KokoroLocal {
+                model,
+                voice,
+                respond_to_all,
+                ort_dylib_path,
+            } => {
+                out.push_str("# Local Kokoro ONNX via espeak-ng phonemizer. Requires\n");
+                out.push_str("# the `kokoro-local` cargo feature at build time.\n");
                 let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=kokoro-local");
                 let _ = writeln!(out, "TELEGRAM_TTS_MODEL={model}");
                 let _ = writeln!(out, "TELEGRAM_TTS_VOICE={voice}");
@@ -386,9 +444,7 @@ fn build_env_file(
                 allow_http,
                 respond_to_all,
             } => {
-                out.push_str(
-                    "# Remote OpenAI-compatible TTS endpoint (e.g. Kokoro-FastAPI).\n",
-                );
+                out.push_str("# Remote OpenAI-compatible TTS endpoint (e.g. Kokoro-FastAPI).\n");
                 let _ = writeln!(out, "TELEGRAM_TTS_BACKEND=kokoro-remote");
                 let _ = writeln!(out, "TELEGRAM_TTS_REMOTE_URL={url}");
                 if let Some(k) = api_key

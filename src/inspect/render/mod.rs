@@ -90,7 +90,7 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext) -> String {
 </section>
 
 <section aria-labelledby="sessions-h">
-  <h2 id="sessions-h">Tmux sessions</h2>
+  <h2 id="sessions-h">Multiplexer sessions</h2>
   <p class="section-lede">Default target: {default_target_display}. Plain-text messages route here.</p>
   <div class="panel">{sessions_table}</div>
 </section>
@@ -100,7 +100,7 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext) -> String {
   <div class="panel"><dl>
     {bot_rows}
     <dt>Authorized Telegram user</dt><dd><code>{allowed_user_id}</code></dd>
-    <dt>Tmux version</dt><dd><code>{tmux_version}</code></dd>
+    <dt>Multiplexer version</dt><dd><code>{tmux_version}</code></dd>
     <dt>Last successful poll</dt><dd>{last_poll_success_ago}</dd>
     <dt>Handler errors</dt><dd>{handler_errors}</dd>
     <dt>Live session slots</dt><dd><code>{dynamic_slots}</code></dd>
@@ -142,7 +142,7 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext) -> String {
     <div class="danger-row">
       <div class="label">
         <div class="title">Restart bridge</div>
-        <div class="desc">Graceful shutdown; launchd / systemd respawns with the current env file.</div>
+        <div class="desc">Graceful shutdown; the OS service manager respawns with the current env file.</div>
       </div>
       <form method="POST" action="/actions/restart">
         <button type="submit" class="btn btn-danger">Restart</button>
@@ -225,7 +225,8 @@ fn build_meta(snapshot: &Snapshot, live: &LiveContext) -> RenderMeta {
 
     let last_poll_secs = m.last_poll_success_at.load(Ordering::Relaxed);
     let healthy = last_poll_secs != 0
-        && timefmt::now_unix_secs().saturating_sub(last_poll_secs) < i64::from(2 * snapshot.poll_timeout);
+        && timefmt::now_unix_secs().saturating_sub(last_poll_secs)
+            < i64::from(2 * snapshot.poll_timeout);
     let (dot_class, status_label) = if healthy {
         ("dot ok", "online")
     } else {

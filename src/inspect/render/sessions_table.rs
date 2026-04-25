@@ -1,9 +1,9 @@
-//! Live tmux session table with kill buttons.
+//! Live multiplexer session table with kill buttons.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
-use crate::sanitize;
+use crate::{platform::multiplexer, sanitize};
 
 pub(super) fn build_sessions_table(
     live_sessions: &[String],
@@ -58,7 +58,10 @@ pub(super) fn build_sessions_table(
     }
     if rows.is_empty() {
         rows.push_str(
-            r#"<tr><td class="col-empty" colspan="3">no tmux sessions — run <code>tmux new-session -s something</code></td></tr>"#,
+            &format!(
+                r#"<tr><td class="col-empty" colspan="3">no {bin} sessions — run <code>{bin} new-session -s something</code></td></tr>"#,
+                bin = sanitize::escape_html(multiplexer::BINARY),
+            ),
         );
     }
     format!(

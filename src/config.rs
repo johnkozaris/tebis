@@ -127,17 +127,24 @@ fn load_tts_config() -> Result<Option<TtsConfig>> {
             if !legacy_on {
                 return Ok(None);
             }
-            #[cfg(target_os = "macos")]
-            {
-                "say".to_string()
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                bail!(
+            // Legacy `TELEGRAM_TTS=on` with no explicit backend → pick the
+            // OS-native default. macOS → say, Windows → winrt, Linux →
+            // error (user must pick kokoro-local/remote explicitly).
+            match crate::platform::tts_support::native_tts_kind() {
+                Some(k) => {
+                    tracing::warn!(
+                        backend = k.kind_str(),
+                        "TELEGRAM_TTS=on without TELEGRAM_TTS_BACKEND is legacy config; \
+                         defaulting to the OS-native TTS backend. Set TELEGRAM_TTS_BACKEND \
+                         explicitly to silence this."
+                    );
+                    k.kind_str().to_string()
+                }
+                None => bail!(
                     "TELEGRAM_TTS=on with no TELEGRAM_TTS_BACKEND — \
                      set TELEGRAM_TTS_BACKEND to one of \
-                     say (macOS only), kokoro-local, kokoro-remote, or none"
-                );
+                     say (macOS), winrt (Windows), kokoro-local, kokoro-remote, or none"
+                ),
             }
         }
         Some(s) => s.to_ascii_lowercase(),
@@ -155,7 +162,7 @@ fn load_tts_config() -> Result<Option<TtsConfig>> {
             {
                 bail!(
                     "TELEGRAM_TTS_BACKEND=say is macOS-only — \
-                     use kokoro-local or kokoro-remote on this platform"
+                     use winrt (Windows), kokoro-local, or kokoro-remote on this platform"
                 );
             }
             #[cfg(target_os = "macos")]
@@ -165,9 +172,30 @@ fn load_tts_config() -> Result<Option<TtsConfig>> {
                 TtsBackendConfig::Say { voice }
             }
         }
+        "sapi" | "windows" => {
+            bail!(
+                "TELEGRAM_TTS_BACKEND={backend_kind} is not supported — \
+                 use TELEGRAM_TTS_BACKEND=winrt for Windows built-in TTS"
+            );
+        }
+        "winrt" => {
+            #[cfg(not(target_os = "windows"))]
+            {
+                bail!(
+                    "TELEGRAM_TTS_BACKEND=winrt is Windows-only — \
+                     use say (macOS), kokoro-local, or kokoro-remote on this platform"
+                );
+            }
+            #[cfg(target_os = "windows")]
+            {
+                // Empty voice = "system default". Users set a substring
+                // like "Zira" or "David" for a specific voice.
+                let voice = env::var("TELEGRAM_TTS_VOICE").unwrap_or_default();
+                TtsBackendConfig::WinRt { voice }
+            }
+        }
         "kokoro-local" | "kokoro_local" | "local" => {
-            let voice =
-                env::var("TELEGRAM_TTS_VOICE").unwrap_or_else(|_| "af_sarah".to_string());
+            let voice = env::var("TELEGRAM_TTS_VOICE").unwrap_or_else(|_| "af_sarah".to_string());
             ensure_safe_voice_name(&voice)?;
             let model = env::var("TELEGRAM_TTS_MODEL").ok().unwrap_or_else(|| {
                 crate::audio::manifest::get()
@@ -178,9 +206,8 @@ fn load_tts_config() -> Result<Option<TtsConfig>> {
             TtsBackendConfig::KokoroLocal { model, voice }
         }
         "kokoro-remote" | "kokoro_remote" | "remote" => {
-            let url = env::var("TELEGRAM_TTS_REMOTE_URL").context(
-                "TELEGRAM_TTS_BACKEND=remote requires TELEGRAM_TTS_REMOTE_URL",
-            )?;
+            let url = env::var("TELEGRAM_TTS_REMOTE_URL")
+                .context("TELEGRAM_TTS_BACKEND=remote requires TELEGRAM_TTS_REMOTE_URL")?;
             if url.trim().is_empty() {
                 bail!("TELEGRAM_TTS_REMOTE_URL must not be empty");
             }
@@ -198,10 +225,9 @@ fn load_tts_config() -> Result<Option<TtsConfig>> {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .map(SecretString::from);
-            let model = env::var("TELEGRAM_TTS_REMOTE_MODEL")
-                .unwrap_or_else(|_| "kokoro".to_string());
-            let voice =
-                env::var("TELEGRAM_TTS_VOICE").unwrap_or_else(|_| "af_sarah".to_string());
+            let model =
+                env::var("TELEGRAM_TTS_REMOTE_MODEL").unwrap_or_else(|_| "kokoro".to_string());
+            let voice = env::var("TELEGRAM_TTS_VOICE").unwrap_or_else(|_| "af_sarah".to_string());
             let timeout_sec: u32 = env::var("TELEGRAM_TTS_REMOTE_TIMEOUT_SEC")
                 .unwrap_or_else(|_| "10".to_string())
                 .parse()
@@ -219,7 +245,7 @@ fn load_tts_config() -> Result<Option<TtsConfig>> {
         }
         other => bail!(
             "TELEGRAM_TTS_BACKEND must be one of: \
-             say, kokoro-local, kokoro-remote, none (got {other:?})"
+             say, winrt, kokoro-local, kokoro-remote, none (got {other:?})"
         ),
     };
 
@@ -331,7 +357,7 @@ fn load_autostart_config(allowed_sessions: &[String]) -> Result<Option<Autostart
             reject_control_chars(&dir, "TELEGRAM_AUTOSTART_DIR")?;
             reject_control_chars(&command, "TELEGRAM_AUTOSTART_COMMAND")?;
             // Fail-fast so the first plain-text message doesn't hit an
-            // opaque "can't cd" error deep inside tmux's spawn.
+            // opaque "can't cd" error deep inside multiplexer spawn.
             if !std::path::Path::new(&dir).is_dir() {
                 bail!("TELEGRAM_AUTOSTART_DIR {dir:?} does not exist or is not a directory");
             }
@@ -347,12 +373,12 @@ fn load_autostart_config(allowed_sessions: &[String]) -> Result<Option<Autostart
     }
 }
 
-/// Reject control chars in tmux argv — tmux would reject them too, but
+/// Reject control chars in multiplexer argv — tmux/psmux would reject them too, but
 /// catching it at config load gives a clearer error.
 fn reject_control_chars(value: &str, name: &str) -> Result<()> {
     if let Some(bad) = value.chars().find(|c| c.is_control()) {
         bail!(
-            "{name} contains a control character (U+{:04X}); tmux argv values must be printable",
+            "{name} contains a control character (U+{:04X}); multiplexer argv values must be printable",
             bad as u32
         );
     }
@@ -360,13 +386,16 @@ fn reject_control_chars(value: &str, name: &str) -> Result<()> {
 }
 
 /// Defensive check on `TELEGRAM_TTS_VOICE`: `[A-Za-z0-9._-]{1,64}`, same
-/// bar as tmux session names. The Kokoro crate builds the voice file
+/// bar as multiplexer session names. The Kokoro crate builds the voice file
 /// path as `voices_dir.join(format!("{voice_name}.bin"))`; without this
 /// check a `/` or `..` would become a path-traversal surface if manifest
 /// validation ordering ever changes.
 fn ensure_safe_voice_name(voice: &str) -> Result<()> {
     if voice.is_empty() || voice.len() > 64 {
-        bail!("TELEGRAM_TTS_VOICE must be 1..=64 chars (got {})", voice.len());
+        bail!(
+            "TELEGRAM_TTS_VOICE must be 1..=64 chars (got {})",
+            voice.len()
+        );
     }
     if !voice
         .chars()

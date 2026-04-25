@@ -7,13 +7,10 @@
 # Events handled:
 #
 #   userPromptSubmitted → inject summarize-at-end instruction
-#   agentStop           → forward tail of last assistant message
-#   subagentStop        → forward subagent tail tagged by agent name
-#   notification        → forward the message text
+#   notification        → forward completion / permission / idle messages
 #
 # Safety: same as .sh — never blocks Copilot on delivery failure; never
-# echoes transcript content except in the hookSpecificOutput contract;
-# reads the JSONL transcript file, not the terminal.
+# echoes transcript content except in the hookSpecificOutput contract.
 
 $ErrorActionPreference = 'Continue'
 
@@ -42,46 +39,6 @@ function Tail-Trim {
     if (-not $Text) { return $null }
     if ($Text.Length -le $MaxChars) { return $Text }
     return '…' + $Text.Substring($Text.Length - $MaxChars)
-}
-
-# Copilot transcript entries have slightly different shapes across CLI
-# versions: `role: "assistant"` + `content: "..."` is the common case,
-# but older versions use `type: "assistant"` and nested
-# `message.content` arrays. Match all of them.
-function Extract-Text {
-    param($Block)
-    if ($null -eq $Block) { return '' }
-    if ($Block -is [string]) { return $Block }
-    if ($Block -is [array]) {
-        $parts = @()
-        foreach ($item in $Block) {
-            if ($item.type -eq 'text' -and $item.text) { $parts += $item.text }
-        }
-        return ($parts -join "`n`n")
-    }
-    if ($Block.content) { return (Extract-Text $Block.content) }
-    return ''
-}
-
-function Tail-Of-Last-Assistant {
-    param([string]$TranscriptPath)
-    if (-not (Test-Path $TranscriptPath)) { return $null }
-
-    $lastText = $null
-    foreach ($line in (Get-Content -LiteralPath $TranscriptPath -ErrorAction SilentlyContinue)) {
-        if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        try {
-            $entry = $line | ConvertFrom-Json -ErrorAction Stop
-        } catch { continue }
-        $isAssistant = ($entry.role -eq 'assistant') -or ($entry.type -eq 'assistant')
-        if (-not $isAssistant) { continue }
-        $source = $entry.content
-        if (-not $source) { $source = $entry.message.content }
-        if (-not $source) { continue }
-        $text = Extract-Text $source
-        if ($text) { $lastText = $text }
-    }
-    return (Tail-Trim $lastText)
 }
 
 function Forward {
@@ -145,9 +102,6 @@ $event = if ($in.hook_event_name) {
 }
 $event = $event.ToLowerInvariant()
 
-$transcript = if ($in.transcriptPath)  { $in.transcriptPath }
-              elseif ($in.transcript_path) { $in.transcript_path }
-              else { '' }
 $cwd     = if ($in.cwd) { $in.cwd } else { '' }
 $session = if ($in.sessionId)  { $in.sessionId }
            elseif ($in.session_id) { $in.session_id }
@@ -164,25 +118,6 @@ switch ($event) {
         } | ConvertTo-Json -Compress -Depth 4
         Write-Output $out
         exit 0
-    }
-
-    { $_ -in 'agentstop', 'stop' } {
-        if (-not $transcript -or -not (Test-Path $transcript)) { exit 0 }
-        $summary = Tail-Of-Last-Assistant $transcript
-        if ($summary) {
-            Forward -Text $summary -Kind 'stop' -Cwd $cwd -Session $session
-        }
-    }
-
-    'subagentstop' {
-        $agentName = if ($in.agentName) { $in.agentName }
-                     elseif ($in.agent_name) { $in.agent_name }
-                     else { 'subagent' }
-        if (-not $transcript -or -not (Test-Path $transcript)) { exit 0 }
-        $summary = Tail-Of-Last-Assistant $transcript
-        if ($summary) {
-            Forward -Text $summary -Kind 'subagent_stop' -Cwd $cwd -Session $agentName
-        }
     }
 
     'notification' {

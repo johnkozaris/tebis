@@ -12,14 +12,9 @@ use super::jsonfile;
 
 pub struct CopilotHooks;
 
-/// Events + timeouts. Only events confirmed in the Copilot CLI changelog.
-/// `sessionStart`/`sessionEnd` are omitted — same rationale as Claude.
-const EVENTS: &[(&str, u64)] = &[
-    ("userPromptSubmitted", 5),
-    ("agentStop", 15),
-    ("subagentStop", 15),
-    ("notification", 10),
-];
+/// Events + timeouts. Copilot CLI exposes `notification` for async agent
+/// completion / permission prompts; there is no Claude-style `agentStop`.
+const EVENTS: &[(&str, u64)] = &[("userPromptSubmitted", 5), ("notification", 10)];
 
 const TEBIS_HOOKS_FILE: &str = "tebis.json";
 
@@ -32,10 +27,6 @@ fn hooks_file(project_dir: &Path) -> PathBuf {
 }
 
 impl super::HookManager for CopilotHooks {
-    fn agent(&self) -> AgentKind {
-        AgentKind::Copilot
-    }
-
     fn install(&self, project_dir: &Path, script_path: &Path) -> Result<super::InstallReport> {
         let dir = hooks_dir(project_dir);
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;

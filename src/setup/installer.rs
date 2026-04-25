@@ -91,10 +91,22 @@ pub fn install_argv(pm: PackageManager, pkg: &str) -> Vec<String> {
         PackageManager::Brew => vec!["brew".into(), "install".into(), pkg],
         PackageManager::MacPorts => vec!["sudo".into(), "port".into(), "install".into(), pkg],
         PackageManager::Apt => {
-            vec!["sudo".into(), "apt".into(), "install".into(), "-y".into(), pkg]
+            vec![
+                "sudo".into(),
+                "apt".into(),
+                "install".into(),
+                "-y".into(),
+                pkg,
+            ]
         }
         PackageManager::Dnf => {
-            vec!["sudo".into(), "dnf".into(), "install".into(), "-y".into(), pkg]
+            vec![
+                "sudo".into(),
+                "dnf".into(),
+                "install".into(),
+                "-y".into(),
+                pkg,
+            ]
         }
         PackageManager::Pacman => vec![
             "sudo".into(),
@@ -169,7 +181,10 @@ mod tests {
     fn argv_contains_pkg_name() {
         for &pm in ALL {
             let argv = install_argv(pm, "my-pkg");
-            assert!(argv.iter().any(|a| a == "my-pkg"), "argv for {pm:?}: {argv:?}");
+            assert!(
+                argv.iter().any(|a| a == "my-pkg"),
+                "argv for {pm:?}: {argv:?}"
+            );
         }
     }
 }

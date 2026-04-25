@@ -7,7 +7,7 @@
 members = [".", "crates/tebis-tts-kokoro"]
 
 [package]
-description = "Telegram-tmux bridge for driving AI coding agents from a phone"
+description = "Telegram-to-multiplexer bridge for driving AI coding agents from a phone"
 edition = "2024"
 license = "MIT"
 name = "tebis"
@@ -55,15 +55,27 @@ libc = "0.2.185"
 # invariant 20), process termination via TerminateProcess, etc. The
 # feature set is the minimum needed by each platform::windows backend
 # — we extend it per subsystem as phases land.
+#
+# WinRT blocks (`Foundation`, `Media_SpeechSynthesis`, `Storage_Streams`)
+# enable the built-in Windows TTS backend — zero-install OneCore voices
+# via `Windows.Media.SpeechSynthesis.SpeechSynthesizer`. Gated behind
+# `cfg(windows)` because WinRT types don't exist on other OSes.
 [target.'cfg(windows)'.dependencies]
 windows = {version = "0.62", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Media_Core",
+    "Media_SpeechSynthesis",
+    "Storage_Streams",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Pipes",
     "Win32_System_Threading",
+    "Win32_System_WinRT",
 ]}
+windows-future = "0.3"
 
 # whisper-rs: Metal GPU on macOS, CPU on Linux + Windows. CUDA/Vulkan
 # on Windows could land later behind a feature flag; CPU is the
@@ -85,7 +97,7 @@ path = "crates/tebis-tts-kokoro"
 
 [features]
 default = []
-kokoro = ["dep:tebis-tts-kokoro"]
+kokoro-local = ["dep:tebis-tts-kokoro"]
 
 [[example]]
 name = "audio-smoke"
@@ -98,7 +110,7 @@ path = "e2e/inspect-demo.rs"
 [[example]]
 name = "kokoro-smoke"
 path = "e2e/kokoro-smoke.rs"
-required-features = ["kokoro"]
+required-features = ["kokoro-local"]
 
 [[example]]
 name = "tts-bench"

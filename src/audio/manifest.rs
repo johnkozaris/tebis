@@ -173,10 +173,7 @@ mod tests {
             assert!(!m.onnx_url.is_empty(), "TTS `{name}` has empty onnx URL");
             assert!(!m.onnx_sha256.is_empty());
             assert!(m.onnx_size_bytes > 0);
-            assert!(
-                !m.voices.is_empty(),
-                "TTS `{name}` declares no voices"
-            );
+            assert!(!m.voices.is_empty(), "TTS `{name}` declares no voices");
             assert!(
                 m.voices.contains_key(&m.default_voice),
                 "TTS `{name}` default_voice `{}` not in voices map",

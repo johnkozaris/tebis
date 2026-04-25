@@ -57,10 +57,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all-targets
       # Kokoro-gated tests live in the separate `tebis-tts-kokoro`
-      # crate. Without `--features kokoro` the tebis adapter + the
+      # crate. Without `--features kokoro-local` the tebis adapter + the
       # crate itself still compile, but the crate's 49 unit tests
       # never exercise. Run them explicitly.
-      - run: cargo test --locked --workspace --features tebis/kokoro
+      - run: cargo test --locked --workspace --features tebis/kokoro-local
 
   build:
     name: cargo build --release

@@ -1,6 +1,6 @@
 //! Adapter between `tebis_tts_kokoro` and tebis's Tts surface.
 
-#![cfg(feature = "kokoro")]
+#![cfg(feature = "kokoro-local")]
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +21,11 @@ impl KokoroTts {
 
 impl Tts for KokoroTts {
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Synthesis, TtsError> {
-        let out = self.inner.synthesize(text, voice).await.map_err(err_from_crate)?;
+        let out = self
+            .inner
+            .synthesize(text, voice)
+            .await
+            .map_err(err_from_crate)?;
         Ok(Synthesis {
             pcm: out.pcm,
             duration_ms: out.duration_ms,
