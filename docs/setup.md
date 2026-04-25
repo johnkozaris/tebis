@@ -8,7 +8,7 @@ short version, run `tebis setup` and follow the prompts.
 | Platform | Required tools |
 | --- | --- |
 | macOS | Rust 1.95+, `tmux` 3.x, Xcode Command Line Tools |
-| Linux | Rust 1.95+, `tmux` 3.x, C++ build tools, CMake |
+| Unix/Linux | Rust 1.95+, `tmux` 3.x, C++ build tools, CMake |
 | Windows | Rust 1.95+, `psmux`, Visual Studio Build Tools with C++, CMake |
 
 On Windows, `tebis setup` can offer to install `psmux` if it detects Scoop,

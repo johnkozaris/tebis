@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="420" viewBox="0 0 1600 420" role="img" aria-labelledby="title desc">
+  <title id="title">Tebis</title>
+  <desc id="desc">Connect telegram to coding agents.</desc>
+  <defs>
+    <filter id="soft-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#17252c" flood-opacity="0.18"/>
+    </filter>
+    <pattern id="grid" width="44" height="44" patternUnits="userSpaceOnUse">
+      <path d="M0 43.5 H44" stroke="#ddcfba" stroke-width="1" opacity="0.34"/>
+      <path d="M43.5 0 V44" stroke="#ddcfba" stroke-width="1" opacity="0.2"/>
+    </pattern>
+  </defs>
+
+  <rect width="1600" height="420" rx="36" fill="#f5efe3"/>
+  <rect width="1600" height="420" rx="36" fill="url(#grid)"/>
+
+  <g opacity="0.92">
+    <circle cx="1264" cy="104" r="138" fill="#d9ecef"/>
+    <circle cx="1430" cy="264" r="172" fill="#eadbc5"/>
+    <circle cx="1092" cy="300" r="96" fill="#d7e7d7"/>
+  </g>
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M1018 144 C1112 72 1244 74 1336 146 C1398 194 1454 203 1518 158" stroke="#2f7da8" stroke-width="8" opacity="0.72"/>
+    <path d="M1020 256 C1112 328 1246 326 1338 254 C1394 210 1454 208 1518 258" stroke="#9a6b43" stroke-width="8" opacity="0.48"/>
+    <path d="M1086 206 H1476" stroke="#20343b" stroke-width="3" stroke-dasharray="3 18" opacity="0.35"/>
+  </g>
+
+  <g transform="translate(1044 104)" filter="url(#soft-shadow)">
+    <rect x="0" y="0" width="86" height="62" rx="24" fill="#2f7da8"/>
+    <path d="M28 21 L18 31 L28 41" fill="none" stroke="#f9f6ef" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M58 21 L68 31 L58 41" fill="none" stroke="#f9f6ef" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <g transform="translate(1310 236)" filter="url(#soft-shadow)">
+    <rect x="0" y="0" width="116" height="72" rx="22" fill="#20343b"/>
+    <circle cx="26" cy="24" r="6" fill="#d46c2f"/>
+    <circle cx="48" cy="24" r="6" fill="#d7a54a"/>
+    <circle cx="70" cy="24" r="6" fill="#6e9f77"/>
+    <path d="M25 50 H90" stroke="#d7e7d7" stroke-width="7" stroke-linecap="round"/>
+  </g>
+
+  <g transform="translate(112 114)">
+    <text x="0" y="102" font-family="Avenir Next, Segoe UI, Helvetica, Arial, sans-serif" font-size="112" font-weight="850" letter-spacing="-3" fill="#1e2930">Tebis</text>
+    <text x="6" y="158" font-family="Avenir Next, Segoe UI, Helvetica, Arial, sans-serif" font-size="34" font-weight="650" fill="#42615a">Connect telegram to coding agents.</text>
+    <g transform="translate(8 204)" font-family="Avenir Next, Segoe UI, Helvetica, Arial, sans-serif" font-size="18" font-weight="750" letter-spacing="1.2">
+      <rect x="0" y="0" width="114" height="36" rx="18" fill="#263b36"/>
+      <text x="20" y="24" fill="#bfe3d4">UNIX</text>
+      <rect x="130" y="0" width="122" height="36" rx="18" fill="#3c302a"/>
+      <text x="154" y="24" fill="#f2d0b7">macOS</text>
+      <rect x="268" y="0" width="146" height="36" rx="18" fill="#25394a"/>
+      <text x="292" y="24" fill="#c7dff0">Windows</text>
+    </g>
+  </g>
+</svg>

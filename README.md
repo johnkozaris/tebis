@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/tebis-banner.svg" alt="Tebis: Connect telegram to coding agents." width="100%">
+
 # tebis
 
 **Control your local AI coding agent from Telegram.**
@@ -15,7 +17,9 @@ only for direct Telegram Bot API calls.
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 2024](https://img.shields.io/badge/rust-edition%202024-orange?logo=rust)](Cargo.toml)
 [![MSRV 1.95](https://img.shields.io/badge/MSRV-1.95-blue?logo=rust)](Cargo.toml)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-Unix%2FLinux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#requirements)
+
+**Supported:** Unix/Linux, macOS, and Windows.
 
 </div>
 
@@ -30,8 +34,9 @@ laptop.
 3. Tebis sends your text to that local session as keystrokes.
 4. Tebis sends useful output back to Telegram.
 
-On macOS and Linux, Tebis uses `tmux`. On Windows, it uses [`psmux`][psmux].
-Both keep terminal apps running even when no terminal window is open.
+On Unix/Linux and macOS, Tebis uses `tmux`. On Windows, it uses
+[`psmux`][psmux]. Both keep terminal apps running even when no terminal window
+is open.
 
 ## Who it is for
 
@@ -51,7 +56,7 @@ bot token.
 | Platform | You need |
 | --- | --- |
 | macOS | Rust 1.95+, `tmux` 3.x, Xcode Command Line Tools |
-| Linux | Rust 1.95+, `tmux` 3.x, C++ build tools, CMake |
+| Unix/Linux | Rust 1.95+, `tmux` 3.x, C++ build tools, CMake |
 | Windows | Rust 1.95+, [psmux][psmux], Visual Studio Build Tools with C++, CMake |
 
 Optional voice features may download local speech models during setup.
