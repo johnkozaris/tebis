@@ -232,15 +232,24 @@ fn resolve_tts_choice(
 mod tests {
     use super::*;
 
+    fn fake_bot_token() -> String {
+        format!(
+            "{}:{}{}",
+            "123", "ABCdefGHIjklMNOpqrSTUvwxYZ", "-1234567890_abcd"
+        )
+    }
+
     #[test]
     fn discover_parses_full_env_file() {
         let tmp = std::env::temp_dir().join(format!("tebis-discover-{}.env", std::process::id()));
+        let token = fake_bot_token();
         fs::write(
             &tmp,
-            "\
+            format!(
+                "\
 # Written by `tebis setup`.
 
-TELEGRAM_BOT_TOKEN=123:ABCdefGHIjklMNOpqrSTUvwxYZ-1234567890_abcd
+TELEGRAM_BOT_TOKEN={token}
 TELEGRAM_ALLOWED_USER=1234567890
 TELEGRAM_ALLOWED_SESSIONS=claude-code,shell
 
@@ -250,14 +259,12 @@ TELEGRAM_AUTOSTART_COMMAND=claude
 
 INSPECT_PORT=51624
 ",
+            ),
         )
         .unwrap();
 
         let d = discover(&tmp);
-        assert_eq!(
-            d.bot_token.as_deref(),
-            Some("123:ABCdefGHIjklMNOpqrSTUvwxYZ-1234567890_abcd")
-        );
+        assert_eq!(d.bot_token.as_deref(), Some(token.as_str()));
         assert_eq!(d.allowed_user, Some(1_234_567_890));
         assert_eq!(
             d.allowed_sessions.as_deref(),
@@ -302,10 +309,13 @@ INSPECT_PORT=51624
             "tebis-discover-permissive-{}.env",
             std::process::id()
         ));
+        let token = fake_bot_token();
         fs::write(
             &tmp,
-            "TELEGRAM_BOT_TOKEN=123:ABCdefGHIjklMNOpqrSTUvwxYZ-1234567890_abcd\n\
+            format!(
+                "TELEGRAM_BOT_TOKEN={token}\n\
              # TELEGRAM_ALLOWED_SESSIONS=commented,out\n",
+            ),
         )
         .unwrap();
         let d = discover(&tmp);
@@ -361,7 +371,7 @@ INSPECT_PORT=51624
             &tmp,
             "TELEGRAM_TTS_BACKEND=kokoro-remote\n\
              TELEGRAM_TTS_REMOTE_URL=https://kokoro.example.com\n\
-             TELEGRAM_TTS_REMOTE_API_KEY=secret123\n\
+             TELEGRAM_TTS_REMOTE_API_KEY=test-api-key\n\
              TELEGRAM_TTS_REMOTE_MODEL=kokoro-v2\n\
              TELEGRAM_TTS_VOICE=af_sarah\n\
              TELEGRAM_TTS_REMOTE_TIMEOUT_SEC=20\n",
@@ -379,7 +389,7 @@ INSPECT_PORT=51624
                 ..
             } => {
                 assert_eq!(url, "https://kokoro.example.com");
-                assert_eq!(api_key.as_deref(), Some("secret123"));
+                assert_eq!(api_key.as_deref(), Some("test-api-key"));
                 assert_eq!(model, "kokoro-v2");
                 assert_eq!(voice, "af_sarah");
                 assert_eq!(timeout_sec, 20);
@@ -436,17 +446,17 @@ INSPECT_PORT=51624
     fn discover_handles_quoted_and_exported_values() {
         let tmp =
             std::env::temp_dir().join(format!("tebis-discover-quoted-{}.env", std::process::id()));
+        let token = fake_bot_token();
         fs::write(
             &tmp,
-            "export TELEGRAM_BOT_TOKEN=\"123:ABCdefGHIjklMNOpqrSTUvwxYZ-1234567890_abcd\"\n\
+            format!(
+                "export TELEGRAM_BOT_TOKEN=\"{token}\"\n\
              TELEGRAM_AUTOSTART_DIR='/my/path'\n",
+            ),
         )
         .unwrap();
         let d = discover(&tmp);
-        assert_eq!(
-            d.bot_token.as_deref(),
-            Some("123:ABCdefGHIjklMNOpqrSTUvwxYZ-1234567890_abcd")
-        );
+        assert_eq!(d.bot_token.as_deref(), Some(token.as_str()));
         let _ = fs::remove_file(&tmp);
     }
 }

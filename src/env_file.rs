@@ -120,8 +120,22 @@ pub fn read_key(path: &Path, key: &str) -> io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir =
+            std::env::temp_dir().join(format!("tebis-env-{tag}-{}-{ns:x}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test env dir");
+        dir.join("env")
+    }
+
+    fn cleanup(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
 
     #[test]
     fn parse_kv_line_basic() {
@@ -164,39 +178,36 @@ mod tests {
         assert_eq!(parse_kv_line("FOO="), Some(("FOO", "")));
     }
 
-    // Mode-bit assertions only make sense on Unix — Windows relies on
-    // parent-directory DACL inheritance until the Phase-3 secure_file
-    // rewrite adds explicit DACLs.
+    // Unix mode bits don't represent Windows owner-only DACLs.
     #[cfg(unix)]
     #[test]
     fn atomic_write_0600_creates_with_mode() {
         use std::os::unix::fs::PermissionsExt;
-        let p = std::env::temp_dir().join(format!("tebis-env-0600-{}", std::process::id()));
-        let _ = fs::remove_file(&p);
+        let p = temp_path("0600");
         atomic_write_0600(&p, "FOO=bar\n").unwrap();
         let meta = fs::metadata(&p).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         assert_eq!(fs::read_to_string(&p).unwrap(), "FOO=bar\n");
-        let _ = fs::remove_file(&p);
+        cleanup(&p);
     }
 
     #[cfg(unix)]
     #[test]
     fn atomic_write_0600_overwrite_tightens_perms() {
         use std::os::unix::fs::PermissionsExt;
-        let p = std::env::temp_dir().join(format!("tebis-env-0600-tight-{}", std::process::id()));
+        let p = temp_path("0600-tight");
         fs::write(&p, "old").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
         atomic_write_0600(&p, "new\n").unwrap();
         let meta = fs::metadata(&p).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         assert_eq!(fs::read_to_string(&p).unwrap(), "new\n");
-        let _ = fs::remove_file(&p);
+        cleanup(&p);
     }
 
     #[test]
     fn remove_keys_drops_matching_lines_and_preserves_others() {
-        let p = std::env::temp_dir().join(format!("tebis-env-rm-{}", std::process::id()));
+        let p = temp_path("rm");
         fs::write(
             &p,
             "# preamble comment\nFOO=bar\nBAZ=  qux  \n\n# trailing\nORT_DYLIB_PATH=/x\n",
@@ -220,34 +231,35 @@ mod tests {
                 0o600
             );
         }
-        let _ = fs::remove_file(&p);
+        cleanup(&p);
     }
 
     #[test]
     fn remove_keys_no_op_when_file_missing() {
-        let p = std::env::temp_dir().join("tebis-env-rm-missing-nonexistent-xyz");
+        let p = temp_path("rm-missing");
         let _ = fs::remove_file(&p);
         // Must succeed + create an empty-ish file.
         remove_keys(&p, &["WHATEVER"]).unwrap();
         assert!(p.exists());
-        let _ = fs::remove_file(&p);
+        cleanup(&p);
     }
 
     #[test]
     fn read_key_finds_and_trims() {
-        let p = std::env::temp_dir().join(format!("tebis-env-read-{}", std::process::id()));
+        let p = temp_path("read");
         fs::write(&p, "FOO=bar\n# comment\nBAZ=  qux  \n").unwrap();
         assert_eq!(read_key(&p, "FOO").unwrap().as_deref(), Some("bar"));
         assert_eq!(read_key(&p, "BAZ").unwrap().as_deref(), Some("qux"));
         assert_eq!(read_key(&p, "MISSING").unwrap(), None);
-        let _ = fs::remove_file(&p);
+        cleanup(&p);
     }
 
     #[test]
     fn read_key_returns_none_when_file_missing() {
-        let p = std::env::temp_dir().join("tebis-env-does-not-exist-xyz-missing");
+        let p = temp_path("read-missing");
         let _ = fs::remove_file(&p);
         assert!(read_key(&p, "FOO").unwrap().is_none());
+        cleanup(&p);
     }
 
     #[test]

@@ -18,10 +18,7 @@ pub struct LockFile {
 #[derive(Debug)]
 pub enum AcquireError {
     Io(std::io::Error),
-    Locked {
-        path: PathBuf,
-        pid: Option<u32>,
-    },
+    Locked { path: PathBuf, pid: Option<u32> },
 }
 
 impl std::fmt::Display for AcquireError {
@@ -54,16 +51,17 @@ pub fn default_path() -> PathBuf {
     paths::lock_file_path().unwrap_or_else(|_| std::env::temp_dir().join("tebis.lock"))
 }
 
-/// Exclusive non-blocking lock. Parent dir is always hardened to owner-only
-/// via [`secure_file::ensure_private_dir`] before opening. On Unix we also
-/// pass `mode(0o600)` so the pidfile inode is private from creation (avoids
-/// the open→chmod TOCTOU); on Windows the owner-only DACL on the parent
-/// dir blocks cross-user access to newly-created children.
+/// Exclusive non-blocking lock. Unix preserves the historical flat
+/// `/tmp/tebis-$USER.lock` fallback, so privacy comes from `mode(0o600)`.
+/// Windows hardens the synthesized per-user runtime dir with an owner-only DACL.
 pub fn acquire(path: &Path) -> Result<LockFile, AcquireError> {
     // `$XDG_RUNTIME_DIR` can be GC'd at logout; create it so errors are clear.
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
+        #[cfg(unix)]
+        std::fs::create_dir_all(parent).map_err(AcquireError::Io)?;
+        #[cfg(windows)]
         crate::platform::secure_file::ensure_private_dir(parent).map_err(AcquireError::Io)?;
     }
 
@@ -127,10 +125,18 @@ mod tests {
         let ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        std::env::temp_dir().join(format!(
-            "tebis-lockfile-test-{tag}-{}-{ns:x}.lock",
+        let dir = std::env::temp_dir().join(format!(
+            "tebis-lockfile-test-{tag}-{}-{ns:x}",
             std::process::id()
-        ))
+        ));
+        std::fs::create_dir_all(&dir).expect("create test lock dir");
+        dir.join("tebis.lock")
+    }
+
+    fn cleanup(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 
     #[test]
@@ -141,6 +147,7 @@ mod tests {
             assert!(path.exists(), "lockfile should exist while held");
         }
         assert!(!path.exists(), "drop should remove the lockfile");
+        cleanup(&path);
     }
 
     // Windows `LockFileEx` blocks cross-handle `ReadFile`, so `read_to_string`
@@ -160,6 +167,7 @@ mod tests {
             Err(AcquireError::Io(e)) => panic!("expected Locked, got Io: {e}"),
             Ok(_) => panic!("expected Locked, got Ok"),
         }
+        cleanup(&path);
     }
 
     #[test]
@@ -168,7 +176,7 @@ mod tests {
         std::fs::write(&path, "99999\n").expect("write stale pidfile");
         assert!(path.exists());
         assert_eq!(active_holder(&path), None, "no one holds the lock");
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
     }
 
     #[cfg(unix)]
@@ -178,5 +186,6 @@ mod tests {
         let _guard = acquire(&path).expect("acquire");
         assert_eq!(active_holder(&path), Some(std::process::id()));
         assert!(path.exists(), "held lockfile must still be present");
+        cleanup(&path);
     }
 }

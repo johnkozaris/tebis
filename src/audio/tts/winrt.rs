@@ -92,7 +92,6 @@ impl WinRtTts {
         .map_err(|e| TtsError::Init(format!("spawn_blocking panicked: {e}")))?
     }
 
-    /// Run synthesis on a blocking thread. Returns raw WAV bytes.
     fn synth_blocking(text: HSTRING, voice: String) -> Result<Vec<u8>, TtsError> {
         winrt_scope(|| {
             let synth = SpeechSynthesizer::new()
@@ -119,9 +118,6 @@ impl WinRtTts {
                 }
             }
 
-            // SynthesizeTextToStreamAsync returns SpeechSynthesisStream
-            // which implements IRandomAccessStream. Waiting is safe here:
-            // this code runs on a dedicated spawn_blocking worker.
             let op = synth
                 .SynthesizeTextToStreamAsync(&text)
                 .map_err(|e| TtsError::Synthesis(format!("SynthesizeTextToStreamAsync: {e}")))?;
@@ -142,9 +138,6 @@ impl WinRtTts {
                 .map_err(|e| TtsError::Synthesis(format!("GetInputStreamAt(0): {e}")))?;
             let reader = DataReader::CreateDataReader(&input)
                 .map_err(|e| TtsError::Synthesis(format!("CreateDataReader: {e}")))?;
-            // Partial is fine — WinRT sometimes holds back the last
-            // packet until the consumer drains, but we asked for the
-            // exact stream size so that's a non-issue.
             reader
                 .SetInputStreamOptions(InputStreamOptions::None)
                 .map_err(|e| TtsError::Synthesis(format!("SetInputStreamOptions: {e}")))?;

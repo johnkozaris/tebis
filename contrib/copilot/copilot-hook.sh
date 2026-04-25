@@ -30,8 +30,6 @@ WRAP_INSTRUCTION=$(
 PROMPT
 )
 
-# -------- socket path resolution -------------------------------------------
-
 resolve_socket() {
     if [[ -n "${NOTIFY_SOCKET_PATH:-}" ]]; then
         printf '%s' "$NOTIFY_SOCKET_PATH"
@@ -45,8 +43,6 @@ resolve_socket() {
 }
 
 SOCKET="$(resolve_socket)"
-
-# -------- helpers ----------------------------------------------------------
 
 tail_trim() {
     local s="$1"
@@ -78,12 +74,8 @@ forward() {
     printf '%s\n' "$payload" | nc -U -w 2 "$SOCKET" >/dev/null 2>&1 || true
 }
 
-# -------- dispatch ---------------------------------------------------------
-
 INPUT="$(cat)"
 
-# Normalize event name: prefer the snake_case hook_event_name (v1.0.21+),
-# fall back to the camelCase eventName (legacy).
 EVENT="$(
     jq -r '(.hook_event_name // .eventName // "") | ascii_downcase' <<<"$INPUT"
 )"

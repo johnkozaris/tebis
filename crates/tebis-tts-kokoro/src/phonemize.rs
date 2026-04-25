@@ -22,9 +22,6 @@ use crate::{e2m, normalize};
 /// reply lengths; 10 s is the handler-level fail-safe.
 const PHONEMIZE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Run the full `normalize → espeak-ng → e2m` pipeline and return the
-/// Kokoro-ready IPA phoneme string.
-///
 /// Errors:
 /// - [`KokoroError::Init`] if `espeak-ng` isn't on `PATH` — the caller
 ///   should already have probed via `setup::phonemizer::probe_espeak_ng`
@@ -34,10 +31,11 @@ const PHONEMIZE_TIMEOUT: Duration = Duration::from_secs(10);
 ///   or if normalization collapses the input to whitespace.
 pub async fn phonemize(text: &str) -> Result<String, KokoroError> {
     if text.trim().is_empty() {
-        return Err(KokoroError::Synthesis("empty input to phonemize".to_string()));
+        return Err(KokoroError::Synthesis(
+            "empty input to phonemize".to_string(),
+        ));
     }
 
-    // Pre-espeak text normalization (numbers, currency, titles, etc.).
     let normalized = normalize::preprocess(text);
     if normalized.trim().is_empty() {
         return Err(KokoroError::Synthesis(
@@ -90,10 +88,6 @@ pub async fn phonemize(text: &str) -> Result<String, KokoroError> {
         ));
     }
 
-    // Post-espeak IPA fixups — diphthong merging, flap-T, rhotacization,
-    // tie-mark stripping. This is the key quality lever: without it,
-    // Kokoro sees phonemes it wasn't trained on and the output sounds
-    // "off" (robotic prosody, missing diphthongs).
     Ok(e2m::apply_e2m(&raw_ipa))
 }
 
@@ -117,7 +111,6 @@ mod tests {
 
     #[tokio::test]
     async fn empty_text_rejected_without_spawn() {
-        // Cheap check before we fork a process.
         let err = phonemize("   ").await.unwrap_err();
         matches!(err, KokoroError::Synthesis(_));
     }
@@ -128,18 +121,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires espeak-ng on PATH"]
     async fn full_pipeline_normalizes_and_fixes_up() {
-        // Input that exercises number normalization. If normalize
-        // didn't run, espeak would read "2024" digit-by-digit.
         let ipa = phonemize("The year is 2024.")
             .await
             .expect("phonemize year 2024");
-        // Year should have been expanded to "twenty twenty-four"
-        // before espeak, so the IPA should look like a four-syllable
-        // word sequence, not four separate digit phonemes. Heuristic:
-        // the output should be longer than 10 chars and not contain
-        // the stress pattern you'd get from individual digits.
         assert!(ipa.len() > 20, "too short for normalized year: {ipa:?}");
-        // E2M `r→ɹ` should fire on at least one `r` from "year".
         assert!(ipa.contains('ɹ'), "E2M didn't fire: {ipa:?}");
     }
 }

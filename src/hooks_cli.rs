@@ -366,11 +366,13 @@ fn warn_if_hook_deps_missing() {
         );
         eprintln!(
             "     install: {}",
-            style("Windows PowerShell ships with the OS; if this reports \
+            style(
+                "Windows PowerShell ships with the OS; if this reports \
                    missing, check the PowerShell execution policy / PATH. \
                    PowerShell 7 (`pwsh`) is available via WinGet: \
-                   `winget install Microsoft.PowerShell`.")
-                .dim(),
+                   `winget install Microsoft.PowerShell`."
+            )
+            .dim(),
         );
     }
 }

@@ -115,8 +115,7 @@ mod windows {
     use super::{Context, PathBuf, Result, test_override};
 
     fn dirs() -> Result<directories::ProjectDirs> {
-        directories::ProjectDirs::from("", "", "tebis")
-            .context("resolving per-user Known Folders")
+        directories::ProjectDirs::from("", "", "tebis").context("resolving per-user Known Folders")
     }
 
     pub fn config_dir() -> Result<PathBuf> {

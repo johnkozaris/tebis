@@ -4,9 +4,9 @@
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use tebis::audio::{AudioConfig, AudioSubsystem, stt::SttConfig};
 #[cfg(target_os = "macos")]
 use tebis::audio::tts::{BackendConfig, TtsConfig};
+use tebis::audio::{AudioConfig, AudioSubsystem, stt::SttConfig};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 

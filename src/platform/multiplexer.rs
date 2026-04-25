@@ -32,7 +32,6 @@ pub const BINARY: &str = "tmux";
 #[cfg(windows)]
 pub const BINARY: &str = "psmux";
 
-/// Whether the platform multiplexer binary is currently discoverable on PATH.
 #[must_use]
 pub fn binary_on_path() -> bool {
     which_on_path(BINARY).is_some()
@@ -91,8 +90,6 @@ pub async fn version() -> String {
     match Command::new(BINARY).arg("-V").output().await {
         Ok(out) if out.status.success() => {
             let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            // tmux prints "tmux 3.5a"; psmux prints similar. Strip the
-            // leading binary name if present.
             line.strip_prefix(&format!("{BINARY} "))
                 .map_or_else(|| line.clone(), ToString::to_string)
         }
@@ -191,7 +188,6 @@ impl Mux {
         self.permissive
     }
 
-    /// Lazily-allocated slot count (permissive mode). Exposed for the dashboard.
     #[must_use]
     pub fn dynamic_slot_count(&self) -> usize {
         self.dynamic.lock().map_or(0, |g| g.len())
@@ -346,7 +342,6 @@ impl Mux {
                 allowed,
             });
         }
-        // Double-check under the lock so concurrent first references share one slot.
         let fresh = {
             let mut map = self.dynamic.lock().expect("dynamic slots poisoned");
             if let Some(slot) = map.get(session) {
@@ -436,8 +431,6 @@ async fn run_mux(op: &'static str, args: &[&str]) -> Result<std::process::Output
     }
 }
 
-// These tests cover tmux's stderr wording for error classification and
-// use Unix `ExitStatus::from_raw` for synthetic outputs.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -461,7 +454,6 @@ mod tests {
 
     #[test]
     fn classify_recognizes_not_found_pane() {
-        // send-keys reports pane, not session
         let out = fake_output(1, "can't find pane: demo\n");
         let err = classify_status(&out, "send-keys", "demo").unwrap_err();
         assert!(matches!(err, MuxError::NotFound(_)));

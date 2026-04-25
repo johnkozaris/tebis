@@ -49,8 +49,7 @@ pub struct HandlerContext {
     pub tracker: TaskTracker,
     pub shutdown: CancellationToken,
     pub audio: Option<Arc<AudioSubsystem>>,
-    /// `BRIDGE_ENV_FILE` — required for runtime config writes (`/tts`, inspect Settings).
-    /// `None` → mutative commands reply with an explicit error instead of a silent no-op.
+    /// Required for runtime config writes (`/tts`, inspect Settings).
     pub env_file_path: Option<std::path::PathBuf>,
 }
 
@@ -100,8 +99,6 @@ pub async fn handle_update(ctx: HandlerContext, chat_id: i64, message_id: i64, p
     };
 
     let cmd = handler::parse(&text);
-    // `/tts` reaches into HandlerContext (env-file path + shutdown
-    // token) which Deps doesn't carry — intercept before dispatch.
     let response = if let handler::Command::Tts(verb) = cmd {
         handle_tts_command(&ctx, &verb)
     } else {
@@ -123,8 +120,6 @@ pub async fn handle_update(ctx: HandlerContext, chat_id: i64, message_id: i64, p
                     false
                 }
             };
-            // TTS fires only on text-send success; detached so the handler
-            // releases its permit while synth+sendVoice run.
             if send_ok
                 && let Some(audio) = ctx.audio.as_ref()
                 && audio.should_tts_reply(inbound_was_voice)
@@ -142,7 +137,6 @@ pub async fn handle_update(ctx: HandlerContext, chat_id: i64, message_id: i64, p
         }
         Response::Sent { session, baseline } => {
             if ctx.session.is_hooked(&session) {
-                // Hook-path: reply arrives via UDS; show typing until cap or message.
                 typing::spawn_with_cap(
                     &ctx.tracker,
                     ctx.tg.clone(),
@@ -244,7 +238,6 @@ fn switch_tts_backend(ctx: &HandlerContext, value: &str) -> Response {
         return Response::Text(msg);
     }
 
-    // Build the upsert list. For kokoro-local we need ORT_DYLIB_PATH too.
     let mut updates: Vec<(&str, String)> = vec![("TELEGRAM_TTS_BACKEND", value.to_string())];
     if value == "kokoro-local" {
         match validate_kokoro_local_tts_env() {
@@ -263,10 +256,7 @@ fn switch_tts_backend(ctx: &HandlerContext, value: &str) -> Response {
         );
     }
 
-    // Switching away from kokoro-local: clear the now-stale dylib path.
-    // Best-effort: a failure here is ugly (the key lingers in the file)
-    // but not a correctness issue since nothing reads it on non-Kokoro
-    // paths.
+    // Best-effort stale cleanup; non-Kokoro paths ignore this key.
     if value != "kokoro-local"
         && let Err(e) = crate::env_file::remove_keys(env_path, &["ORT_DYLIB_PATH"])
     {
@@ -289,13 +279,13 @@ fn switch_tts_backend(ctx: &HandlerContext, value: &str) -> Response {
 fn validate_kokoro_local_tts_env() -> Result<std::path::PathBuf, String> {
     #[cfg(not(feature = "kokoro-local"))]
     {
-        return Err(
+        Err(
             "Can't switch to <code>kokoro-local</code>: this binary was built without the \
              <code>kokoro-local</code> cargo feature. Rebuild with \
              <code>cargo build --features kokoro-local</code>, or use \
              <code>kokoro-remote</code>."
                 .to_string(),
-        );
+        )
     }
 
     #[cfg(feature = "kokoro-local")]
@@ -457,7 +447,6 @@ async fn transcribe_voice(
         .await
         .map_err(|e| format!("Voice download failed: {e}"))?;
 
-    // Bot API `size_bytes` is optional; enforce `TELEGRAM_STT_MAX_BYTES` post-download.
     let actual_bytes = u32::try_from(oga_bytes.len()).unwrap_or(u32::MAX);
     if actual_bytes > limits.max_bytes {
         return Err(format!(
@@ -482,7 +471,6 @@ async fn transcribe_voice(
         format!("Voice decode failed: {e}. Tebis only accepts OGG/Opus voice notes — music files in other formats aren't supported.")
     })?;
 
-    // `duration_sec` is sender-supplied; re-check against decoded sample count.
     let actual_duration_sec = u32::try_from(pcm.len() / PCM_SAMPLE_RATE).unwrap_or(u32::MAX);
     if actual_duration_sec > limits.max_duration_sec {
         return Err(format!(
@@ -526,7 +514,6 @@ async fn transcribe_voice(
     Ok(text)
 }
 
-/// Best-effort TTS + sendVoice. HTML-stripped so TTS doesn't say "ampersand lt".
 async fn synthesize_and_send_voice_detached(
     tg: &crate::telegram::TelegramClient,
     metrics: &crate::metrics::Metrics,
@@ -576,10 +563,8 @@ fn strip_html_for_tts(body: &str) -> String {
     step2.replace(AMP_SENTINEL, "&")
 }
 
-/// Sentinel that protects `&amp;` from double-decode.
 const AMP_SENTINEL: char = '\u{0001}';
 
-/// Typing-indicator cap on the hook reply path. 20 s balances patience with "looks hung".
 const HOOK_TYPING_CAP: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[cfg(test)]
@@ -618,7 +603,6 @@ mod strip_html_tests {
         );
     }
 
-    /// Contract: `strip_html_for_tts` must undo everything `escape_html` adds.
     #[test]
     fn escape_then_strip_is_identity() {
         for input in [
@@ -663,22 +647,33 @@ mod strip_html_tests {
 #[cfg(test)]
 mod tts_switch_tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::validate_remote_tts_env;
 
     fn env_file(body: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "tebis-tts-remote-{pid}-{nonce}.env",
-            pid = std::process::id()
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "tebis-tts-remote-{pid}-{nonce:x}-{seq}",
+            pid = std::process::id(),
         ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("env");
         fs::write(&path, body).unwrap();
         path
+    }
+
+    fn cleanup(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
     }
 
     #[test]
@@ -686,14 +681,14 @@ mod tts_switch_tests {
         let path = env_file("TELEGRAM_TTS_BACKEND=none\n");
         let err = validate_remote_tts_env(&path).unwrap_err();
         assert!(err.contains("TELEGRAM_TTS_REMOTE_URL"));
-        let _ = fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
     fn kokoro_remote_switch_accepts_https_url() {
         let path = env_file("TELEGRAM_TTS_REMOTE_URL=https://kokoro.example.com\n");
         validate_remote_tts_env(&path).unwrap();
-        let _ = fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
@@ -701,7 +696,7 @@ mod tts_switch_tests {
         let path = env_file("TELEGRAM_TTS_REMOTE_URL=http://127.0.0.1:8880\n");
         let err = validate_remote_tts_env(&path).unwrap_err();
         assert!(err.contains("https://"));
-        let _ = fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
@@ -711,7 +706,7 @@ mod tts_switch_tests {
              TELEGRAM_TTS_REMOTE_ALLOW_HTTP=true\n",
         );
         validate_remote_tts_env(&path).unwrap();
-        let _ = fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
@@ -722,7 +717,7 @@ mod tts_switch_tests {
         );
         let err = validate_remote_tts_env(&path).unwrap_err();
         assert!(err.contains("TELEGRAM_TTS_REMOTE_ALLOW_HTTP"));
-        let _ = fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
@@ -733,7 +728,7 @@ mod tts_switch_tests {
         );
         let err = validate_remote_tts_env(&path).unwrap_err();
         assert!(err.contains("TELEGRAM_TTS_REMOTE_TIMEOUT_SEC"));
-        let _ = fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
@@ -744,7 +739,7 @@ mod tts_switch_tests {
         );
         let err = validate_remote_tts_env(&path).unwrap_err();
         assert!(err.contains("1..=300"));
-        let _ = fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
@@ -755,7 +750,7 @@ mod tts_switch_tests {
                  TELEGRAM_TTS_REMOTE_TIMEOUT_SEC={timeout}\n"
             ));
             validate_remote_tts_env(&path).unwrap();
-            let _ = fs::remove_file(path);
+            cleanup(&path);
         }
     }
 }

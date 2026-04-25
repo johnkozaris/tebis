@@ -4,9 +4,7 @@
 
 #[cfg(not(feature = "kokoro-local"))]
 fn main() {
-    eprintln!(
-        "This smoke test requires the `kokoro-local` cargo feature. Rebuild with:"
-    );
+    eprintln!("This smoke test requires the `kokoro-local` cargo feature. Rebuild with:");
     eprintln!();
     eprintln!("  cargo run --release --features kokoro-local --example kokoro-smoke");
     std::process::exit(2);
@@ -25,13 +23,13 @@ async fn main() -> anyhow::Result<()> {
     use tokio_util::task::TaskTracker;
 
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
-            |_| {
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 tracing_subscriber::EnvFilter::new(
                     "info,hyper=warn,hyper_util=warn,rustls=warn,tebis=debug",
                 )
-            },
-        ))
+            }),
+        )
         .with_target(false)
         .init();
 
@@ -55,11 +53,13 @@ async fn main() -> anyhow::Result<()> {
         .default_tts_model()
         .context("manifest has no default TTS model")?
         .to_string();
-    let default_voice = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| manifest.tts_model(&default_tts_model).ok()
+    let default_voice = std::env::args().nth(1).unwrap_or_else(|| {
+        manifest
+            .tts_model(&default_tts_model)
+            .ok()
             .map(|m| m.default_voice.clone())
-            .unwrap_or_else(|| "af_sarah".to_string()));
+            .unwrap_or_else(|| "af_sarah".to_string())
+    });
 
     let cfg = AudioConfig {
         stt: None,
@@ -75,9 +75,7 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
 
     println!();
-    println!(
-        "Loading Kokoro backend (model={default_tts_model}, voice={default_voice}).",
-    );
+    println!("Loading Kokoro backend (model={default_tts_model}, voice={default_voice}).",);
     println!("  First run downloads ~346 MB model + 510 KB voice file.");
     let t0 = Instant::now();
     let audio = AudioSubsystem::new(&cfg, &tracker, shutdown)

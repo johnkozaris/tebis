@@ -88,10 +88,7 @@ pub fn sid_to_string(sid_bytes: &[u8]) -> windows::core::Result<String> {
     // SAFETY: sid_bytes is a valid SID; `ConvertSidToStringSidW` writes
     // a LocalAlloc'd wide string into `sid_str` that we LocalFree below.
     unsafe {
-        ConvertSidToStringSidW(
-            PSID(sid_bytes.as_ptr() as *mut c_void),
-            &mut sid_str,
-        )?;
+        ConvertSidToStringSidW(PSID(sid_bytes.as_ptr() as *mut c_void), &mut sid_str)?;
     }
     if sid_str.is_null() {
         return Err(windows::core::Error::from_thread());

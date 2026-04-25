@@ -46,8 +46,6 @@ WRAP_INSTRUCTION=$(
 PROMPT
 )
 
-# -------- socket path resolution -------------------------------------------
-
 resolve_socket() {
     if [[ -n "${NOTIFY_SOCKET_PATH:-}" ]]; then
         printf '%s' "$NOTIFY_SOCKET_PATH"
@@ -61,8 +59,6 @@ resolve_socket() {
 }
 
 SOCKET="$(resolve_socket)"
-
-# -------- helpers ----------------------------------------------------------
 
 # Extract last assistant text block from a JSONL transcript and return the
 # TAIL (not head) of MAX_CHARS codepoints — prepending an ellipsis when cut.
@@ -116,17 +112,12 @@ forward() {
     printf '%s\n' "$payload" | nc -U -w 2 "$SOCKET" >/dev/null 2>&1 || true
 }
 
-# -------- dispatch ---------------------------------------------------------
-
 INPUT="$(cat)"
 EVENT="$(jq -r '.hook_event_name // ""' <<<"$INPUT")"
 
 case "$EVENT" in
 
     UserPromptSubmit)
-        # Inject the summarize-at-end instruction via additionalContext.
-        # Harmless if the bridge socket is down — this shapes Claude's reply
-        # regardless of whether a notification will actually be sent.
         jq -nc --arg ctx "$WRAP_INSTRUCTION" '{
             hookSpecificOutput: {
                 hookEventName: "UserPromptSubmit",
@@ -164,7 +155,6 @@ case "$EVENT" in
         ;;
 
     SubagentStop)
-        # SubagentStop payloads carry the subagent's final text pre-extracted.
         RAW="$(jq -r '.last_assistant_message // ""' <<<"$INPUT")"
         CWD="$(jq -r '.cwd // ""' <<<"$INPUT")"
         SESSION="$(jq -r '.session_id // ""' <<<"$INPUT")"
@@ -194,7 +184,6 @@ case "$EVENT" in
         ;;
 
     *)
-        # Unknown event — do nothing (forward-compat).
         exit 0
         ;;
 esac

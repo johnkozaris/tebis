@@ -18,7 +18,6 @@ pub const MAX_PHONEMES: usize = 510;
 /// must re-export the model; the table and the weights are coupled.
 #[rustfmt::skip]
 const VOCAB_ENTRIES: &[(char, i64)] = &[
-    // ASCII punctuation + whitespace
     (';', 1), (':', 2), (',', 3), ('.', 4), ('!', 5), ('?', 6),
     // Typographic dash + ellipsis + quotes + brackets + space
     ('\u{2014}', 9),   // em-dash —
@@ -28,24 +27,19 @@ const VOCAB_ENTRIES: &[(char, i64)] = &[
     ('\u{201C}', 14),  // left double-curly-quote "
     ('\u{201D}', 15),  // right double-curly-quote "
     (' ', 16),
-    // Combining tilde (nasal marker)
     ('\u{0303}', 17),
-    // IPA affricate ligatures
     ('ʣ', 18), ('ʥ', 19), ('ʦ', 20), ('ʨ', 21),
     ('ᵝ', 22), ('ꭧ', 23),
     // Uppercase — Kokoro uses these as diphthong merge markers
     // (see misaki's E2M table: a^ɪ→I, e^ɪ→A, o^ʊ→O, ɔ^ɪ→Y, etc.)
     ('A', 24), ('I', 25), ('O', 31), ('Q', 33), ('S', 35),
     ('T', 36), ('W', 39), ('Y', 41),
-    // Superscript schwa
     ('ᵊ', 42),
-    // Lowercase ASCII letters (as IPA)
     ('a', 43), ('b', 44), ('c', 45), ('d', 46), ('e', 47),
     ('f', 48), ('h', 50), ('i', 51), ('j', 52), ('k', 53),
     ('l', 54), ('m', 55), ('n', 56), ('o', 57), ('p', 58),
     ('q', 59), ('r', 60), ('s', 61), ('t', 62), ('u', 63),
     ('v', 64), ('w', 65), ('x', 66), ('y', 67), ('z', 68),
-    // IPA vowels + consonants
     ('ɑ', 69), ('ɐ', 70), ('ɒ', 71), ('æ', 72),
     ('β', 75), ('ɔ', 76), ('ɕ', 77), ('ç', 78),
     ('ɖ', 80), ('ð', 81), ('ʤ', 82), ('ə', 83),
@@ -62,13 +56,9 @@ const VOCAB_ENTRIES: &[(char, i64)] = &[
     ('ɣ', 139), ('ɤ', 140),
     ('χ', 142), ('ʎ', 143),
     ('ʒ', 147), ('ʔ', 148),
-    // Stress / length marks
     ('ˈ', 156), ('ˌ', 157), ('ː', 158),
-    // Aspiration / palatalization
     ('ʰ', 162), ('ʲ', 164),
-    // Tone arrows (used for non-English but present in vocab)
     ('↓', 169), ('→', 171), ('↗', 172), ('↘', 173),
-    // Near-close near-front rounded
     ('ᵻ', 177),
 ];
 
@@ -122,23 +112,18 @@ mod tests {
 
     #[test]
     fn vocab_spot_check_known_entries() {
-        // Spot-check a handful against the ONNX config.json we pinned.
         assert_eq!(vocab().get(&' '), Some(&16));
-        assert_eq!(vocab().get(&'ˈ'), Some(&156)); // primary stress
+        assert_eq!(vocab().get(&'ˈ'), Some(&156));
         assert_eq!(vocab().get(&'a'), Some(&43));
-        assert_eq!(vocab().get(&'ə'), Some(&83));  // schwa
-        assert_eq!(vocab().get(&'ː'), Some(&158)); // length
-        assert_eq!(vocab().get(&'ɹ'), Some(&123)); // rhotic r
+        assert_eq!(vocab().get(&'ə'), Some(&83));
+        assert_eq!(vocab().get(&'ː'), Some(&158));
+        assert_eq!(vocab().get(&'ɹ'), Some(&123));
     }
 
     #[test]
     fn tokenize_drops_unknowns() {
-        // "hello" in IPA-ish ("həˈloʊ" approximately). The `ʊ` isn't
-        // in the vocab in that combination — Kokoro uses `O` (diphthong
-        // merge marker) instead. What isn't in the table gets dropped.
         let tokens = ipa_to_token_ids("həˈloʊ");
         assert!(!tokens.is_empty());
-        // None of the tokens can be zero — 0 is the boundary-pad sentinel.
         assert!(tokens.iter().all(|&t| t != 0));
     }
 
@@ -149,7 +134,6 @@ mod tests {
 
     #[test]
     fn tokenize_all_unknown_is_empty() {
-        // Emoji etc. are dropped silently.
         assert!(ipa_to_token_ids("🎉🎊👋").is_empty());
     }
 

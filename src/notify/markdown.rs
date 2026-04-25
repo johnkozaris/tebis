@@ -240,7 +240,10 @@ mod tests {
     #[test]
     fn unbalanced_markdown_falls_back_to_escape_only() {
         let ok = to_html("a **bold** b");
-        assert!(is_balanced_telegram_html(&ok), "today's output is balanced: {ok:?}");
+        assert!(
+            is_balanced_telegram_html(&ok),
+            "today's output is balanced: {ok:?}"
+        );
     }
 
     #[test]

@@ -46,11 +46,7 @@ use crate::platform::windows_auth::{
 pub type Conn = NamedPipeServer;
 
 pub struct Listener {
-    /// Pipe name kept as OsString so each `ServerOptions::create_with_*`
-    /// call gets a fresh `&OsStr` without re-allocating.
     pipe_name: OsString,
-    /// Our user's SID (owned heap copy). Compared via `EqualSid`
-    /// against every accepted peer's impersonation-token SID.
     our_sid: Vec<u8>,
     /// Security descriptor that backs `security_attrs.lpSecurityDescriptor`.
     /// Must outlive every pipe instance.
@@ -60,9 +56,6 @@ pub struct Listener {
     /// `create_with_security_attributes_raw` stays stable for the
     /// Listener's lifetime.
     security_attrs: Box<SECURITY_ATTRIBUTES>,
-    /// Next pipe instance waiting for a client. Taken + replaced on
-    /// each `accept()` call so `listener.accept().await` twice in a
-    /// row always has a pending instance for clients to connect to.
     pending: Mutex<Option<NamedPipeServer>>,
 }
 
@@ -129,8 +122,6 @@ impl Listener {
 
         server.connect().await?;
 
-        // Queue up the next pending instance so the following accept
-        // call already has a pipe for clients to connect to.
         let next = unsafe {
             ServerOptions::new()
                 .access_inbound(true)
@@ -152,9 +143,7 @@ impl Listener {
         let pipe_handle = HANDLE(conn.as_raw_handle());
         match peer_sid_via_impersonation(pipe_handle) {
             Ok(peer_sid) => {
-                // SAFETY: `our_sid` and `peer_sid` are both valid
-                // NT SID byte buffers (non-null, returned by
-                // `GetTokenInformation(TokenUser)`).
+                // SAFETY: both buffers are SIDs returned by `GetTokenInformation(TokenUser)`.
                 let equal = unsafe {
                     EqualSid(
                         PSID(self.our_sid.as_ptr() as *mut c_void),

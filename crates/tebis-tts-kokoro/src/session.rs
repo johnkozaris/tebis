@@ -34,18 +34,12 @@ enum SpeedDtype {
     Float32,
 }
 
-/// Loaded Kokoro model + voice directory + cached input dtype.
 pub struct KokoroTts {
     session: Arc<Mutex<Session>>,
     voices_dir: PathBuf,
     speed_dtype: SpeedDtype,
 }
 
-/// 24 kHz mono `f32` PCM + wall-clock synthesis time.
-///
-/// `sample_rate` is always [`crate::OUTPUT_SAMPLE_RATE`]; exposed as
-/// a field for convenience when passing to an encoder that accepts
-/// rate as a parameter.
 #[derive(Debug)]
 pub struct Synthesis {
     pub pcm: Vec<f32>,
@@ -54,8 +48,6 @@ pub struct Synthesis {
 }
 
 impl KokoroTts {
-    /// Load the ONNX model and inspect its input signature.
-    ///
     /// Blocks for ~500 ms on first load of the 346 MB fp32 model.
     /// Don't invoke from a request handler — this is startup work.
     pub fn load(model_path: &Path, voices_dir: PathBuf) -> Result<Self, KokoroError> {
@@ -93,11 +85,7 @@ impl KokoroTts {
     /// pass, so process-shutdown cancellation waits up to one synth
     /// worth of latency — acceptable for normal bounded text, not for
     /// a runaway 510-phoneme max call.
-    pub async fn synthesize(
-        &self,
-        text: &str,
-        voice_name: &str,
-    ) -> Result<Synthesis, KokoroError> {
+    pub async fn synthesize(&self, text: &str, voice_name: &str) -> Result<Synthesis, KokoroError> {
         if text.trim().is_empty() {
             return Err(KokoroError::Synthesis("empty text".to_string()));
         }

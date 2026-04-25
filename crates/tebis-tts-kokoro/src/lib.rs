@@ -32,10 +32,7 @@ mod voices;
 
 pub use session::{KokoroTts, Synthesis};
 
-/// Typed errors returned by [`KokoroTts`]. Matches the shape of
-/// [`thiserror`] so callers can pattern-match on the variant to
-/// decide between "init-time, fail-open to text-only" versus
-/// "per-request, log-and-skip-voice".
+/// Distinguishes startup failures from per-request synthesis failures.
 #[derive(Debug, thiserror::Error)]
 pub enum KokoroError {
     /// Model / voice / runtime setup failed — fatal for this backend

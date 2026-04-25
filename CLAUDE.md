@@ -279,10 +279,9 @@ These exist because past AI passes drifted in predictable ways. Hold the line.
 
 ## Secrets
 
-Bot token belongs in OpenBao at `secret/telegram/bot-token/bridge` (see global
-rules). For local/systemd/launchd, put env in `~/.config/tebis/env` with
-mode 0600 (or use `tebis setup`). **Never commit a filled `.env`.**
-`.env` is gitignored.
+Bot token belongs in the private secret manager. For local/systemd/launchd,
+put env in `~/.config/tebis/env` with mode 0600 (or use `tebis setup`).
+**Never commit a filled `.env`.** `.env` is gitignored.
 
 ## Don't-dos
 

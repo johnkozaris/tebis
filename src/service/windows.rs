@@ -83,7 +83,6 @@ pub fn uninstall(purge_flag: bool) -> Result<()> {
         .context("spawning schtasks /Delete")?;
     if !del.status.success() {
         let stderr = String::from_utf8_lossy(&del.stderr);
-        // A missing task is fine — we're idempotent.
         if !stderr.to_ascii_lowercase().contains("does not exist")
             && !stderr.to_ascii_lowercase().contains("cannot find")
         {
@@ -157,7 +156,6 @@ pub fn stop() -> Result<()> {
 }
 
 pub fn restart() -> Result<()> {
-    // Best-effort stop, then start — a not-running task is fine.
     let _ = stop();
     start()
 }

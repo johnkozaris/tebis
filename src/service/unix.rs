@@ -204,8 +204,6 @@ pub fn uninstall(purge_flag: bool) -> Result<()> {
     let should_purge = if purge_flag {
         true
     } else if console::Term::stdout().is_term() {
-        // Stdout-is-tty is a reliable-enough proxy for "user at a terminal".
-        // A pipe (scripts, CI) takes the else-branch and leaves state alone.
         println!();
         dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
             .with_prompt("Also purge these (env, models, hook manifest)?")
@@ -232,17 +230,13 @@ pub fn uninstall(purge_flag: bool) -> Result<()> {
 /// packages (espeak-ng etc.) are preserved — uninstalling them is hostile.
 fn purge_user_state(bin: &Path, env_dir: &Path, data_dir: Option<&Path>) -> Result<()> {
     println!();
-    println!(
-        "{}  Purging user state…",
-        style("▶").cyan().bold()
-    );
+    println!("{}  Purging user state…", style("▶").cyan().bold());
 
     let mut removed: Vec<PathBuf> = Vec::new();
     for p in [bin, env_dir] {
         if p.exists() {
             if p.is_dir() {
-                fs::remove_dir_all(p)
-                    .with_context(|| format!("removing {}", p.display()))?;
+                fs::remove_dir_all(p).with_context(|| format!("removing {}", p.display()))?;
             } else {
                 fs::remove_file(p).with_context(|| format!("removing {}", p.display()))?;
             }
@@ -283,10 +277,7 @@ fn purge_user_state(bin: &Path, env_dir: &Path, data_dir: Option<&Path>) -> Resu
         "    {}",
         style("    tebis hooks list       # see which dirs have hooks").dim()
     );
-    println!(
-        "    {}",
-        style("    tebis hooks uninstall <dir>").dim()
-    );
+    println!("    {}", style("    tebis hooks uninstall <dir>").dim());
     println!();
     println!(
         "    {}",

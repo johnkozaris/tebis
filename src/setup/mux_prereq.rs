@@ -1,10 +1,16 @@
 //! Setup-time multiplexer prerequisite check.
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
+#[cfg(windows)]
+use anyhow::{Context as _, bail};
+#[cfg(windows)]
 use console::style;
 use dialoguer::theme::ColorfulTheme;
 
 pub(super) fn ensure_or_offer_install(theme: &ColorfulTheme) -> Result<()> {
+    #[cfg(not(windows))]
+    let _ = theme;
+
     if crate::platform::multiplexer::binary_on_path() {
         return Ok(());
     }

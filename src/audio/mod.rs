@@ -21,7 +21,6 @@ use self::stt::{Stt as _, SttConfig, SttError, Transcription};
 use self::tts::Tts as _;
 use self::tts::{TtsConfig, TtsError};
 
-/// Built from env in `config::load_audio_config`.
 #[derive(Debug, Clone)]
 pub struct AudioConfig {
     pub stt: Option<SttConfig>,
@@ -34,7 +33,6 @@ impl AudioConfig {
     }
 }
 
-/// Unified error surface for `bridge`. Sub-modules keep typed errors internally.
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
     #[error(transparent)]
@@ -61,13 +59,10 @@ pub struct AudioSubsystem {
     tts: Option<tts::Backend>,
     stt_model_name: Option<String>,
     stt_limits: Option<SttLimits>,
-    /// ISO-639-1 for whisper; `None` means auto-detect.
     stt_language: Option<String>,
     tts_voice: Option<String>,
     tts_respond_to_all: bool,
-    /// `"none"`, `"say"`, `"winrt"`, `"kokoro-local"`, or `"kokoro-remote"`.
     tts_backend_kind: &'static str,
-    /// Redacted host for remote, manifest model key for local.
     tts_detail: Option<String>,
 }
 
@@ -149,7 +144,6 @@ impl AudioSubsystem {
         }))
     }
 
-    /// Transcribe 16 kHz mono `f32` PCM.
     pub async fn transcribe(&self, pcm: &[f32], lang: &str) -> Result<Transcription, AudioError> {
         let stt = self
             .stt
@@ -170,7 +164,6 @@ impl AudioSubsystem {
         self.stt_language.as_deref()
     }
 
-    /// Returns the real runtime voice — `None` if TTS init failed.
     pub fn tts_voice(&self) -> Option<&str> {
         self.tts.as_ref()?;
         self.tts_voice.as_deref()
@@ -193,7 +186,6 @@ impl AudioSubsystem {
         self.tts_detail.as_deref()
     }
 
-    /// Synthesize `text` → OGG/Opus + duration in seconds for `sendVoice`.
     pub async fn synthesize(&self, text: &str) -> Result<(Bytes, u32), AudioError> {
         let backend = self
             .tts
@@ -228,7 +220,6 @@ impl AudioSubsystem {
         }
     }
 
-    /// `is_voice_reply=true` when the inbound was voice. `respond_to_all` else.
     pub const fn should_tts_reply(&self, is_voice_reply: bool) -> bool {
         self.tts.is_some() && (is_voice_reply || self.tts_respond_to_all)
     }
@@ -259,6 +250,7 @@ async fn build_tts(
             }
             #[cfg(not(target_os = "windows"))]
             {
+                let _ = voice;
                 Err(TtsError::UnsupportedPlatform)
             }
         }
@@ -298,7 +290,6 @@ async fn build_tts(
     }
 }
 
-/// Returns `(LocalStt, model_name_for_display)`.
 async fn build_local_stt(
     cfg: &SttConfig,
     shutdown: CancellationToken,
@@ -484,7 +475,6 @@ async fn build_kokoro_local(
     Ok(tts::Backend::Kokoro(Box::new(backend)))
 }
 
-/// No-op when both assets cached. Shared between first-run + corrupt-cache retry.
 #[cfg(feature = "kokoro-local")]
 #[allow(
     clippy::too_many_arguments,
@@ -534,8 +524,6 @@ async fn download_kokoro_if_missing(
     if !voice_path.exists() {
         tracing::info!(voice = %voice, "Downloading Kokoro voice (~510 KB)…");
         let tmp = cache::tmp_path_for(voice_path);
-        // Voice files are tiny (~510 KB); still show a bar on TTY for
-        // consistency, but total is the manifest's declared size.
         let mut reporter =
             progress::Reporter::new(&format!("Voice {voice}"), Some(voice_asset.size_bytes));
         let result = client
@@ -567,16 +555,13 @@ fn display_detail_for(cfg: &tts::BackendConfig) -> Option<String> {
     }
 }
 
-/// Extract `host[:port]` from a URL. Falls through on missing scheme.
 fn redacted_host_from_url(url: &str) -> String {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
     after_scheme[..host_end].to_string()
 }
 
-/// Basename of an HF download URL.
 fn filename_from_url(url: &str) -> String {
-    // Strip query string defensively — falls back to a generic name on a trailing `/`.
     let no_query = url.split('?').next().unwrap_or(url);
     no_query
         .rsplit('/')

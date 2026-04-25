@@ -3,7 +3,10 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use tebis::audio::{AudioConfig, AudioSubsystem, tts::{BackendConfig, TtsConfig}};
+use tebis::audio::{
+    AudioConfig, AudioSubsystem,
+    tts::{BackendConfig, TtsConfig},
+};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 

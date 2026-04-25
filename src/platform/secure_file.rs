@@ -125,10 +125,6 @@ mod windows {
             path.file_name().and_then(|n| n.to_str()).unwrap_or("env")
         ));
 
-        // Build an owner-only SECURITY_ATTRIBUTES.`FA` = FILE_ALL_ACCESS
-        // — the narrowest grant that covers read+write+delete for the
-        // owner. Protected DACL (`D:P`) prevents parent dir inheritance
-        // from ever widening the ACL.
         let our_sid = current_user_sid().map_err(to_io)?;
         let sid_str = sid_to_string(&our_sid).map_err(to_io)?;
         let sddl = owner_only_sddl(&sid_str, "FA");
@@ -142,8 +138,6 @@ mod windows {
 
         let tmp_wide = to_wide(&tmp);
 
-        // CreateFileW with our SA sets the DACL at creation — no
-        // race between create-with-default-perms and set-security.
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(tmp_wide.as_ptr()),
@@ -167,9 +161,6 @@ mod windows {
         }
 
         let dst_wide = to_wide(path);
-        // MOVEFILE_REPLACE_EXISTING is atomic on NTFS — either the
-        // target points to the new inode or it doesn't; no window
-        // where the path is absent.
         unsafe {
             MoveFileExW(
                 PCWSTR(tmp_wide.as_ptr()),
@@ -199,12 +190,10 @@ mod windows {
     /// newly-created dirs is already the current user, so leaving it
     /// alone is both correct and safer.
     fn tighten_dir_dacl(path: &Path) -> io::Result<()> {
+        use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
         use windows::Win32::Security::{
             ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
             PROTECTED_DACL_SECURITY_INFORMATION,
-        };
-        use windows::Win32::Security::Authorization::{
-            SE_FILE_OBJECT, SetNamedSecurityInfoW,
         };
         use windows::core::BOOL;
 
@@ -239,9 +228,6 @@ mod windows {
             .chain(std::iter::once(0))
             .collect();
 
-        // SetNamedSecurityInfoW returns WIN32_ERROR (0 == ERROR_SUCCESS).
-        // Wrap in `windows::core::Error::from_win32()`-style handling via
-        // the return value.
         // SAFETY: `path_wide` is NUL-terminated; `dacl_ptr` is valid for
         // the lifetime of `descriptor`, which outlives this call.
         let rc = unsafe {

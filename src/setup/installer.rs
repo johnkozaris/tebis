@@ -6,8 +6,6 @@
 
 use std::path::PathBuf;
 
-/// Platform package managers we drive.
-#[allow(dead_code, reason = "Linux-only variants compile on macOS for testing")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageManager {
     Brew,

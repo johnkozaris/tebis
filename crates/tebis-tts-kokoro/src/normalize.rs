@@ -15,11 +15,6 @@ use std::sync::OnceLock;
 use num2words::{Currency, Lang, Num2Words};
 use regex::Regex;
 
-// Every `Regex::new(...).expect(...)` below compiles a string literal
-// pattern at first-use. `.expect` cannot fire at runtime — the tests
-// exercise each pattern, so any malformed pattern is caught at
-// `cargo test` time, never in production.
-
 /// Apply all normalization passes in order.
 #[must_use]
 pub fn preprocess(text: &str) -> String {
@@ -33,16 +28,13 @@ pub fn preprocess(text: &str) -> String {
     collapse_whitespace(&t)
 }
 
-// ---- Titles ----
-
 /// Word-boundary-anchored title expansion. Trailing `\s` requirement
 /// so "Dr.Smith" (no space) is deliberately left alone — tebis text
 /// rarely has it, and espeak handles it acceptably.
 fn titles(text: &str) -> String {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r"\b(Dr|Mr|Mrs|Ms|vs|Jr|Sr|St|Prof)\.\s").expect("title regex")
-    });
+    let re = RE
+        .get_or_init(|| Regex::new(r"\b(Dr|Mr|Mrs|Ms|vs|Jr|Sr|St|Prof)\.\s").expect("title regex"));
     re.replace_all(text, |caps: &regex::Captures<'_>| match &caps[1] {
         "Dr" => "doctor ".to_string(),
         "Mr" => "mister ".to_string(),
@@ -57,8 +49,6 @@ fn titles(text: &str) -> String {
     })
     .into_owned()
 }
-
-// ---- Currency ----
 
 /// `$42`, `$42.50`, `$0.99`. Emits e.g. "forty-two dollars" or
 /// "three dollars and fifty cents". Only handles USD; extension to €
@@ -99,11 +89,8 @@ fn int_to_currency_cents(n: i64) -> String {
     format!("{words} {unit}")
 }
 
-// ---- Percent ----
-
 fn percent(text: &str) -> String {
     static RE: OnceLock<Regex> = OnceLock::new();
-    // Match an integer or decimal immediately before `%`.
     let re = RE.get_or_init(|| Regex::new(r"(\d+(?:\.\d+)?)%").expect("percent regex"));
     re.replace_all(text, |caps: &regex::Captures<'_>| {
         let raw = &caps[1];
@@ -117,14 +104,11 @@ fn percent(text: &str) -> String {
     .into_owned()
 }
 
-// ---- Ordinals ----
-
 /// `1st`, `2nd`, `3rd`, `42nd`, `101st`, etc. → "first", "second",
 /// "third", "forty-second", "one hundred first".
 fn ordinals(text: &str) -> String {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re =
-        RE.get_or_init(|| Regex::new(r"\b(\d+)(st|nd|rd|th)\b").expect("ordinal regex"));
+    let re = RE.get_or_init(|| Regex::new(r"\b(\d+)(st|nd|rd|th)\b").expect("ordinal regex"));
     re.replace_all(text, |caps: &regex::Captures<'_>| {
         let n: i64 = caps[1].parse().unwrap_or(0);
         ordinal_to_words(n)
@@ -139,8 +123,6 @@ fn ordinal_to_words(n: i64) -> String {
         .to_words()
         .unwrap_or_else(|_| format!("{n}th"))
 }
-
-// ---- Years ----
 
 /// Reads 4-digit year-like numbers with year-aware grouping: 1995 →
 /// "nineteen ninety-five", 2024 → "twenty twenty-four", 2005 → "two
@@ -176,15 +158,12 @@ fn year_to_words(n: i64) -> String {
     let century = n / 100;
     let rest = n % 100;
     if n % 1000 == 0 {
-        // 1000, 2000, 3000 — normal cardinal reads fine
         return int_to_words(n);
     }
     if rest == 0 {
-        // 1900, 2100, etc. — "nineteen hundred"
         return format!("{} hundred", int_to_words(century));
     }
     if (2000..2010).contains(&n) {
-        // 2001-2009 → "two thousand X"
         return format!("two thousand {}", int_to_words(rest));
     }
     // General: century + two-digit chunk, with leading-zero chunks
@@ -197,8 +176,6 @@ fn year_to_words(n: i64) -> String {
     };
     format!("{} {}", int_to_words(century), rest_words)
 }
-
-// ---- Decimals ----
 
 /// `3.14` → "three point one four". Each digit after the decimal is
 /// read individually, matching how num2words handles this when `prefer`
@@ -254,8 +231,6 @@ const fn digit_word(d: u32) -> &'static str {
     }
 }
 
-// ---- Cardinals ----
-
 /// Any remaining standalone integer → words. Runs last because the
 /// previous passes have already consumed years, ordinals, currency,
 /// and decimal numbers — what's left is genuinely just a count.
@@ -287,7 +262,10 @@ fn collapse_whitespace(text: &str) -> String {
 // ---- Type juggling: num2words's Currency enum unused (we build the
 // string ourselves for explicit singular/plural control). Kept as a
 // compile-time reference that we're aware of the crate's builder. ----
-#[allow(dead_code, reason = "explicit marker that we considered num2words Currency builder")]
+#[allow(
+    dead_code,
+    reason = "explicit marker that we considered num2words Currency builder"
+)]
 const _: Option<Currency> = None;
 
 #[cfg(test)]
@@ -320,18 +298,9 @@ mod tests {
 
     #[test]
     fn currency_with_cents() {
-        assert_eq!(
-            currency("$3.50"),
-            "three dollars and fifty cents"
-        );
-        assert_eq!(
-            currency("$0.99"),
-            "zero dollars and ninety-nine cents"
-        );
-        assert_eq!(
-            currency("$1.01"),
-            "one dollar and one cent"
-        );
+        assert_eq!(currency("$3.50"), "three dollars and fifty cents");
+        assert_eq!(currency("$0.99"), "zero dollars and ninety-nine cents");
+        assert_eq!(currency("$1.01"), "one dollar and one cent");
     }
 
     #[test]
@@ -362,10 +331,7 @@ mod tests {
 
     #[test]
     fn percent_decimal() {
-        assert_eq!(
-            percent("42.5%"),
-            "forty-two point five percent"
-        );
+        assert_eq!(percent("42.5%"), "forty-two point five percent");
     }
 
     #[test]
@@ -388,11 +354,7 @@ mod tests {
 
     #[test]
     fn years_older() {
-        assert!(
-            years("1995").contains("nineteen"),
-            "got: {}",
-            years("1995")
-        );
+        assert!(years("1995").contains("nineteen"), "got: {}", years("1995"));
     }
 
     #[test]
@@ -409,14 +371,8 @@ mod tests {
 
     #[test]
     fn decimals_simple() {
-        assert_eq!(
-            decimals("3.14"),
-            "three point one four"
-        );
-        assert_eq!(
-            decimals("0.5"),
-            "zero point five"
-        );
+        assert_eq!(decimals("3.14"), "three point one four");
+        assert_eq!(decimals("0.5"), "zero point five");
     }
 
     #[test]
@@ -435,11 +391,8 @@ mod tests {
 
     #[test]
     fn full_pipeline_on_assistant_reply() {
-        // A realistic assistant reply that exercises most passes.
         let input = "Dr. Smith's 2024 report shows $42.50 and 50% improvement on the 1st test.";
         let out = preprocess(input);
-        // Assert key transformations rather than the full string —
-        // num2words minor output drift shouldn't flake the test.
         assert!(out.contains("doctor Smith"), "titles: {out}");
         assert!(out.contains("twenty twenty-four"), "year: {out}");
         assert!(

@@ -54,7 +54,9 @@ async fn main() -> anyhow::Result<()> {
         Err(MuxError::NotFound(_)) => println!("     ok: classified as NotFound"),
         Err(e) => {
             println!("     FAIL: expected NotFound, got {e}");
-            anyhow::bail!("classify_status does not recognize this multiplexer's NotFound phrasing");
+            anyhow::bail!(
+                "classify_status does not recognize this multiplexer's NotFound phrasing"
+            );
         }
         Ok(()) => anyhow::bail!("send-keys to missing session unexpectedly succeeded"),
     }

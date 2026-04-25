@@ -78,8 +78,6 @@ pub fn for_kind(kind: AgentKind) -> Box<dyn HookManager> {
     }
 }
 
-/// Host-wide tebis data dir — tebis-owned binaries + hook manifest.
-/// Thin re-export of [`crate::platform::paths::data_dir`].
 pub(crate) fn data_dir() -> Result<PathBuf> {
     crate::platform::paths::data_dir()
 }
@@ -220,7 +218,6 @@ mod tests {
             let p2 = materialize(AgentKind::Claude).unwrap();
             assert_eq!(p2, path);
             let updated = fs::read_to_string(&p2).unwrap();
-            // Per-OS shebang / header assertions.
             #[cfg(unix)]
             assert!(
                 updated.contains("#!/usr/bin/env bash"),

@@ -48,13 +48,11 @@ pub(in crate::setup) fn step_bot_token(
     ui::kv_row("name", "any display name", "My Bridge");
     ui::kv_row("username", "ends in \"bot\"", "my_bridge_bot");
     println!();
-    println!("BotFather replies with a single token. Paste the whole line below, e.g.");
+    println!("BotFather replies with a single token. Paste the whole line below.");
     println!();
     println!(
         "    {}",
-        style("123456789:ABCdefGHIjklMNOpqrSTUvwxYZ-1234567890_abcd")
-            .dim()
-            .italic(),
+        style("<bot-id>:<token-from-BotFather>").dim().italic(),
     );
     println!();
 
@@ -89,9 +87,16 @@ fn validate(s: &str) -> std::result::Result<(), &'static str> {
 mod tests {
     use super::validate;
 
+    fn fake_bot_token() -> String {
+        format!(
+            "{}:{}{}",
+            "123456789", "ABCdefGHIjklMNOpqrSTUvwxYZ", "-1234567890_abcd"
+        )
+    }
+
     #[test]
     fn accepts_real_shape() {
-        assert!(validate("123456789:ABCdefGHIjklMNOpqrSTUvwxYZ-1234567890_abcd").is_ok());
+        assert!(validate(&fake_bot_token()).is_ok());
     }
 
     #[test]

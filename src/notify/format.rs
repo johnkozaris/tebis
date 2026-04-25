@@ -5,9 +5,11 @@ use super::{Payload, markdown};
 use crate::sanitize;
 
 pub fn body(p: &Payload) -> String {
-    let tag_line = p.kind.as_deref().and_then(kind_tag).map(|t| {
-        format!("<i>[{t}]</i>\n")
-    });
+    let tag_line = p
+        .kind
+        .as_deref()
+        .and_then(kind_tag)
+        .map(|t| format!("<i>[{t}]</i>\n"));
 
     let html = markdown::to_html(&p.text);
     let truncated = sanitize::wrap_and_truncate(&html, "", "");

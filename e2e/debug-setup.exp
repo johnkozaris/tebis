@@ -41,7 +41,6 @@ set bin [lindex $argv 0]
 if {$bin eq ""} { set bin "./target/debug/tebis" }
 spawn $bin setup
 
-# Step 1 — bot token
 expect {
     timeout { puts stderr "TIMEOUT waiting for bot-token prompt"; exit 1 }
     -re "Keep the current bot token" {
@@ -52,31 +51,23 @@ expect {
 }
 send -- "$bot_token\r"
 
-# Step 2 — user id
 expect -re "Your numeric Telegram id"
 send -- "$user_id\r"
 
-# Step 3 — session allowlist: No
 expect -re "Restrict to specific session names"
 send -- "n"
 
-# Step 4 — autostart: No
 expect -re "Set a default agent"
 send -- "n"
 
-# Step 5 — hooks: auto-skipped (no autostart).
-
-# Step 6 — inspect dashboard: No
 expect -re "Enable dashboard"
 send -- "n"
 
-# Step 7 — STT: Yes, then default model (Small.en)
 expect -re "Enable voice-to-text"
 send -- "y"
 expect -re "Whisper model"
 send -- "\r"
 
-# Step 8 — TTS Setup mode: Advanced (down once + Enter)
 expect -re "Setup mode"
 send -- "\033\[B"
 send -- "\r"
@@ -95,31 +86,24 @@ send -- "\033\[A"
 send -- "\033\[A"
 send -- "\r"
 
-# espeak-ng probe finds nothing → "Install now?" Confirm (default yes).
 expect -re "Install now"
 send -- "y"
 
-# The install runs `brew install espeak-ng`. Give it up to 90s.
 set timeout 90
 expect -re "espeak-ng installed at"
 
-# onnxruntime probe — second "Install now?" in this step.
 expect -re "Install now"
 send -- "y"
 expect -re "onnxruntime installed at"
 
-# Back to 60s for the rest of the wizard.
 set timeout 60
 
-# Voice name prompt
 expect -re "Voice \\(af_sarah or am_adam\\)"
 send -- "\r"
 
-# respond_to_all Confirm (default No)
 expect -re "Voice-reply to typed messages too"
 send -- "n"
 
-# Review → Save?
 expect -re "Save this config"
 send -- "y"
 

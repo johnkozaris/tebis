@@ -49,3 +49,4 @@ tarpaulin-report.*
 # Per-user machine config (direnv etc.)
 .direnv/
 .envrc.local
+.claude/settings.local.json
