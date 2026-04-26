@@ -4,62 +4,33 @@
 
 # tebis
 
-**Control your local AI coding agent from Telegram.**
+**Control local terminal agents from Telegram.**
 
-Tebis is a small Rust daemon for one person and one workstation. It connects a
-private Telegram bot to a local terminal session, so you can check progress,
-send a prompt, approve a permission question, restart an agent, or send a voice
-note from your phone.
-
-No hosted relay. No team dashboard. Your bot token is stored locally and used
-only for direct Telegram Bot API calls.
+Tebis is a small Rust daemon that connects a private Telegram bot to local
+terminal sessions. Send prompts, voice notes, and slash commands from your
+phone; Tebis types into `tmux`/`psmux`, reads back useful output, and can send
+voice replies.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 2024](https://img.shields.io/badge/rust-edition%202024-orange?logo=rust)](Cargo.toml)
 [![MSRV 1.95](https://img.shields.io/badge/MSRV-1.95-blue?logo=rust)](Cargo.toml)
-[![Platform](https://img.shields.io/badge/platform-Unix%2FLinux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#requirements)
 
-**Supported:** Unix/Linux, macOS, and Windows.
+**Supported:** Linux, macOS, and Windows.
 
 </div>
-
-## What Tebis does
-
-Tebis keeps a local command-line agent reachable while you are away from the
-laptop.
-
-1. Run Claude Code, Copilot CLI, aider, or another terminal app in a persistent
-   terminal session.
-2. Message your private Telegram bot.
-3. Tebis sends your text to that local session as keystrokes.
-4. Tebis sends useful output back to Telegram.
-
-On Unix/Linux and macOS, Tebis uses `tmux`. On Windows, it uses
-[`psmux`][psmux]. Both keep terminal apps running even when no terminal window
-is open.
-
-## Who it is for
-
-Tebis is for solo developers who:
-
-- run local AI coding agents for long tasks
-- want to check progress from a phone
-- need to answer permission prompts without walking back to the desk
-- prefer a local binary over a hosted control panel
-
-It is not built for team access, shared bots, or remote shell hosting. The
-safety model is intentionally simple: one Telegram user, one local machine, one
-bot token.
 
 ## Requirements
 
 | Platform | You need |
 | --- | --- |
 | macOS | Rust 1.95+, `tmux` 3.x, Xcode Command Line Tools |
-| Unix/Linux | Rust 1.95+, `tmux` 3.x, C++ build tools, CMake |
+| Linux | Rust 1.95+, `tmux` 3.x, C++ build tools, CMake |
 | Windows | Rust 1.95+, [psmux][psmux], Visual Studio Build Tools with C++, CMake |
 
-Optional voice features may download local speech models during setup.
+Works with Claude Code, Copilot CLI, aider, shells, or any terminal app that
+accepts keyboard input. Voice features may download local speech models during
+setup.
 
 ## Quick start
 
@@ -95,7 +66,9 @@ commands.
 
 ## Use it from Telegram
 
-Plain text goes to your current terminal session. Slash commands control Tebis:
+Plain text goes to your current terminal session. Voice notes can be
+transcribed and sent the same way when voice is enabled. Slash commands control
+Tebis:
 
 | Command | What it does |
 | --- | --- |
@@ -113,19 +86,14 @@ Plain text goes to your current terminal session. Slash commands control Tebis:
 Short control commands respond with a thumbs-up reaction instead of adding
 noise to the chat.
 
-## Safety at a glance
+## See what is going on
 
-Tebis is careful because it sends keystrokes to a real local process.
+Enable the local dashboard to check service state, running sessions, recent
+activity, hooks, and voice settings from the same machine.
 
-- It accepts messages only from your numeric Telegram user ID.
-- Usernames are not trusted.
-- Your bot token is stored in your local config file.
-- There is no Tebis cloud service or relay server.
-- The dashboard binds to `127.0.0.1` only.
-- Local agent notifications are accepted only from your operating-system user.
-- Telegram replies are escaped before being sent.
+![Tebis local dashboard](docs/dashboard.png)
 
-For security details or vulnerability reports, see [SECURITY.md](SECURITY.md).
+See [Dashboard](docs/dashboard.md) for setup.
 
 ## More guides
 
@@ -138,12 +106,6 @@ For security details or vulnerability reports, see [SECURITY.md](SECURITY.md).
 | [Dashboard](docs/dashboard.md) | Enable the local browser dashboard |
 | [Contributing](CONTRIBUTING.md) | Open issues and pull requests |
 | [Security policy](SECURITY.md) | Report vulnerabilities privately |
-
-## Project status
-
-Tebis is pre-1.0 and built for a focused personal workflow. It has CI coverage
-for macOS, Linux, and Windows, but the command surface and config names may
-still change before 1.0.
 
 ## License
 
