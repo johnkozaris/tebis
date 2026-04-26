@@ -87,7 +87,7 @@ fn simple_tts(theme: &ColorfulTheme, existing: Option<&TtsChoice>) -> Result<Opt
             style("espeak-ng").bold(),
             style("onnxruntime").bold(),
         );
-        return kokoro_local_simple_flow(theme, existing, respond_to_all);
+        kokoro_local_simple_flow(theme, existing, respond_to_all)
     }
 
     // Anything else (BSD, unknown) — no native, no auto-install path.

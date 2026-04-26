@@ -94,6 +94,7 @@ whisper-rs = {version = "0.16", default-features = false}
 [dependencies.tebis-tts-kokoro]
 optional = true
 path = "crates/tebis-tts-kokoro"
+version = "0.1.0"
 
 [features]
 default = []

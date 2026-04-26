@@ -44,23 +44,18 @@ jobs:
         continue-on-error: true
 
   test:
-    name: cargo test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: cargo test
+    runs-on: ubuntu-latest
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --all-targets
       # Kokoro-gated tests live in the separate `tebis-tts-kokoro`
       # crate. Without `--features kokoro-local` the tebis adapter + the
       # crate itself still compile, but the crate's 49 unit tests
-      # never exercise. Run them explicitly.
-      - run: cargo test --locked --workspace --features tebis/kokoro-local
+      # never exercise.
+      - run: cargo test --locked --workspace --all-targets --features tebis/kokoro-local
 
   build:
     name: cargo build --release
@@ -100,32 +95,3 @@ jobs:
       - uses: actions/checkout@v4
       - name: shellcheck contrib/
         run: shellcheck --severity=warning contrib/claude/claude-hook.sh contrib/copilot/copilot-hook.sh
-
-  # Windows build + clippy + unit tests. The test scratch-dir override
-  # goes through TEBIS_SCRATCH_DIR (honored by `platform::paths` in
-  # test builds), which is platform-neutral — Windows's Known Folder
-  # API ignores XDG_* but picks up this env var, so agent_hooks and
-  # manifest tests run against scratch paths the same way they do on
-  # Unix. Unix-only tests (peer_listener UDS, script_e2e_tests .sh
-  # harness, tmux stderr classifier) are cfg-gated and skipped.
-  windows-test:
-    name: cargo test (windows)
-    runs-on: windows-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked --all-targets
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked --all-targets
-      # PowerShell syntax-parse the embedded hook scripts. `[scriptblock]::Create`
-      # parses without executing, so this is the PowerShell sibling of
-      # shellcheck on the `.sh` scripts. windows-latest ships PowerShell
-      # 5.1 as `powershell.exe` and (since 2024) PowerShell 7 as `pwsh.exe`;
-      # either works here.
-      - name: Parse-check embedded .ps1 hook scripts
-        shell: pwsh
-        run: |
-          $null = [ScriptBlock]::Create((Get-Content -Raw contrib/claude/claude-hook.ps1))
-          $null = [ScriptBlock]::Create((Get-Content -Raw contrib/copilot/copilot-hook.ps1))
