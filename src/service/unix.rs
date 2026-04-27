@@ -11,7 +11,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use console::style;
 
-use crate::{fsutil, lockfile, setup};
+use crate::{fsutil, lockfile};
 
 #[cfg(target_os = "macos")]
 const MACOS_PLIST_TEMPLATE: &str = include_str!("../../contrib/macos/local.tebis.plist");
@@ -28,15 +28,32 @@ const LAUNCHD_LABEL: &str = "local.tebis";
 const SYSTEMD_UNIT_NAME: &str = "tebis";
 
 pub fn install() -> Result<()> {
-    let env_path = setup::env_file_path()?;
-    if !env_path.exists() {
-        bail!(
-            "no config at {} — run `tebis setup` first",
-            env_path.display()
-        );
-    }
-
     refuse_if_foreground_running("install")?;
+
+    // Preflight: assesses container, privileges, dependencies, and
+    // writable paths up front. Aborts on blockers; on warnings, prompts
+    // (TTY) or auto-continues (non-interactive). The detected container
+    // kind threads through so install_linux doesn't re-shell.
+    let report = crate::preflight::run_install_preflight();
+    if !report.checks.is_empty() {
+        println!();
+        println!("{}  System assessment:", style("▶").cyan().bold());
+        crate::preflight::render(&report, false);
+    }
+    if report.has_blockers() {
+        bail!("preflight found blocking issues — fix the items above and re-run");
+    }
+    if report.has_warnings() && console::Term::stdout().is_term() {
+        println!();
+        let go = dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt("Continue with install?")
+            .default(true)
+            .interact()
+            .unwrap_or(true);
+        if !go {
+            bail!("install cancelled");
+        }
+    }
 
     let bin_src = env::current_exe().context("locating current tebis binary")?;
     let bin_dst = home_dir()?.join(".local/bin/tebis");
@@ -52,9 +69,12 @@ pub fn install() -> Result<()> {
     #[cfg(target_os = "macos")]
     install_macos()?;
     #[cfg(target_os = "linux")]
-    install_linux()?;
+    install_linux(report.container_kind.as_deref())?;
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    bail!("unsupported platform — macOS and Linux only");
+    {
+        let _ = report; // silence unused-warning on unsupported builds
+        bail!("unsupported platform — macOS and Linux only");
+    }
 
     println!();
     println!(
@@ -62,22 +82,7 @@ pub fn install() -> Result<()> {
         style("✓").green().bold(),
         style("Auto-starts at login; respawns on crash.").dim(),
     );
-    if let Ok(path) = env::var("PATH")
-        && !path
-            .split(':')
-            .any(|p| home_dir().is_ok_and(|h| Path::new(p) == h.join(".local/bin")))
-    {
-        println!();
-        println!(
-            "    {} {} is not in your PATH. Add it to run `tebis` from any shell:",
-            style("⚠").yellow().bold(),
-            style("~/.local/bin").bold(),
-        );
-        println!(
-            "    {}",
-            style(r#"    export PATH="$HOME/.local/bin:$PATH""#).dim(),
-        );
-    }
+    // PATH warning is now part of the preflight table; don't re-emit.
     println!();
     Ok(())
 }
@@ -128,7 +133,7 @@ fn install_macos() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn install_linux() -> Result<()> {
+fn install_linux(container_kind: Option<&str>) -> Result<()> {
     let unit_path = systemd_unit_path()?;
     let unit_dir = unit_path
         .parent()
@@ -138,35 +143,26 @@ fn install_linux() -> Result<()> {
         .with_context(|| format!("writing {}", unit_path.display()))?;
     println!("    unit    {}", short(&unit_path));
 
-    // Detect unprivileged container — user systemd there cannot apply
-    // the unit's CapabilityBoundingSet/NoNewPrivileges/etc. and the
-    // service hits 218/CAPABILITIES on every restart. Offer to install
-    // a relaxing drop-in. The container itself is the sandbox.
-    if let Some(kind) = detect_container() {
+    // Detected by preflight. The unit's hardening (CapabilityBoundingSet,
+    // Protect*, RestrictNamespaces, …) cannot be applied by user
+    // systemd inside an unprivileged container — write a relaxed
+    // drop-in. The container itself is the sandbox.
+    if let Some(kind) = container_kind {
         let dropin = systemd_dropin_path()?;
         let install_dropin = if dropin.exists() {
-            // Already there from a previous install — keep it.
             true
         } else if console::Term::stdout().is_term() {
             println!();
-            println!(
-                "    {} container detected ({}). Hardening directives in the unit",
-                style("⚠").yellow().bold(),
-                style(&kind).bold(),
-            );
-            println!(
-                "      typically fail in unprivileged containers (exit 218/CAPABILITIES)."
-            );
             dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
-                .with_prompt("Install relaxed-hardening drop-in?")
+                .with_prompt(format!(
+                    "Container detected ({kind}). Install relaxed-hardening drop-in?"
+                ))
                 .default(true)
                 .interact()
                 .unwrap_or(true)
         } else {
-            // Non-interactive (CI, cloud-init): install by default —
-            // the alternative is a silent restart loop.
             eprintln!(
-                "    note    container detected ({kind}); installing relaxed drop-in (non-interactive)"
+                "    note    container ({kind}); installing relaxed drop-in (non-interactive)"
             );
             true
         };
@@ -188,9 +184,6 @@ fn install_linux() -> Result<()> {
         ["--user", "enable", "--now", SYSTEMD_UNIT_NAME],
     )?;
 
-    // `enable --now` returns 0 even when the unit immediately exits and
-    // enters auto-restart — verify the unit actually settled into
-    // `active`, otherwise surface the journal hint up front.
     if !wait_for_active_linux() {
         explain_systemd_failure();
         bail!("tebis service failed to start — see hint above");
@@ -204,38 +197,6 @@ fn install_linux() -> Result<()> {
     );
     println!("    logs    journalctl --user -u tebis -f");
     Ok(())
-}
-
-/// Detects whether we're running inside a container by asking
-/// `systemd-detect-virt --container`. Returns the runtime kind (e.g.
-/// "lxc", "docker", "podman", "oci") so callers can include it in
-/// user-visible messages. Falls back to filesystem markers for
-/// docker/podman in case the helper is somehow missing.
-///
-/// We deliberately avoid `/proc/1/environ` — under unprivileged user
-/// containers (LXC/Incus default) PID 1 is root-owned and the env
-/// block is unreadable to the service user.
-#[cfg(target_os = "linux")]
-fn detect_container() -> Option<String> {
-    let out = Command::new("systemd-detect-virt")
-        .arg("--container")
-        .output()
-        .ok()?;
-    // Exit 0 + non-empty stdout (other than "none") means a container
-    // was detected. Exit 1 + "none" means bare metal / non-container VM.
-    let kind = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    if out.status.success() && !kind.is_empty() && kind != "none" {
-        return Some(kind);
-    }
-    // Fallbacks for the (unlikely) case where systemd-detect-virt is
-    // unavailable but we can still spot well-known runtime markers.
-    if Path::new("/run/.containerenv").exists() {
-        return Some("podman".to_owned());
-    }
-    if Path::new("/.dockerenv").exists() {
-        return Some("docker".to_owned());
-    }
-    None
 }
 
 #[cfg(target_os = "linux")]

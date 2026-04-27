@@ -20,6 +20,7 @@ pub mod lockfile;
 pub mod metrics;
 pub mod notify;
 pub mod platform;
+pub mod preflight;
 pub mod sanitize;
 pub mod security;
 pub mod service;

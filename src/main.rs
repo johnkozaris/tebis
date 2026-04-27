@@ -35,6 +35,8 @@ Usage:
   tebis stop            Stop the installed background service.
   tebis restart         Stop + start the installed service (e.g. after config edit).
   tebis status          Show service + foreground state.
+  tebis doctor          Diagnose system, privileges, deps, and service state.
+                        Pass `-v` / `--verbose` to include OK rows.
   tebis hooks <verb>    Manage agent hooks: install | uninstall | status.
   tebis --help / -h     This message.
   tebis --version / -V  Print version.
@@ -81,6 +83,17 @@ fn main() -> Result<()> {
         Some("stop") => service::stop(),
         Some("restart") => service::restart(),
         Some("status") => service::status(),
+        Some("doctor") => {
+            let verbose = env::args().any(|a| a == "-v" || a == "--verbose");
+            let report = tebis::preflight::run_doctor();
+            println!();
+            tebis::preflight::render(&report, verbose);
+            println!();
+            if report.has_blockers() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Some("hooks") => hooks_cli::run(&env::args().skip(2).collect::<Vec<_>>()),
         Some(other) => {
             eprintln!("tebis: unknown argument: {other}\n\n{HELP}");
