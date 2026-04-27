@@ -19,6 +19,9 @@ const MACOS_PLIST_TEMPLATE: &str = include_str!("../../contrib/macos/local.tebis
 #[cfg(target_os = "linux")]
 const LINUX_SERVICE: &str = include_str!("../../contrib/linux/tebis.service");
 
+#[cfg(target_os = "linux")]
+const LINUX_CONTAINER_DROPIN: &str = include_str!("../../contrib/linux/tebis-container.conf");
+
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const LAUNCHD_LABEL: &str = "local.tebis";
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -135,11 +138,64 @@ fn install_linux() -> Result<()> {
         .with_context(|| format!("writing {}", unit_path.display()))?;
     println!("    unit    {}", short(&unit_path));
 
+    // Detect unprivileged container — user systemd there cannot apply
+    // the unit's CapabilityBoundingSet/NoNewPrivileges/etc. and the
+    // service hits 218/CAPABILITIES on every restart. Offer to install
+    // a relaxing drop-in. The container itself is the sandbox.
+    if let Some(kind) = detect_container() {
+        let dropin = systemd_dropin_path()?;
+        let install_dropin = if dropin.exists() {
+            // Already there from a previous install — keep it.
+            true
+        } else if console::Term::stdout().is_term() {
+            println!();
+            println!(
+                "    {} container detected ({}). Hardening directives in the unit",
+                style("⚠").yellow().bold(),
+                style(&kind).bold(),
+            );
+            println!(
+                "      typically fail in unprivileged containers (exit 218/CAPABILITIES)."
+            );
+            dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                .with_prompt("Install relaxed-hardening drop-in?")
+                .default(true)
+                .interact()
+                .unwrap_or(true)
+        } else {
+            // Non-interactive (CI, cloud-init): install by default —
+            // the alternative is a silent restart loop.
+            eprintln!(
+                "    note    container detected ({kind}); installing relaxed drop-in (non-interactive)"
+            );
+            true
+        };
+        if install_dropin {
+            let dropin_dir = dropin
+                .parent()
+                .context("drop-in path has no parent — malformed unit dir?")?;
+            fs::create_dir_all(dropin_dir)
+                .with_context(|| format!("creating {}", dropin_dir.display()))?;
+            atomic_write_0644(&dropin, LINUX_CONTAINER_DROPIN.as_bytes())
+                .with_context(|| format!("writing {}", dropin.display()))?;
+            println!("    drop-in {}", short(&dropin));
+        }
+    }
+
     run("systemctl", ["--user", "daemon-reload"])?;
     run(
         "systemctl",
         ["--user", "enable", "--now", SYSTEMD_UNIT_NAME],
     )?;
+
+    // `enable --now` returns 0 even when the unit immediately exits and
+    // enters auto-restart — verify the unit actually settled into
+    // `active`, otherwise surface the journal hint up front.
+    if !wait_for_active_linux() {
+        explain_systemd_failure();
+        bail!("tebis service failed to start — see hint above");
+    }
+
     println!("    systemd enabled + started");
     println!(
         "    note    {} {}",
@@ -148,6 +204,122 @@ fn install_linux() -> Result<()> {
     );
     println!("    logs    journalctl --user -u tebis -f");
     Ok(())
+}
+
+/// Detects whether we're running inside a container by asking
+/// `systemd-detect-virt --container`. Returns the runtime kind (e.g.
+/// "lxc", "docker", "podman", "oci") so callers can include it in
+/// user-visible messages. Falls back to filesystem markers for
+/// docker/podman in case the helper is somehow missing.
+///
+/// We deliberately avoid `/proc/1/environ` — under unprivileged user
+/// containers (LXC/Incus default) PID 1 is root-owned and the env
+/// block is unreadable to the service user.
+#[cfg(target_os = "linux")]
+fn detect_container() -> Option<String> {
+    let out = Command::new("systemd-detect-virt")
+        .arg("--container")
+        .output()
+        .ok()?;
+    // Exit 0 + non-empty stdout (other than "none") means a container
+    // was detected. Exit 1 + "none" means bare metal / non-container VM.
+    let kind = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if out.status.success() && !kind.is_empty() && kind != "none" {
+        return Some(kind);
+    }
+    // Fallbacks for the (unlikely) case where systemd-detect-virt is
+    // unavailable but we can still spot well-known runtime markers.
+    if Path::new("/run/.containerenv").exists() {
+        return Some("podman".to_owned());
+    }
+    if Path::new("/.dockerenv").exists() {
+        return Some("docker".to_owned());
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_dropin_path() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".config/systemd/user/tebis.service.d/container.conf"))
+}
+
+/// Polls `systemctl --user is-active` for up to ~3s. Distinguishes a
+/// transient `activating` (normal during boot/reload) from a unit that
+/// has already failed and is auto-restarting.
+#[cfg(target_os = "linux")]
+fn wait_for_active_linux() -> bool {
+    use std::thread::sleep;
+    use std::time::Duration;
+    for _ in 0..6 {
+        sleep(Duration::from_millis(500));
+        if Command::new("systemctl")
+            .args(["--user", "is-active", "--quiet", SYSTEMD_UNIT_NAME])
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Prints an actionable diagnostic when the unit isn't active. Tails
+/// the journal looking for the well-known 218/CAPABILITIES marker so
+/// the container case gets a tailored fix-it suggestion.
+#[cfg(target_os = "linux")]
+fn explain_systemd_failure() {
+    let log = Command::new("journalctl")
+        .args([
+            "--user",
+            "-u",
+            SYSTEMD_UNIT_NAME,
+            "-n",
+            "30",
+            "--no-pager",
+        ])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+
+    eprintln!();
+    eprintln!(
+        "{}  tebis is not active after install. Last journal lines:",
+        style("✗").red().bold()
+    );
+    for line in log.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev() {
+        eprintln!("    {line}");
+    }
+
+    if log.contains("218/CAPABILITIES") || log.contains("Failed to drop capabilities") {
+        eprintln!();
+        eprintln!(
+            "    {} systemd cannot drop capabilities here — typical of",
+            style("hint").yellow().bold(),
+        );
+        eprintln!("    unprivileged containers. Install the relaxed drop-in:");
+        eprintln!();
+        eprintln!(
+            "      {}",
+            style("tebis uninstall && tebis install   # re-run; install detects container").dim()
+        );
+        eprintln!(
+            "      {}",
+            style("# or, manually:").dim()
+        );
+        eprintln!(
+            "      {}",
+            style("mkdir -p ~/.config/systemd/user/tebis.service.d").dim()
+        );
+        eprintln!(
+            "      {}",
+            style("# write the relaxed [Service] override there, then:").dim()
+        );
+        eprintln!(
+            "      {}",
+            style("systemctl --user daemon-reload && systemctl --user restart tebis").dim()
+        );
+    }
 }
 
 pub fn uninstall(purge_flag: bool) -> Result<()> {
@@ -330,6 +502,18 @@ fn uninstall_linux() -> Result<()> {
     } else {
         println!("    {} no unit at {}", style("·").dim(), short(&unit));
     }
+    // Clean up the container drop-in too. Best-effort — silently skip
+    // if absent (most installs won't have one).
+    if let Ok(dropin) = systemd_dropin_path()
+        && dropin.exists()
+    {
+        let _ = fs::remove_file(&dropin);
+        if let Some(d) = dropin.parent() {
+            // rmdir succeeds only if empty; ignore if user added files.
+            let _ = fs::remove_dir(d);
+        }
+        println!("    drop-in removed {}", short(&dropin));
+    }
     let _ = run_quiet("systemctl", ["--user", "daemon-reload"]);
     Ok(())
 }
@@ -340,7 +524,13 @@ pub fn start() -> Result<()> {
     #[cfg(target_os = "macos")]
     run("launchctl", ["start", LAUNCHD_LABEL])?;
     #[cfg(target_os = "linux")]
-    run("systemctl", ["--user", "start", SYSTEMD_UNIT_NAME])?;
+    {
+        run("systemctl", ["--user", "start", SYSTEMD_UNIT_NAME])?;
+        if !wait_for_active_linux() {
+            explain_systemd_failure();
+            bail!("tebis service failed to start — see hint above");
+        }
+    }
     println!("{}  tebis started.", style("✓").green().bold());
     Ok(())
 }
@@ -365,7 +555,13 @@ pub fn restart() -> Result<()> {
         run("launchctl", ["kickstart", "-k", target.as_str()])?;
     }
     #[cfg(target_os = "linux")]
-    run("systemctl", ["--user", "restart", SYSTEMD_UNIT_NAME])?;
+    {
+        run("systemctl", ["--user", "restart", SYSTEMD_UNIT_NAME])?;
+        if !wait_for_active_linux() {
+            explain_systemd_failure();
+            bail!("tebis service failed to start — see hint above");
+        }
+    }
     println!("{}  tebis restarted.", style("✓").green().bold());
     Ok(())
 }
