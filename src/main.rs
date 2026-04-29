@@ -49,6 +49,7 @@ Optional env:
   TELEGRAM_ALLOWED_SESSIONS     Comma-separated terminal session allowlist
   TELEGRAM_POLL_TIMEOUT         Long-poll seconds (default 30, 1..=900)
   TELEGRAM_MAX_OUTPUT_CHARS     /read truncation cap (default 4000)
+  TELEGRAM_SUBMIT_GAP_MS        Text→Enter sleep in ms (default 300, 50..=5000)
   TELEGRAM_AUTOSTART_SESSION    Autostart session name
   TELEGRAM_AUTOSTART_DIR        Autostart working directory
   TELEGRAM_AUTOSTART_COMMAND    Autostart command (e.g. `claude`)
@@ -442,6 +443,7 @@ async fn run_bridge() -> Result<()> {
     let tmux = Arc::new(mux::Mux::new(
         config.allowed_sessions.clone(),
         config.max_output_chars,
+        Duration::from_millis(u64::from(config.submit_gap_ms)),
     ));
     if let Some(a) = config.autostart.as_ref() {
         tracing::info!(
@@ -484,6 +486,9 @@ async fn run_bridge() -> Result<()> {
         );
         inspect::spawn(&tracker, shutdown.clone(), port, snapshot, live)?;
     }
+
+    let env_file_path: Option<std::path::PathBuf> =
+        env::var("BRIDGE_ENV_FILE").ok().map(std::path::PathBuf::from);
 
     let mut offset: Option<i64> = None;
     let mut backoff = Duration::from_secs(1);
@@ -579,12 +584,7 @@ async fn run_bridge() -> Result<()> {
                         tracker: tracker.clone(),
                         shutdown: shutdown.clone(),
                         audio: audio.clone(),
-                        // `BRIDGE_ENV_FILE` enables `/tts` runtime
-                        // reconfig. Without it, /tts replies with an
-                        // error and no-ops.
-                        env_file_path: env::var("BRIDGE_ENV_FILE")
-                            .ok()
-                            .map(std::path::PathBuf::from),
+                        env_file_path: env_file_path.clone(),
                     };
 
                     tracker.spawn(bridge::handle_update(ctx, chat_id, message_id, payload));

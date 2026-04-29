@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
     let live: Vec<String> = if dummy {
         vec!["claude-code".into(), "shell".into(), "notes".into()]
     } else {
-        let probe = mux::Mux::new(vec![], 4000);
+        let probe = mux::Mux::new(vec![], 4000, Duration::from_millis(300));
         probe.list_sessions().await.unwrap_or_default()
     };
     let real_allowlist: Vec<String> = live
@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
     } else {
         real_allowlist.clone()
     };
-    let tmux = Arc::new(mux::Mux::new(allowlist.clone(), 4000));
+    let tmux = Arc::new(mux::Mux::new(allowlist.clone(), 4000, Duration::from_millis(300)));
     let default_target = allowlist.first().cloned();
 
     let sessions = Arc::new(session::SessionState::new(None, HooksMode::Off));

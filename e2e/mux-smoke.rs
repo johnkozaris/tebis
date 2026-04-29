@@ -11,7 +11,7 @@ use tebis::platform::multiplexer::{Mux, MuxError};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let session = "mux_smoke_tebis";
-    let mux = Mux::new(Vec::new(), 4000); // permissive
+    let mux = Mux::new(Vec::new(), 4000, std::time::Duration::from_millis(300)); // permissive
 
     // Clean slate.
     let _ = mux.kill_session(session).await;

@@ -152,6 +152,7 @@ async fn handle(
             }
             let _ = live.tmux.kill_session(name).await;
             live.session.clear_target_if(name);
+            live.session.unmark_hooked(name);
             tracing::warn!(session = name, "Inspect: killed session");
             Ok(redirect_to("/"))
         }
@@ -175,6 +176,7 @@ async fn kill_all(live: &LiveContext) -> usize {
             killed += 1;
         }
         live.session.clear_target_if(&name);
+        live.session.unmark_hooked(&name);
     }
     killed
 }

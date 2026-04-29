@@ -20,9 +20,6 @@ use tokio::sync::Mutex;
 
 use crate::sanitize;
 
-/// 300 ms is safe; Ink/React TUIs drop Enter that arrives too close to text.
-const SUBMIT_GAP: Duration = Duration::from_millis(300);
-
 /// Binary to invoke. tmux on Unix, psmux on Windows (tmux-compatible
 /// Rust port — reads `~/.tmux.conf`, same command language). psmux
 /// v3.3+ is the verified Windows target; `binary_on_path` probes
@@ -102,6 +99,7 @@ pub struct Mux {
     dynamic: std::sync::Mutex<HashMap<String, Arc<SessionSlot>>>,
     permissive: bool,
     max_output_chars: usize,
+    submit_gap: Duration,
 }
 
 /// Invariant 13: tmux needs `=NAME:0` for exact pane targets. psmux treats `=`
@@ -160,7 +158,7 @@ pub type Result<T> = std::result::Result<T, MuxError>;
 
 impl Mux {
     /// Empty `allowed` → permissive mode.
-    pub fn new(allowed: Vec<String>, max_output_chars: usize) -> Self {
+    pub fn new(allowed: Vec<String>, max_output_chars: usize, submit_gap: Duration) -> Self {
         let permissive = allowed.is_empty();
         let strict = allowed
             .into_iter()
@@ -180,6 +178,7 @@ impl Mux {
             dynamic: std::sync::Mutex::new(HashMap::new()),
             permissive,
             max_output_chars,
+            submit_gap,
         }
     }
 
@@ -234,7 +233,7 @@ impl Mux {
         .await?;
         classify_status(&out, "send-keys", session)?;
 
-        tokio::time::sleep(SUBMIT_GAP).await;
+        tokio::time::sleep(self.submit_gap).await;
 
         // Invariant 3 second call: send Enter. tmux accepts `-H 0d`
         // (literal CR as hex). psmux has no `-H` flag; the only Enter
@@ -328,6 +327,9 @@ impl Mux {
         self.strict.keys().cloned().collect()
     }
 
+    /// In-flight ops hold their own `Arc` clone; clearing only affects new lookups.
+    const DYNAMIC_SOFT_CAP: usize = 256;
+
     fn slot(&self, session: &str) -> Result<Arc<SessionSlot>> {
         if !is_valid_session_name(session) {
             return Err(MuxError::InvalidName);
@@ -346,6 +348,13 @@ impl Mux {
             let mut map = self.dynamic.lock().expect("dynamic slots poisoned");
             if let Some(slot) = map.get(session) {
                 return Ok(slot.clone());
+            }
+            if map.len() >= Self::DYNAMIC_SOFT_CAP {
+                tracing::debug!(
+                    evicted = map.len(),
+                    "dynamic slot map hit soft cap, clearing"
+                );
+                map.clear();
             }
             let fresh = Arc::new(SessionSlot {
                 exact_target: exact_target_for(session),
@@ -434,6 +443,8 @@ async fn run_mux(op: &'static str, args: &[&str]) -> Result<std::process::Output
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    const TEST_GAP: Duration = Duration::from_millis(300);
 
     fn fake_output(status: i32, stderr: &str) -> std::process::Output {
         use std::os::unix::process::ExitStatusExt;
@@ -537,7 +548,7 @@ mod tests {
 
     #[test]
     fn strict_mode_rejects_unknown_names() {
-        let t = Mux::new(vec!["allowed".into()], 4000);
+        let t = Mux::new(vec!["allowed".into()], 4000, TEST_GAP);
         assert!(!t.is_permissive());
         assert!(matches!(t.validate_session("allowed"), Ok(()),));
         assert!(matches!(
@@ -548,7 +559,7 @@ mod tests {
 
     #[test]
     fn permissive_mode_accepts_any_valid_name() {
-        let t = Mux::new(Vec::new(), 4000);
+        let t = Mux::new(Vec::new(), 4000, TEST_GAP);
         assert!(t.is_permissive());
         // Regex still enforced.
         assert!(matches!(t.validate_session(""), Err(MuxError::InvalidName),));
@@ -566,10 +577,22 @@ mod tests {
         // Same name → same `Arc<SessionSlot>`, so the per-session mutex
         // is stable across calls (two concurrent sends on the same
         // session can actually serialize).
-        let t = Mux::new(Vec::new(), 4000);
+        let t = Mux::new(Vec::new(), 4000, TEST_GAP);
         let a = t.slot("sess").unwrap();
         let b = t.slot("sess").unwrap();
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn dynamic_slot_map_evicts_on_soft_cap() {
+        let t = Mux::new(Vec::new(), 4000, TEST_GAP);
+        for i in 0..Mux::DYNAMIC_SOFT_CAP {
+            t.slot(&format!("s{i}")).unwrap();
+        }
+        assert_eq!(t.dynamic_slot_count(), Mux::DYNAMIC_SOFT_CAP);
+        // Next insert triggers eviction + re-insert of just the new name.
+        t.slot("overflow").unwrap();
+        assert_eq!(t.dynamic_slot_count(), 1);
     }
 }
 

@@ -323,7 +323,7 @@ impl TelegramClient {
             .fill(&mut boundary_bytes)
             .map_err(|_| TelegramError::Network {
                 method: "sendVoice".to_string(),
-                description: "ring RNG failure".to_string(),
+                description: "ring RNG failure (/dev/urandom unavailable?)".to_string(),
                 retryable: false,
             })?;
         let mut boundary = String::with_capacity(boundary_bytes.len() * 2);

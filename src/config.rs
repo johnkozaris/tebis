@@ -23,6 +23,7 @@ pub struct Config {
     pub allowed_sessions: Vec<String>,
     pub poll_timeout: u32,
     pub max_output_chars: usize,
+    pub submit_gap_ms: u32,
     pub notify: Option<NotifyConfig>,
     pub autostart: Option<AutostartConfig>,
     pub autoreply: Option<AutoreplyConfig>,
@@ -89,6 +90,14 @@ impl Config {
             bail!("TELEGRAM_MAX_OUTPUT_CHARS must be 100..=20000");
         }
 
+        let submit_gap_ms: u32 = env::var("TELEGRAM_SUBMIT_GAP_MS")
+            .unwrap_or_else(|_| "300".to_string())
+            .parse()
+            .context("TELEGRAM_SUBMIT_GAP_MS must be a valid integer")?;
+        if !(50..=5000).contains(&submit_gap_ms) {
+            bail!("TELEGRAM_SUBMIT_GAP_MS must be 50..=5000");
+        }
+
         let notify = load_notify_config(allowed_user_id)?;
         let autostart = load_autostart_config(&allowed_sessions)?;
         let autoreply = load_autoreply_config()?;
@@ -103,6 +112,7 @@ impl Config {
             allowed_sessions,
             poll_timeout,
             max_output_chars,
+            submit_gap_ms,
             notify,
             autostart,
             autoreply,
