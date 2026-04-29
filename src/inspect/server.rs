@@ -107,7 +107,8 @@ async fn handle(
     let path = req.uri().path().to_string();
     match (req.method(), path.as_str()) {
         (&Method::GET, "/" | "/index.html") => {
-            let body = render::html(&snapshot, &live).await;
+            let query = req.uri().query().unwrap_or("");
+            let body = render::html(&snapshot, &live, query).await;
             Ok(html_response(body))
         }
         (&Method::GET, "/status") => {
@@ -117,6 +118,17 @@ async fn handle(
         (&Method::POST, "/actions/kill-all-sessions") => {
             if !origin_is_trusted(&req, &expected_origins) {
                 return Ok(text_response(StatusCode::FORBIDDEN, "forbidden\n"));
+            }
+            let body = match Limited::new(req.into_body(), 256).collect().await {
+                Ok(b) => b.to_bytes(),
+                Err(_) => Bytes::new(),
+            };
+            let confirmed = std::str::from_utf8(&body)
+                .unwrap_or("")
+                .split('&')
+                .any(|kv| kv == "confirm=1");
+            if !confirmed {
+                return Ok(redirect_to("/?confirm_kill_all=1"));
             }
             let killed = kill_all(&live).await;
             tracing::warn!(count = killed, "Inspect: killed all allowlisted sessions");
@@ -224,7 +236,7 @@ async fn handle_config_post(
         "Inspect: config updated, restarting"
     );
     crate::shutdown::schedule_graceful_restart(&live.shutdown);
-    Ok(redirect_to("/"))
+    Ok(redirect_to("/?saved=1"))
 }
 
 /// Parse form-urlencoded into validated env updates. Whitelist-only, range-checked.

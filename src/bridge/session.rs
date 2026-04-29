@@ -13,10 +13,8 @@ pub struct AutostartConfig {
     pub session: String,
     pub dir: String,
     pub command: String,
+    pub tui_boot_delay: Duration,
 }
-
-/// Claude Code's Ink/React TUI drops input for ~1–2 s after spawn.
-const TUI_BOOT_DELAY: Duration = Duration::from_secs(3);
 
 pub struct SessionState {
     default_target: Mutex<Option<String>>,
@@ -107,7 +105,7 @@ impl SessionState {
                 .await
             {
                 Ok(()) => {
-                    tokio::time::sleep(TUI_BOOT_DELAY).await;
+                    tokio::time::sleep(auto.tui_boot_delay).await;
                     true
                 }
                 Err(MuxError::AlreadyExists(_)) => {
@@ -222,7 +220,7 @@ pub enum ResolveError {
     NoTarget,
 
     #[error(
-        "autostart command {0:?} exited immediately — check TELEGRAM_AUTOSTART_COMMAND \
+        "autostart command '{0}' exited immediately — check TELEGRAM_AUTOSTART_COMMAND \
          (is the binary on PATH? does it need args?)"
     )]
     AutostartCommandDied(String),
@@ -301,6 +299,7 @@ mod tests {
             session: session.into(),
             dir: "/tmp".into(),
             command: "echo".into(),
+            tui_boot_delay: Duration::from_secs(3),
         }
     }
 

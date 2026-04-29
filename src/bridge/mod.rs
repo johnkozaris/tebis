@@ -99,6 +99,13 @@ pub async fn handle_update(ctx: HandlerContext, chat_id: i64, message_id: i64, p
     };
 
     let cmd = handler::parse(&text);
+
+    // Fire a typing indicator early when autostart provisioning is likely — the
+    // 3s TUI boot delay would otherwise leave the user with no feedback.
+    if matches!(cmd, handler::Command::PlainText(_)) && ctx.session.target().is_none() {
+        let _ = ctx.tg.send_chat_action(chat_id, "typing").await;
+    }
+
     let response = if let handler::Command::Tts(verb) = cmd {
         handle_tts_command(&ctx, &verb)
     } else {
@@ -187,8 +194,14 @@ fn handle_tts_command(ctx: &HandlerContext, v: &handler::TtsVerb) -> Response {
 
     match v {
         TtsVerb::Status => {
+            let mut options = String::from("  /tts off\n");
+            #[cfg(target_os = "macos")]
+            options.push_str("  /tts say\n");
+            #[cfg(target_os = "windows")]
+            options.push_str("  /tts winrt\n");
+            options.push_str("  /tts kokoro-local\n  /tts kokoro-remote");
             let msg = format!(
-                "TTS: <code>{}</code>\n\nPick one with:\n  /tts off\n  /tts say\n  /tts winrt\n  /tts kokoro-local\n  /tts kokoro-remote",
+                "TTS: <code>{}</code>\n\nPick one with:\n{options}",
                 escape_html(current_label),
             );
             Response::Text(msg)
@@ -224,12 +237,11 @@ fn handle_tts_command(ctx: &HandlerContext, v: &handler::TtsVerb) -> Response {
 /// also probes + writes `ORT_DYLIB_PATH` (ort's dyld search misses /opt/homebrew/lib).
 fn switch_tts_backend(ctx: &HandlerContext, value: &str) -> Response {
     let Some(env_path) = ctx.env_file_path.as_ref() else {
-        return Response::Text(
+        return Response::Text(format!(
             "Can't switch TTS at runtime: BRIDGE_ENV_FILE isn't set. \
-             Set it in the service environment (Task Scheduler, systemd, or launchd) \
-             and restart tebis."
-                .to_string(),
-        );
+             Set it in the service environment ({}) and restart tebis.",
+            platform_service_name(),
+        ));
     };
 
     if value == "kokoro-remote"
@@ -364,7 +376,7 @@ fn validate_remote_tts_env(env_path: &Path) -> Result<(), String> {
         })?;
         if !(1..=300).contains(&timeout_sec) {
             return Err("Can't switch to <code>kokoro-remote</code>: \
-                 <code>TELEGRAM_TTS_REMOTE_TIMEOUT_SEC</code> must be 1..=300."
+                 <code>TELEGRAM_TTS_REMOTE_TIMEOUT_SEC</code> must be between 1 and 300."
                 .to_string());
         }
     }
@@ -565,6 +577,17 @@ fn strip_html_for_tts(body: &str) -> String {
 
 const AMP_SENTINEL: char = '\u{0001}';
 
+fn platform_service_name() -> &'static str {
+    #[cfg(target_os = "macos")]
+    { "launchd" }
+    #[cfg(target_os = "linux")]
+    { "systemd" }
+    #[cfg(target_os = "windows")]
+    { "Task Scheduler" }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    { "your OS service manager" }
+}
+
 const HOOK_TYPING_CAP: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[cfg(test)]
@@ -738,7 +761,7 @@ mod tts_switch_tests {
              TELEGRAM_TTS_REMOTE_TIMEOUT_SEC=301\n",
         );
         let err = validate_remote_tts_env(&path).unwrap_err();
-        assert!(err.contains("1..=300"));
+        assert!(err.contains("between 1 and 300"));
         cleanup(&path);
     }
 

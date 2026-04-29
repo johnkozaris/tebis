@@ -209,6 +209,13 @@ form.inline { display: inline; margin: 0; }
 .settings-submit { background: var(--surface-2); padding: 0.875rem 1.125rem; }
 .settings-submit .desc { font-size: var(--text-small); color: var(--text-2); }
 
+/* FLASH */
+.flash {
+  padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1.5rem;
+  background: var(--ok-bg); color: var(--ok); font-weight: 500; font-size: var(--text-small);
+  border: 1px solid color-mix(in srgb, var(--ok) 30%, transparent);
+}
+
 /* FOOTER */
 footer {
   margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid var(--border);

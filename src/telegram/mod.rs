@@ -467,9 +467,12 @@ impl TelegramClient {
         })?;
         let body_bytes = Bytes::from(body_bytes);
 
-        let mut backoff = Duration::from_secs(1);
+        const MAX_RATE_LIMIT_HITS: usize = 10;
         // Wall-clock cap so retries can't starve the handler semaphore permit.
         const TOTAL_RETRY_BUDGET: Duration = Duration::from_mins(3);
+
+        let mut backoff = Duration::from_secs(1);
+        let mut rate_limit_hits: usize = 0;
         let start = std::time::Instant::now();
 
         for attempt in 0..=MAX_RETRIES {
@@ -531,6 +534,14 @@ impl TelegramClient {
             }
 
             if status.as_u16() == 429 {
+                rate_limit_hits += 1;
+                if rate_limit_hits > MAX_RATE_LIMIT_HITS {
+                    return Err(TelegramError::Network {
+                        method: method.into(),
+                        description: format!("exceeded {MAX_RATE_LIMIT_HITS} consecutive 429 rate limits"),
+                        retryable: false,
+                    });
+                }
                 // Cap server-provided `retry_after` so a malformed value can't stall for days.
                 const MAX_RETRY_AFTER_SECS: u64 = 300;
                 let retry_after = api_response
@@ -538,7 +549,7 @@ impl TelegramClient {
                     .and_then(|p| p.retry_after)
                     .unwrap_or(10)
                     .min(MAX_RETRY_AFTER_SECS);
-                tracing::warn!(retry_after, "{method}: rate limited");
+                tracing::warn!(retry_after, hits = rate_limit_hits, "{method}: rate limited");
                 tokio::time::sleep(Duration::from_secs(retry_after)).await;
                 continue;
             }

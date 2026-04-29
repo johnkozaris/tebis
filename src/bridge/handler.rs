@@ -30,6 +30,8 @@ pub enum Command {
     Status,
     Restart,
     Help,
+    /// Targeted usage hint when a command is missing a required argument.
+    UsageHint(&'static str),
     /// TTS backend selection — routed through `bridge::handle_update` (not `execute`)
     /// because env-file writes + graceful restart need `HandlerContext`, not `Deps`.
     Tts(TtsVerb),
@@ -103,6 +105,7 @@ pub fn parse(text: &str) -> Command {
             let msg = rest[space_pos..].trim().to_string();
             return Command::Send { session, text: msg };
         }
+        return Command::UsageHint("/send &lt;session&gt; &lt;text&gt; — missing message text.");
     }
 
     if let Some(rest) = text
@@ -111,7 +114,17 @@ pub fn parse(text: &str) -> Command {
     {
         let parts: Vec<&str> = rest.split_whitespace().collect();
         let session = parts.first().map(|s| normalize_session_arg(s));
-        let lines = parts.get(1).and_then(|s| s.parse().ok());
+        let lines = match parts.get(1) {
+            Some(s) => match s.parse::<usize>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    return Command::UsageHint(
+                        "/read [session] [lines] — line count must be a number.",
+                    );
+                }
+            },
+            None => None,
+        };
         return Command::Read { session, lines };
     }
 
@@ -120,6 +133,7 @@ pub fn parse(text: &str) -> Command {
         if !session.is_empty() {
             return Command::Target { session };
         }
+        return Command::UsageHint("/target &lt;session&gt; — missing session name.");
     }
 
     if let Some(rest) = strip_cmd(text, "/new") {
@@ -127,6 +141,7 @@ pub fn parse(text: &str) -> Command {
         if !session.is_empty() {
             return Command::New { session };
         }
+        return Command::UsageHint("/new &lt;session&gt; — missing session name.");
     }
 
     if let Some(rest) = strip_cmd(text, "/kill") {
@@ -134,6 +149,7 @@ pub fn parse(text: &str) -> Command {
         if !session.is_empty() {
             return Command::Kill { session };
         }
+        return Command::UsageHint("/kill &lt;session&gt; — missing session name.");
     }
 
     // `/tts` — backend picker. `/tts` alone (or `/tts status`) reports;
@@ -182,6 +198,7 @@ async fn handle(cmd: Command, deps: &Deps<'_>) -> HandleResult {
         Command::Status => Ok(Response::Text(status(deps))),
         Command::Restart => restart(deps).await,
         Command::Help => Ok(Response::Text(help_text(deps.session.autostart_session()))),
+        Command::UsageHint(msg) => Ok(Response::Text(msg.to_string())),
         // `/tts` is intercepted in `bridge::handle_update` — needs env-file
         // path + shutdown token from `HandlerContext`, not `Deps`.
         Command::Tts(_) => Ok(Response::Text(
@@ -458,6 +475,7 @@ mod tests {
             Command::Status => "status",
             Command::Restart => "restart",
             Command::Help => "help",
+            Command::UsageHint(_) => "usage_hint",
             Command::Tts(_) => "tts",
             Command::PlainText(_) => "plain",
         }
@@ -496,8 +514,8 @@ mod tests {
     }
 
     #[test]
-    fn send_without_text_falls_through_to_help() {
-        assert_eq!(kind(&parse("/send mysession")), "help");
+    fn send_without_text_gives_usage_hint() {
+        assert_eq!(kind(&parse("/send mysession")), "usage_hint");
     }
 
     #[test]
@@ -561,6 +579,8 @@ mod tests {
             Command::Target { session } => assert_eq!(session, "sess"),
             c => panic!("{}", kind(&c)),
         }
+        // Both bare `/target` and `/target ` trim to `/target`; strip_cmd
+        // requires whitespace-then-arg, so both fall through to generic help.
         assert_eq!(kind(&parse("/target")), "help");
         assert_eq!(kind(&parse("/target ")), "help");
     }
@@ -577,6 +597,11 @@ mod tests {
         }
         assert_eq!(kind(&parse("/new")), "help");
         assert_eq!(kind(&parse("/kill")), "help");
+    }
+
+    #[test]
+    fn read_invalid_line_count_gives_usage_hint() {
+        assert_eq!(kind(&parse("/read sess abc")), "usage_hint");
     }
 
     #[test]

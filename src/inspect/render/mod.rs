@@ -16,12 +16,14 @@ use crate::sanitize;
     clippy::too_many_lines,
     reason = "one HTML template; splitting fragments the layout"
 )]
-pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext) -> String {
+pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext, query: &str) -> String {
     let live_sessions = live.cached_live_sessions().await;
     let allowlist: HashSet<_> = snapshot.allowed_sessions.iter().cloned().collect();
     let default_target = live.session.target();
     let permissive = snapshot.allowed_sessions.is_empty();
 
+    let confirm_kill_all = query.split('&').any(|kv| kv == "confirm_kill_all=1");
+    let show_saved = query.split('&').any(|kv| kv == "saved=1");
     let meta = build_meta(snapshot, live);
     let sessions_table = sessions_table::build_sessions_table(
         &live_sessions,
@@ -42,6 +44,26 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext) -> String {
         |s| format!("<code>{}</code>", sanitize::escape_html(s)),
     );
 
+    let kill_all_button = if confirm_kill_all {
+        r#"
+      <form method="POST" action="/actions/kill-all-sessions">
+        <input type="hidden" name="confirm" value="1">
+        <button type="submit" class="btn btn-danger">Confirm kill all</button>
+        <a href="/" style="margin-left:0.5em">cancel</a>
+      </form>"#
+    } else {
+        r#"
+      <form method="POST" action="/actions/kill-all-sessions">
+        <button type="submit" class="btn btn-danger">Kill all</button>
+      </form>"#
+    };
+
+    let flash_banner = if show_saved {
+        r#"<div class="flash">Settings saved. Bridge is restarting.</div>"#
+    } else {
+        ""
+    };
+
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -53,7 +75,7 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext) -> String {
 <style>{css}</style>
 </head>
 <body>
-
+{flash_banner}
 <header class="page-head">
   <div class="{dot_class}" aria-hidden="true"></div>
   <div>
@@ -134,10 +156,7 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext) -> String {
       <div class="label">
         <div class="title">Kill all allowlisted sessions</div>
         <div class="desc">Idempotent. Drops the default target so the next plain-text re-provisions.</div>
-      </div>
-      <form method="POST" action="/actions/kill-all-sessions">
-        <button type="submit" class="btn btn-danger">Kill all</button>
-      </form>
+      </div>{kill_all_button}
     </div>
     <div class="danger-row">
       <div class="label">

@@ -51,9 +51,13 @@ pub fn sanitize_tmux_output(output: &str, max_chars: usize) -> String {
     }
 
     let truncated = &clean[..clean.floor_char_boundary(max_chars)];
+    let omitted = clean.len() - truncated.len();
     truncated.rfind('\n').map_or_else(
-        || format!("{truncated}\n... (truncated)"),
-        |pos| format!("{}\n... (truncated)", &truncated[..pos]),
+        || format!("{truncated}\n... (truncated, {omitted} chars omitted)"),
+        |pos| {
+            let omitted = clean.len() - pos;
+            format!("{}\n... (truncated, {omitted} chars omitted)", &truncated[..pos])
+        },
     )
 }
 
@@ -130,13 +134,14 @@ pub(crate) fn redact_hyper_error_string(s: &str, should_redact: impl Fn(&str) ->
 /// Cut avoids landing inside `&amp;`-style entities and prefers the last newline.
 pub fn wrap_and_truncate(escaped_body: &str, open: &str, close: &str) -> String {
     const MAX_MSG: usize = 4000;
-    const TRUNC_SUFFIX: &str = "\n... (truncated)";
+    // Reserve space for suffix; exact length adjusted after we know `omitted`.
+    const TRUNC_TEMPLATE: &str = "\n... (truncated, 00000 chars omitted)";
     let overhead = open.len() + close.len();
     if escaped_body.len() + overhead <= MAX_MSG {
         return format!("{open}{escaped_body}{close}");
     }
 
-    let target = MAX_MSG.saturating_sub(overhead + TRUNC_SUFFIX.len());
+    let target = MAX_MSG.saturating_sub(overhead + TRUNC_TEMPLATE.len());
     let mut cut = escaped_body.floor_char_boundary(target);
 
     // Longest entity `escape_html` emits is `&quot;` (6). Bump if you add a longer one.
@@ -152,7 +157,8 @@ pub fn wrap_and_truncate(escaped_body: &str, open: &str, close: &str) -> String 
         cut = nl;
     }
 
-    format!("{open}{}{TRUNC_SUFFIX}{close}", &escaped_body[..cut])
+    let omitted = escaped_body.len() - cut;
+    format!("{open}{}\n... (truncated, {omitted} chars omitted){close}", &escaped_body[..cut])
 }
 
 #[cfg(test)]
@@ -255,7 +261,7 @@ mod tests {
         assert!(wrapped.len() <= 4000, "len was {}", wrapped.len());
         assert!(wrapped.starts_with("<pre>"));
         assert!(wrapped.ends_with("</pre>"));
-        assert!(wrapped.contains("... (truncated)"));
+        assert!(wrapped.contains("truncated"));
     }
 
     #[test]

@@ -68,8 +68,8 @@ impl Config {
         for name in &allowed_sessions {
             if !is_valid_session_name(name) {
                 bail!(
-                    "TELEGRAM_ALLOWED_SESSIONS contains invalid name {name:?} — \
-                     only [A-Za-z0-9._-], 1..=64 chars allowed"
+                    "TELEGRAM_ALLOWED_SESSIONS contains invalid name '{name}' — \
+                     only [A-Za-z0-9._-], 1 to 64 chars allowed"
                 );
             }
         }
@@ -79,7 +79,7 @@ impl Config {
             .parse()
             .context("TELEGRAM_POLL_TIMEOUT must be a valid integer")?;
         if !(1..=900).contains(&poll_timeout) {
-            bail!("TELEGRAM_POLL_TIMEOUT must be 1..=900 (0 busy-loops)");
+            bail!("TELEGRAM_POLL_TIMEOUT must be between 1 and 900 (0 busy-loops)");
         }
 
         let max_output_chars: usize = env::var("TELEGRAM_MAX_OUTPUT_CHARS")
@@ -87,7 +87,7 @@ impl Config {
             .parse()
             .context("TELEGRAM_MAX_OUTPUT_CHARS must be a valid integer")?;
         if !(100..=20_000).contains(&max_output_chars) {
-            bail!("TELEGRAM_MAX_OUTPUT_CHARS must be 100..=20000");
+            bail!("TELEGRAM_MAX_OUTPUT_CHARS must be between 100 and 20000");
         }
 
         let submit_gap_ms: u32 = env::var("TELEGRAM_SUBMIT_GAP_MS")
@@ -95,7 +95,7 @@ impl Config {
             .parse()
             .context("TELEGRAM_SUBMIT_GAP_MS must be a valid integer")?;
         if !(50..=5000).contains(&submit_gap_ms) {
-            bail!("TELEGRAM_SUBMIT_GAP_MS must be 50..=5000");
+            bail!("TELEGRAM_SUBMIT_GAP_MS must be between 50 and 5000");
         }
 
         let notify = load_notify_config(allowed_user_id)?;
@@ -243,7 +243,7 @@ fn load_tts_config() -> Result<Option<TtsConfig>> {
                 .parse()
                 .context("TELEGRAM_TTS_REMOTE_TIMEOUT_SEC must be a positive integer")?;
             if !(1..=300).contains(&timeout_sec) {
-                bail!("TELEGRAM_TTS_REMOTE_TIMEOUT_SEC must be 1..=300");
+                bail!("TELEGRAM_TTS_REMOTE_TIMEOUT_SEC must be between 1 and 300");
             }
             TtsBackendConfig::Remote {
                 url: url.trim().to_string(),
@@ -255,7 +255,7 @@ fn load_tts_config() -> Result<Option<TtsConfig>> {
         }
         other => bail!(
             "TELEGRAM_TTS_BACKEND must be one of: \
-             say, winrt, kokoro-local, kokoro-remote, none (got {other:?})"
+             say, winrt, kokoro-local, kokoro-remote, none (got '{other}')"
         ),
     };
 
@@ -283,7 +283,7 @@ fn load_stt_config() -> Result<Option<SttConfig>> {
         .parse()
         .context("TELEGRAM_STT_MAX_DURATION_SEC must be a positive integer")?;
     if !(1..=900).contains(&max_duration_sec) {
-        bail!("TELEGRAM_STT_MAX_DURATION_SEC must be 1..=900");
+        bail!("TELEGRAM_STT_MAX_DURATION_SEC must be between 1 and 900");
     }
 
     let max_bytes: u32 = env::var("TELEGRAM_STT_MAX_BYTES")
@@ -291,7 +291,7 @@ fn load_stt_config() -> Result<Option<SttConfig>> {
         .parse()
         .context("TELEGRAM_STT_MAX_BYTES must be a non-negative integer")?;
     if !(65_536..=52_428_800).contains(&max_bytes) {
-        bail!("TELEGRAM_STT_MAX_BYTES must be 65536..=52428800 (64 KiB .. 50 MiB)");
+        bail!("TELEGRAM_STT_MAX_BYTES must be between 65536 and 52428800 (64 KiB to 50 MiB)");
     }
 
     let threads: u32 = match env::var("TELEGRAM_STT_THREADS")
@@ -306,7 +306,7 @@ fn load_stt_config() -> Result<Option<SttConfig>> {
             .context("TELEGRAM_STT_THREADS must be 'auto' or a positive integer")?,
     };
     if !(1..=32).contains(&threads) {
-        bail!("TELEGRAM_STT_THREADS must be 1..=32");
+        bail!("TELEGRAM_STT_THREADS must be between 1 and 32");
     }
 
     Ok(Some(SttConfig {
@@ -351,13 +351,13 @@ fn load_autostart_config(allowed_sessions: &[String]) -> Result<Option<Autostart
         {
             if !is_valid_session_name(&session) {
                 bail!(
-                    "TELEGRAM_AUTOSTART_SESSION {session:?} is invalid — \
-                     only [A-Za-z0-9._-], 1..=64 chars allowed"
+                    "TELEGRAM_AUTOSTART_SESSION '{session}' is invalid — \
+                     only [A-Za-z0-9._-], 1 to 64 chars allowed"
                 );
             }
             if !allowed_sessions.is_empty() && !allowed_sessions.iter().any(|s| s == &session) {
                 bail!(
-                    "TELEGRAM_AUTOSTART_SESSION {session:?} must be in TELEGRAM_ALLOWED_SESSIONS"
+                    "TELEGRAM_AUTOSTART_SESSION '{session}' must be in TELEGRAM_ALLOWED_SESSIONS"
                 );
             }
             reject_control_chars(&dir, "TELEGRAM_AUTOSTART_DIR")?;
@@ -365,12 +365,20 @@ fn load_autostart_config(allowed_sessions: &[String]) -> Result<Option<Autostart
             // Fail-fast so the first plain-text message doesn't hit an
             // opaque "can't cd" error deep inside multiplexer spawn.
             if !std::path::Path::new(&dir).is_dir() {
-                bail!("TELEGRAM_AUTOSTART_DIR {dir:?} does not exist or is not a directory");
+                bail!("TELEGRAM_AUTOSTART_DIR '{dir}' does not exist or is not a directory");
+            }
+            let tui_boot_delay_ms: u64 = env::var("TELEGRAM_TUI_BOOT_DELAY_MS")
+                .unwrap_or_else(|_| "3000".to_string())
+                .parse()
+                .context("TELEGRAM_TUI_BOOT_DELAY_MS must be a valid integer")?;
+            if !(0..=30_000).contains(&tui_boot_delay_ms) {
+                bail!("TELEGRAM_TUI_BOOT_DELAY_MS must be between 0 and 30000");
             }
             Ok(Some(AutostartConfig {
                 session,
                 dir,
                 command,
+                tui_boot_delay: std::time::Duration::from_millis(tui_boot_delay_ms),
             }))
         }
         _ => bail!(
@@ -396,7 +404,7 @@ fn reject_control_chars(value: &str, name: &str) -> Result<()> {
 fn ensure_safe_voice_name(voice: &str) -> Result<()> {
     if voice.is_empty() || voice.len() > 64 {
         bail!(
-            "TELEGRAM_TTS_VOICE must be 1..=64 chars (got {})",
+            "TELEGRAM_TTS_VOICE must be 1 to 64 chars (got {})",
             voice.len()
         );
     }
@@ -405,7 +413,7 @@ fn ensure_safe_voice_name(voice: &str) -> Result<()> {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     {
         bail!(
-            "TELEGRAM_TTS_VOICE {voice:?} contains disallowed characters — \
+            "TELEGRAM_TTS_VOICE '{voice}' contains disallowed characters — \
              use [A-Za-z0-9._-] only"
         );
     }

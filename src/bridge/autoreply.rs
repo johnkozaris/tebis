@@ -94,7 +94,13 @@ pub async fn watch_and_forward(
                 return;
             }
         }
-        tokio::time::sleep(cfg.poll_interval).await;
+        tokio::select! {
+            () = tokio::time::sleep(cfg.poll_interval) => {}
+            () = shutdown.cancelled() => {
+                tracing::debug!(session = %session, "autoreply: shutdown during settle — aborting");
+                break;
+            }
+        }
     }
 
     typing.cancel();
