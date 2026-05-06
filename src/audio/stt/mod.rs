@@ -31,9 +31,6 @@ pub enum SttError {
 
     #[error("transcription failed: decoder: {0}")]
     Decoder(String),
-
-    #[error("transcription failed: rate-limited")]
-    RateLimited,
 }
 
 /// AFIT — consistent with `notify::Forwarder`.

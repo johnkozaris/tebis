@@ -1,6 +1,6 @@
 //! Terminal-multiplexer subprocess wrapper. Validates session names,
-//! serializes per-session ops via mutex, classifies errors. Strict or
-//! permissive allowlist.
+//! serializes per-session ops via mutex, classifies errors. Optional
+//! allowlist; empty allowlist → any valid name accepted.
 //!
 //! Both backends — `tmux` on Unix and `psmux` on Windows — share the
 //! tmux-compatible CLI (`new-session`, `send-keys -l`, `capture-pane`,
@@ -10,7 +10,7 @@
 //! already fuzzy-tolerant ("no such session" / "session not found"
 //! already fold into `NotFound`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -95,14 +95,19 @@ pub async fn version() -> String {
 }
 
 pub struct Mux {
-    strict: HashMap<String, Arc<SessionSlot>>,
-    dynamic: std::sync::Mutex<HashMap<String, Arc<SessionSlot>>>,
-    permissive: bool,
-    max_output_chars: usize,
+    /// Some(set) → enforce allowlist; None → any valid name accepted.
+    allowed: Option<HashSet<String>>,
+    /// Per-session slots, populated lazily; the slot mutex serializes
+    /// text+Enter writes for one session.
+    slots: std::sync::Mutex<HashMap<String, Arc<SessionSlot>>>,
     submit_gap: Duration,
+    /// Injected via `new-session -e KEY=VALUE` so hook scripts inside
+    /// the session see tebis's `NOTIFY_SOCKET_PATH` even when the
+    /// tmux server was started with a stale environment.
+    new_session_env: Vec<(String, String)>,
 }
 
-/// Invariant 13: tmux needs `=NAME:0` for exact pane targets. psmux treats `=`
+/// tmux needs `=NAME:0` for exact pane targets. psmux treats `=`
 /// literally, so Windows uses `NAME:0`; psmux target matching is exact.
 struct SessionSlot {
     exact_target: String,
@@ -157,39 +162,34 @@ impl MuxError {
 pub type Result<T> = std::result::Result<T, MuxError>;
 
 impl Mux {
-    /// Empty `allowed` → permissive mode.
-    pub fn new(allowed: Vec<String>, max_output_chars: usize, submit_gap: Duration) -> Self {
-        let permissive = allowed.is_empty();
-        let strict = allowed
-            .into_iter()
-            .map(|name| {
-                let exact_target = exact_target_for(&name);
-                (
-                    name,
-                    Arc::new(SessionSlot {
-                        exact_target,
-                        lock: Mutex::new(()),
-                    }),
-                )
-            })
-            .collect();
+    /// Empty `allowed` → any valid session name accepted.
+    pub fn new(allowed: Vec<String>, submit_gap: Duration) -> Self {
+        Self::with_env(allowed, submit_gap, Vec::new())
+    }
+
+    /// Like `new`, but also injects `extra_env` as `-e KEY=VALUE` on
+    /// every `new-session` (used to propagate `NOTIFY_SOCKET_PATH`).
+    pub fn with_env(
+        allowed: Vec<String>,
+        submit_gap: Duration,
+        extra_env: Vec<(String, String)>,
+    ) -> Self {
+        let allowed = if allowed.is_empty() {
+            None
+        } else {
+            Some(allowed.into_iter().collect::<HashSet<_>>())
+        };
         Self {
-            strict,
-            dynamic: std::sync::Mutex::new(HashMap::new()),
-            permissive,
-            max_output_chars,
+            allowed,
+            slots: std::sync::Mutex::new(HashMap::new()),
             submit_gap,
+            new_session_env: extra_env,
         }
     }
 
     #[must_use]
     pub const fn is_permissive(&self) -> bool {
-        self.permissive
-    }
-
-    #[must_use]
-    pub fn dynamic_slot_count(&self) -> usize {
-        self.dynamic.lock().map_or(0, |g| g.len())
+        self.allowed.is_none()
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<String>> {
@@ -215,8 +215,8 @@ impl Mux {
         Ok(sessions)
     }
 
-    /// Text → sleep → Enter, atomic under the per-session lock (CLAUDE.md
-    /// invariant 3: cancellation mid-sequence strands chars without Enter).
+    /// Text → sleep → Enter, atomic under the per-session lock — cancellation
+    /// mid-sequence would otherwise strand chars without the trailing Enter.
     pub async fn send_keys(&self, session: &str, text: &str) -> Result<()> {
         let slot = self.slot(session)?;
         let _guard = slot.lock.lock().await;
@@ -235,7 +235,7 @@ impl Mux {
 
         tokio::time::sleep(self.submit_gap).await;
 
-        // Invariant 3 second call: send Enter. tmux accepts `-H 0d`
+        // Atomic-pair second call: send Enter. tmux accepts `-H 0d`
         // (literal CR as hex). psmux has no `-H` flag; the only Enter
         // path is the tmux key-name syntax passed as its own argv
         // entry — which is fine because each call is a separate spawn
@@ -267,9 +267,21 @@ impl Mux {
         let slot = self.slot(session)?;
         let _guard = slot.lock.lock().await;
 
-        // `-s` takes a bare NAME, not a target — passing `=name` would
-        // literally create a session named `=name`. Only `-t` gets the `=` prefix.
-        let mut args: Vec<&str> = vec!["new-session", "-d", "-s", session];
+        // Materialize KEY=VALUE strings so the &str slices in argv outlive the spawn.
+        let env_pairs: Vec<String> = self
+            .new_session_env
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+
+        // `-s` takes a bare NAME (not a target); only `-t` gets the `=` prefix.
+        let mut args: Vec<&str> = vec!["new-session", "-d"];
+        for pair in &env_pairs {
+            args.push("-e");
+            args.push(pair);
+        }
+        args.push("-s");
+        args.push(session);
         if let Some(d) = dir {
             args.push("-c");
             args.push(d);
@@ -295,79 +307,47 @@ impl Mux {
         }
     }
 
-    pub async fn capture_pane(&self, session: &str, lines: usize) -> Result<String> {
-        let slot = self.slot(session)?;
-        let _guard = slot.lock.lock().await;
-
-        let start_line = format!("-{lines}");
-        let output = run_mux(
-            "capture-pane",
-            &[
-                "capture-pane",
-                "-t",
-                &slot.exact_target,
-                "-p",
-                "-J",
-                "-S",
-                &start_line,
-            ],
-        )
-        .await?;
-        classify_status(&output, "capture-pane", session)?;
-
-        let raw = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(sanitize::sanitize_tmux_output(&raw, self.max_output_chars))
-    }
-
     pub fn validate_session(&self, session: &str) -> Result<()> {
         self.slot(session).map(|_| ())
     }
 
+    /// Sorted snapshot of the allowlist. Empty in permissive mode.
     pub fn allowlisted_sessions(&self) -> Vec<String> {
-        self.strict.keys().cloned().collect()
+        self.allowed.as_ref().map_or_else(Vec::new, |set| {
+            let mut v: Vec<String> = set.iter().cloned().collect();
+            v.sort();
+            v
+        })
     }
-
-    /// In-flight ops hold their own `Arc` clone; clearing only affects new lookups.
-    const DYNAMIC_SOFT_CAP: usize = 256;
 
     fn slot(&self, session: &str) -> Result<Arc<SessionSlot>> {
         if !is_valid_session_name(session) {
             return Err(MuxError::InvalidName);
         }
-        if let Some(slot) = self.strict.get(session) {
-            return Ok(slot.clone());
-        }
-        if !self.permissive {
-            let allowed = self.strict.keys().cloned().collect::<Vec<_>>().join(", ");
+        if let Some(allowed) = &self.allowed
+            && !allowed.contains(session)
+        {
+            let mut keys: Vec<String> = allowed.iter().cloned().collect();
+            keys.sort();
             return Err(MuxError::NotAllowed {
                 session: session.to_string(),
-                allowed,
+                allowed: keys.join(", "),
             });
         }
-        let fresh = {
-            let mut map = self.dynamic.lock().expect("dynamic slots poisoned");
-            if let Some(slot) = map.get(session) {
-                return Ok(slot.clone());
-            }
-            if map.len() >= Self::DYNAMIC_SOFT_CAP {
-                tracing::debug!(
-                    evicted = map.len(),
-                    "dynamic slot map hit soft cap, clearing"
-                );
-                map.clear();
-            }
-            let fresh = Arc::new(SessionSlot {
-                exact_target: exact_target_for(session),
-                lock: Mutex::new(()),
-            });
-            map.insert(session.to_string(), fresh.clone());
-            fresh
-        };
+        let mut map = self.slots.lock().expect("session slots poisoned");
+        if let Some(slot) = map.get(session) {
+            return Ok(slot.clone());
+        }
+        let fresh = Arc::new(SessionSlot {
+            exact_target: exact_target_for(session),
+            lock: Mutex::new(()),
+        });
+        map.insert(session.to_string(), fresh.clone());
         Ok(fresh)
     }
 }
 
-/// Shell-metachar / path-traversal defense. Invariant 2.
+/// Shell-metachar / path-traversal defense.
 #[must_use]
 pub fn is_valid_session_name(name: &str) -> bool {
     !name.is_empty()
@@ -392,7 +372,7 @@ fn classify_status(output: &std::process::Output, op: &'static str, session: &st
         || stderr_lc.contains("no such session")
         // psmux's send-keys / capture-pane phrase NotFound as
         // "psmux: no server running on session 'X'". Fold it here so
-        // invariant-15 stale-target recovery fires on Windows too.
+        // stale-target recovery fires on Windows too.
         || stderr_lc.contains("no server running on")
     {
         return Err(MuxError::NotFound(session.to_string()));
@@ -548,7 +528,7 @@ mod tests {
 
     #[test]
     fn strict_mode_rejects_unknown_names() {
-        let t = Mux::new(vec!["allowed".into()], 4000, TEST_GAP);
+        let t = Mux::new(vec!["allowed".into()], TEST_GAP);
         assert!(!t.is_permissive());
         assert!(matches!(t.validate_session("allowed"), Ok(()),));
         assert!(matches!(
@@ -559,7 +539,7 @@ mod tests {
 
     #[test]
     fn permissive_mode_accepts_any_valid_name() {
-        let t = Mux::new(Vec::new(), 4000, TEST_GAP);
+        let t = Mux::new(Vec::new(), TEST_GAP);
         assert!(t.is_permissive());
         // Regex still enforced.
         assert!(matches!(t.validate_session(""), Err(MuxError::InvalidName),));
@@ -576,23 +556,11 @@ mod tests {
     fn permissive_mode_caches_slots() {
         // Same name → same `Arc<SessionSlot>`, so the per-session mutex
         // is stable across calls (two concurrent sends on the same
-        // session can actually serialize).
-        let t = Mux::new(Vec::new(), 4000, TEST_GAP);
+        // session actually serialize).
+        let t = Mux::new(Vec::new(), TEST_GAP);
         let a = t.slot("sess").unwrap();
         let b = t.slot("sess").unwrap();
         assert!(Arc::ptr_eq(&a, &b));
-    }
-
-    #[test]
-    fn dynamic_slot_map_evicts_on_soft_cap() {
-        let t = Mux::new(Vec::new(), 4000, TEST_GAP);
-        for i in 0..Mux::DYNAMIC_SOFT_CAP {
-            t.slot(&format!("s{i}")).unwrap();
-        }
-        assert_eq!(t.dynamic_slot_count(), Mux::DYNAMIC_SOFT_CAP);
-        // Next insert triggers eviction + re-insert of just the new name.
-        t.slot("overflow").unwrap();
-        assert_eq!(t.dynamic_slot_count(), 1);
     }
 }
 

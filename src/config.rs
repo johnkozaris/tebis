@@ -2,31 +2,28 @@
 //! just maps env vars onto them.
 
 use anyhow::{Context, Result, bail};
-use secrecy::{ExposeSecret, SecretString};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::agent_hooks::HooksMode;
 use crate::audio::AudioConfig;
 use crate::audio::stt::SttConfig;
 use crate::audio::tts::{BackendConfig as TtsBackendConfig, TtsConfig};
-use crate::bridge::autoreply::AutoreplyConfig;
 use crate::bridge::session::AutostartConfig;
 use crate::env_file;
 use crate::notify::NotifyConfig;
 use crate::platform::multiplexer::is_valid_session_name;
 
 pub struct Config {
-    pub bot_token: SecretString,
+    pub bot_token: Arc<str>,
     pub allowed_user_id: i64,
     pub allowed_sessions: Vec<String>,
     pub poll_timeout: u32,
-    pub max_output_chars: usize,
     pub submit_gap_ms: u32,
     pub notify: Option<NotifyConfig>,
     pub autostart: Option<AutostartConfig>,
-    pub autoreply: Option<AutoreplyConfig>,
     pub hooks_mode: HooksMode,
     pub audio: AudioConfig,
 }
@@ -40,13 +37,13 @@ fn parse_toggle_env(key: &str, default: bool) -> Result<bool> {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let bot_token: SecretString = env::var("TELEGRAM_BOT_TOKEN")
-            .context("TELEGRAM_BOT_TOKEN env var not set")?
-            .into();
+        let bot_token =
+            env::var("TELEGRAM_BOT_TOKEN").context("TELEGRAM_BOT_TOKEN env var not set")?;
 
-        if bot_token.expose_secret().is_empty() {
+        if bot_token.is_empty() {
             bail!("TELEGRAM_BOT_TOKEN is empty");
         }
+        let bot_token: Arc<str> = Arc::from(bot_token);
 
         let allowed_user_id: i64 = env::var("TELEGRAM_ALLOWED_USER")
             .context("TELEGRAM_ALLOWED_USER env var not set")?
@@ -82,14 +79,6 @@ impl Config {
             bail!("TELEGRAM_POLL_TIMEOUT must be between 1 and 900 (0 busy-loops)");
         }
 
-        let max_output_chars: usize = env::var("TELEGRAM_MAX_OUTPUT_CHARS")
-            .unwrap_or_else(|_| "4000".to_string())
-            .parse()
-            .context("TELEGRAM_MAX_OUTPUT_CHARS must be a valid integer")?;
-        if !(100..=20_000).contains(&max_output_chars) {
-            bail!("TELEGRAM_MAX_OUTPUT_CHARS must be between 100 and 20000");
-        }
-
         let submit_gap_ms: u32 = env::var("TELEGRAM_SUBMIT_GAP_MS")
             .unwrap_or_else(|_| "300".to_string())
             .parse()
@@ -100,7 +89,6 @@ impl Config {
 
         let notify = load_notify_config(allowed_user_id)?;
         let autostart = load_autostart_config(&allowed_sessions)?;
-        let autoreply = load_autoreply_config()?;
         let hooks_mode =
             HooksMode::from_env_str(&env::var("TELEGRAM_HOOKS_MODE").unwrap_or_default())
                 .context("TELEGRAM_HOOKS_MODE")?;
@@ -111,11 +99,9 @@ impl Config {
             allowed_user_id,
             allowed_sessions,
             poll_timeout,
-            max_output_chars,
             submit_gap_ms,
             notify,
             autostart,
-            autoreply,
             hooks_mode,
             audio,
         })
@@ -234,7 +220,7 @@ fn load_tts_config() -> Result<Option<TtsConfig>> {
             let api_key = env::var("TELEGRAM_TTS_REMOTE_API_KEY")
                 .ok()
                 .filter(|s| !s.is_empty())
-                .map(SecretString::from);
+                .map(Arc::<str>::from);
             let model =
                 env::var("TELEGRAM_TTS_REMOTE_MODEL").unwrap_or_else(|_| "kokoro".to_string());
             let voice = env::var("TELEGRAM_TTS_VOICE").unwrap_or_else(|_| "af_sarah".to_string());
@@ -324,17 +310,6 @@ fn default_threads() -> u32 {
     let total = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
     let half = (total / 2).clamp(2, 8);
     u32::try_from(half).unwrap_or(4)
-}
-
-/// Autoreply (pane-settle) is the universal TUI fallback; suppressed per-session when
-/// hooks are installed. Opt out with `TELEGRAM_AUTOREPLY=off` for hook-only replies.
-fn load_autoreply_config() -> Result<Option<AutoreplyConfig>> {
-    let enabled = parse_toggle_env("TELEGRAM_AUTOREPLY", true)?;
-    Ok(if enabled {
-        Some(AutoreplyConfig::default())
-    } else {
-        None
-    })
 }
 
 /// All three env vars must be set together — a partial triple is an error,
@@ -470,7 +445,7 @@ pub unsafe fn load_env_file(path: &Path) -> Result<()> {
         if env::var_os(key).is_some() {
             continue;
         }
-        // SAFETY: invariant forwarded from our `unsafe` signature — caller
+        // SAFETY: precondition forwarded from our `unsafe` signature — caller
         // guarantees no threads are running.
         unsafe {
             env::set_var(key, value);

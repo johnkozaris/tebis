@@ -31,36 +31,6 @@ pub fn sanitize_tmux_input(input: &str) -> String {
     sanitized.trim_end_matches(';').to_string()
 }
 
-/// ANSI strip + manual pass for stray control/bidi codepoints.
-pub fn sanitize_tmux_output(output: &str, max_chars: usize) -> String {
-    let stripped = strip_ansi_escapes::strip_str(output);
-
-    let clean: String = stripped
-        .chars()
-        .filter(|&c| {
-            let cp = c as u32;
-            if is_bidi_or_zero_width(c) {
-                return false;
-            }
-            c == '\n' || c == '\t' || (cp >= 0x20 && cp != 0x7F && !(0x80..=0x9F).contains(&cp))
-        })
-        .collect();
-
-    if clean.len() <= max_chars {
-        return clean;
-    }
-
-    let truncated = &clean[..clean.floor_char_boundary(max_chars)];
-    let omitted = clean.len() - truncated.len();
-    truncated.rfind('\n').map_or_else(
-        || format!("{truncated}\n... (truncated, {omitted} chars omitted)"),
-        |pos| {
-            let omitted = clean.len() - pos;
-            format!("{}\n... (truncated, {omitted} chars omitted)", &truncated[..pos])
-        },
-    )
-}
-
 /// Tag-content escaper for `parse_mode=HTML`. Does NOT escape quotes —
 /// we never emit attribute values.
 pub fn escape_html(text: &str) -> String {
@@ -76,14 +46,12 @@ pub fn escape_html(text: &str) -> String {
     String::from_utf8(out).expect("escape_html only substitutes ASCII — output is valid UTF-8")
 }
 
-// ─── Invariant 6: network-error redaction ────────────────────────────
+// ─── network-error redaction ─────────────────────────────────────────
 //
-// Shared primitives used by every hyper-error logger. Triggers differ by
-// endpoint so each caller passes its own `should_redact` predicate; the
-// scaffold (root-cause walk + "kind: <cause>" format + redacted replacement)
-// is here to prevent drift.
+// Shared primitives used by every network-error logger. Triggers differ by
+// endpoint so each caller passes its own `should_redact` predicate.
 
-/// Invariant 6: true when `s` contains `/bot` + ASCII digit (Telegram Bot API URL shape
+/// True when `s` contains `/bot` + ASCII digit (Telegram Bot API URL shape
 /// `/bot<TOKEN>/method`). Callers pair with host-level `api.telegram.org` check.
 pub(crate) fn contains_bot_token_shape(s: &str) -> bool {
     let bytes = s.as_bytes();
@@ -94,35 +62,8 @@ pub(crate) fn contains_bot_token_shape(s: &str) -> bool {
         .any(|(i, w)| w == needle && bytes.get(i + needle.len()).is_some_and(u8::is_ascii_digit))
 }
 
-/// Render a hyper-util error into a token-safe string. Walks to root cause,
-/// redacts when `should_redact(&raw)` returns true. Invariant 6.
-pub(crate) fn redact_hyper_error(
-    err: &hyper_util::client::legacy::Error,
-    should_redact: impl Fn(&str) -> bool,
-) -> String {
-    const MAX_SOURCE_DEPTH: usize = 16;
-    let mut cur: &dyn std::error::Error = err;
-    for _ in 0..MAX_SOURCE_DEPTH {
-        let Some(next) = cur.source() else { break };
-        cur = next;
-    }
-    let kind = if err.is_connect() {
-        "connect"
-    } else {
-        "request"
-    };
-    let raw = format!("{kind}: {cur}");
-    if should_redact(&raw) {
-        tracing::warn!(
-            "Network error contained sensitive data; replaced with redacted placeholder"
-        );
-        return format!("{kind}: <redacted network error>");
-    }
-    raw
-}
-
-/// String-input variant of [`redact_hyper_error`] for callers whose errors flatten
-/// to `String` before reaching the redaction layer (e.g. `audio::fetch`).
+/// Render a network-error string with sensitive substrings redacted.
+/// `should_redact(&raw)` decides whether to swap the message for a placeholder.
 pub(crate) fn redact_hyper_error_string(s: &str, should_redact: impl Fn(&str) -> bool) -> String {
     if should_redact(s) {
         return "<redacted network error>".to_string();
@@ -158,7 +99,10 @@ pub fn wrap_and_truncate(escaped_body: &str, open: &str, close: &str) -> String 
     }
 
     let omitted = escaped_body.len() - cut;
-    format!("{open}{}\n... (truncated, {omitted} chars omitted){close}", &escaped_body[..cut])
+    format!(
+        "{open}{}\n... (truncated, {omitted} chars omitted){close}",
+        &escaped_body[..cut]
+    )
 }
 
 #[cfg(test)]
@@ -210,28 +154,6 @@ mod tests {
     fn truncates_long_input() {
         let long = "a".repeat(5000);
         assert!(sanitize_tmux_input(&long).len() <= 4096);
-    }
-
-    #[test]
-    fn output_strips_ansi_colors() {
-        let input = "\x1b[31mred text\x1b[0m";
-        let result = sanitize_tmux_output(input, 4000);
-        assert_eq!(result, "red text");
-    }
-
-    #[test]
-    fn output_strips_bidi() {
-        let input = "hello\u{202E}evil";
-        let result = sanitize_tmux_output(input, 4000);
-        assert_eq!(result, "helloevil");
-    }
-
-    #[test]
-    fn output_truncates_at_newline() {
-        let input = "line1\nline2\nline3\nline4";
-        let result = sanitize_tmux_output(input, 15);
-        assert!(result.contains("truncated"));
-        assert!(!result.contains("line4"));
     }
 
     #[test]

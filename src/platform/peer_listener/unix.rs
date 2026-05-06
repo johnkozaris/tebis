@@ -1,4 +1,6 @@
-//! UDS backend. Invariants 9, 10, 11, 17 — see module docs.
+//! UDS backend. Byte cap, newline framing, and three-layer peer auth
+//! (umask → chmod → SO_PEERCRED) all live in the per-connection paths
+//! and the `bind` constructor below.
 
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -19,7 +21,7 @@ impl Listener {
     /// `remove_file` doesn't follow symlinks, and `/tmp`'s sticky bit
     /// blocks clobbering another user's file).
     ///
-    /// Three-layer defense per invariant 17:
+    /// Three-layer defense:
     /// - (a) `umask(0o177)` around bind so the filesystem entry is
     ///   created with mode `0600` at the syscall level.
     /// - (b) Explicit `chmod 0600` after bind (belt-and-suspenders
@@ -92,13 +94,12 @@ impl Drop for Listener {
 mod tests {
     //! Integration tests for the Unix peer-auth path. Exercises the
     //! same `peer_cred` → uid-compare code that the notify listener
-    //! gates every hook connection on (invariant 17c).
+    //! gates every hook connection on.
     //!
-    //! `bind()` flips `libc::umask` process-globally (invariant 17a),
-    //! so these tests serialize on the same mutex the env-mutating
-    //! `agent_hooks` tests use — a parallel `fs::create_dir_all`
-    //! inside the umask window would get mode 0o600 and break that
-    //! test.
+    //! `bind()` flips `libc::umask` process-globally, so these tests
+    //! serialize on the same mutex the env-mutating `agent_hooks`
+    //! tests use — a parallel `fs::create_dir_all` inside the umask
+    //! window would get mode 0o600 and break that test.
 
     use super::*;
     use crate::agent_hooks::test_support::env_lock;
@@ -130,7 +131,7 @@ mod tests {
         assert_eq!(
             meta.permissions().mode() & 0o777,
             0o600,
-            "socket should be mode 0600 (invariant 17b)"
+            "socket should be mode 0600"
         );
         drop(listener);
         assert!(

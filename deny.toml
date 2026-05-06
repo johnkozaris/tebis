@@ -13,7 +13,6 @@ deny = [
   {name = "native-tls"},
   {name = "aws-lc-rs"},
   {name = "aws-lc-sys"},
-  {name = "reqwest"},
 ]
 multiple-versions = "warn"
 wildcards = "deny"

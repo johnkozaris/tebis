@@ -14,10 +14,6 @@ pub enum Command {
         session: String,
         text: String,
     },
-    Read {
-        session: Option<String>,
-        lines: Option<usize>,
-    },
     Target {
         session: String,
     },
@@ -51,15 +47,11 @@ pub enum TtsVerb {
     Unknown(String),
 }
 
-/// `Text`: reply body. `ReactSuccess`: 👍. `Sent`: text delivered to a session; `baseline`
-/// is the pre-send pane capture for diff-based autoreply, routed by `handle_update`.
+/// `Text`: reply body. `ReactSuccess`: 👍. `Sent`: text delivered to a session.
 pub enum Response {
     Text(String),
     ReactSuccess,
-    Sent {
-        session: String,
-        baseline: Option<String>,
-    },
+    Sent { session: String },
 }
 
 pub struct Deps<'a> {
@@ -106,26 +98,6 @@ pub fn parse(text: &str) -> Command {
             return Command::Send { session, text: msg };
         }
         return Command::UsageHint("/send &lt;session&gt; &lt;text&gt; — missing message text.");
-    }
-
-    if let Some(rest) = text
-        .strip_prefix("/read")
-        .filter(|r| r.is_empty() || r.starts_with(' ') || r.starts_with('\t'))
-    {
-        let parts: Vec<&str> = rest.split_whitespace().collect();
-        let session = parts.first().map(|s| normalize_session_arg(s));
-        let lines = match parts.get(1) {
-            Some(s) => match s.parse::<usize>() {
-                Ok(n) => Some(n),
-                Err(_) => {
-                    return Command::UsageHint(
-                        "/read [session] [lines] — line count must be a number.",
-                    );
-                }
-            },
-            None => None,
-        };
-        return Command::Read { session, lines };
     }
 
     if let Some(rest) = strip_cmd(text, "/target") {
@@ -191,7 +163,6 @@ async fn handle(cmd: Command, deps: &Deps<'_>) -> HandleResult {
     match cmd {
         Command::List => list(deps).await,
         Command::Send { session, text } => send(deps, &session, &text).await,
-        Command::Read { session, lines } => read(deps, session, lines).await,
         Command::Target { session } => target(deps, session),
         Command::New { session } => new(deps, &session).await,
         Command::Kill { session } => kill(deps, &session).await,
@@ -239,57 +210,17 @@ async fn list(deps: &Deps<'_>) -> HandleResult {
 }
 
 async fn send(deps: &Deps<'_>, session: &str, text: &str) -> HandleResult {
-    // Pre-send baseline so autoreply can forward only new content.
-    let baseline = match deps.tmux.capture_pane(session, 100).await {
-        Ok(p) => Some(p),
-        Err(e) => {
-            tracing::debug!(
-                err = %e, session,
-                "baseline capture_pane failed — autoreply will fall back to pane tail"
-            );
-            None
-        }
-    };
     match deps.tmux.send_keys(session, text).await {
         Ok(()) => Ok(Response::Sent {
             session: session.to_string(),
-            baseline,
         }),
         Err(e) => {
             if e.is_not_found() {
                 deps.session.clear_target_if(session);
-                deps.session.unmark_hooked(session);
             }
             Err(e.to_string())
         }
     }
-}
-
-async fn read(deps: &Deps<'_>, session: Option<String>, lines: Option<usize>) -> HandleResult {
-    let session = deps
-        .session
-        .resolve_explicit(session)
-        .map_err(|e| e.to_string())?;
-    let lines = lines.unwrap_or(50).min(5_000);
-    let output = match deps.tmux.capture_pane(&session, lines).await {
-        Ok(o) => o,
-        Err(e) => {
-            if e.is_not_found() {
-                deps.session.clear_target_if(&session);
-            }
-            return Err(e.to_string());
-        }
-    };
-    if output.trim().is_empty() {
-        return Ok(Response::Text(format!(
-            "<code>{}</code>: (empty pane)",
-            sanitize::escape_html(&session)
-        )));
-    }
-    let escaped = sanitize::escape_html(&output);
-    Ok(Response::Text(sanitize::wrap_and_truncate(
-        &escaped, "<pre>", "</pre>",
-    )))
 }
 
 fn target(deps: &Deps<'_>, session: String) -> HandleResult {
@@ -311,15 +242,12 @@ async fn new(deps: &Deps<'_>, session: &str) -> HandleResult {
 async fn kill(deps: &Deps<'_>, session: &str) -> HandleResult {
     // Validate + execute first, mutate state only on success. `kill_session`
     // is idempotent (NotFound → Ok), so "already gone" still reaches the
-    // clear + unmark below. Mutating before validation was a no-op for
-    // invalid-name input (both helpers are no-ops on non-matches), but
-    // side-effects-before-check is a fragile pattern.
+    // clear below.
     deps.tmux
         .kill_session(session)
         .await
         .map_err(|e| e.to_string())?;
     deps.session.clear_target_if(session);
-    deps.session.unmark_hooked(session);
     Ok(Response::ReactSuccess)
 }
 
@@ -355,7 +283,6 @@ async fn restart(deps: &Deps<'_>) -> HandleResult {
         .await
         .map_err(|e| e.to_string())?;
     deps.session.clear_target_if(&name);
-    deps.session.unmark_hooked(&name);
     Ok(Response::Text(format!(
         "Killed <code>{}</code>. Next plain-text message will re-provision.",
         sanitize::escape_html(&name)
@@ -365,18 +292,8 @@ async fn restart(deps: &Deps<'_>) -> HandleResult {
 /// Resolve-or-autostart + send; on `NotFound` kill + reprovision + retry once.
 async fn plain_text(deps: &Deps<'_>, text: &str) -> HandleResult {
     let session = resolve_or_autostart_str(deps).await?;
-    let baseline = match deps.tmux.capture_pane(&session, 100).await {
-        Ok(p) => Some(p),
-        Err(e) => {
-            tracing::debug!(
-                err = %e, session,
-                "plain_text baseline capture failed — autoreply will fall back to pane tail"
-            );
-            None
-        }
-    };
     match deps.tmux.send_keys(&session, text).await {
-        Ok(()) => Ok(Response::Sent { session, baseline }),
+        Ok(()) => Ok(Response::Sent { session }),
         Err(e) if e.is_not_found() => {
             deps.session.clear_target_if(&session);
             if let Err(kill_err) = deps.tmux.kill_session(&session).await {
@@ -390,10 +307,7 @@ async fn plain_text(deps: &Deps<'_>, text: &str) -> HandleResult {
                 .send_keys(&fresh, text)
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(Response::Sent {
-                session: fresh,
-                baseline: None,
-            })
+            Ok(Response::Sent { session: fresh })
         }
         Err(e) => Err(e.to_string()),
     }
@@ -434,7 +348,6 @@ const HELP_BASE: &str = concat!(
     "/list — list multiplexer sessions (✓ = allowlisted)\n",
     "/status — show bridge state\n",
     "/send &lt;session&gt; &lt;text&gt; — send text to session\n",
-    "/read [session] [lines] — read pane output\n",
     "/target &lt;session&gt; — set default session\n",
     "/new &lt;session&gt; — create an empty detached multiplexer session\n",
     "/kill &lt;session&gt; — kill a multiplexer session\n",
@@ -468,7 +381,6 @@ mod tests {
         match cmd {
             Command::List => "list",
             Command::Send { .. } => "send",
-            Command::Read { .. } => "read",
             Command::Target { .. } => "target",
             Command::New { .. } => "new",
             Command::Kill { .. } => "kill",
@@ -556,24 +468,6 @@ mod tests {
     }
 
     #[test]
-    fn read_accepts_optional_args() {
-        match parse("/read") {
-            Command::Read { session, lines } => {
-                assert!(session.is_none());
-                assert!(lines.is_none());
-            }
-            c => panic!("{}", kind(&c)),
-        }
-        match parse("/read sess 100") {
-            Command::Read { session, lines } => {
-                assert_eq!(session.as_deref(), Some("sess"));
-                assert_eq!(lines, Some(100));
-            }
-            c => panic!("{}", kind(&c)),
-        }
-    }
-
-    #[test]
     fn target_requires_arg() {
         match parse("/target sess") {
             Command::Target { session } => assert_eq!(session, "sess"),
@@ -597,11 +491,6 @@ mod tests {
         }
         assert_eq!(kind(&parse("/new")), "help");
         assert_eq!(kind(&parse("/kill")), "help");
-    }
-
-    #[test]
-    fn read_invalid_line_count_gives_usage_hint() {
-        assert_eq!(kind(&parse("/read sess abc")), "usage_hint");
     }
 
     #[test]
@@ -653,13 +542,6 @@ mod tests {
             Command::Send { session, text } => {
                 assert_eq!(session, "foo");
                 assert_eq!(text, "hi");
-            }
-            c => panic!("{}", kind(&c)),
-        }
-        match parse("/read =foo 10") {
-            Command::Read { session, lines } => {
-                assert_eq!(session.as_deref(), Some("foo"));
-                assert_eq!(lines, Some(10));
             }
             c => panic!("{}", kind(&c)),
         }

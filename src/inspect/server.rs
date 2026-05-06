@@ -153,7 +153,8 @@ async fn handle(
                 return Ok(text_response(StatusCode::FORBIDDEN, "forbidden\n"));
             }
             let name = p.strip_prefix("/actions/kill/").unwrap_or("");
-            // Strict mode: allowlist-gated. Permissive: `kill_session` enforces invariant 2.
+            // Allowlist mode rejects unknown sessions; permissive lets
+            // `kill_session` enforce session-name validation.
             if !live.tmux.is_permissive()
                 && !live.tmux.allowlisted_sessions().iter().any(|s| s == name)
             {
@@ -164,7 +165,6 @@ async fn handle(
             }
             let _ = live.tmux.kill_session(name).await;
             live.session.clear_target_if(name);
-            live.session.unmark_hooked(name);
             tracing::warn!(session = name, "Inspect: killed session");
             Ok(redirect_to("/"))
         }
@@ -188,7 +188,6 @@ async fn kill_all(live: &LiveContext) -> usize {
             killed += 1;
         }
         live.session.clear_target_if(&name);
-        live.session.unmark_hooked(&name);
     }
     killed
 }
@@ -245,7 +244,6 @@ fn parse_config_form(
 ) -> std::result::Result<Vec<(&'static str, String)>, &'static str> {
     let s = std::str::from_utf8(body).map_err(|_| "body is not valid utf-8\n")?;
     let mut poll_timeout: Option<u32> = None;
-    let mut max_output_chars: Option<usize> = None;
     let mut autostart_dir: Option<String> = None;
     for kv in s.split('&') {
         let Some((k, v)) = kv.split_once('=') else {
@@ -258,15 +256,6 @@ fn parse_config_form(
                     return Err("poll_timeout must be 1..=900\n");
                 }
                 poll_timeout = Some(n);
-            }
-            "max_output_chars" => {
-                let n: usize = v
-                    .parse()
-                    .map_err(|_| "max_output_chars must be an integer\n")?;
-                if !(100..=20_000).contains(&n) {
-                    return Err("max_output_chars must be 100..=20000\n");
-                }
-                max_output_chars = Some(n);
             }
             "autostart_dir" => {
                 let decoded = url_decode(v);
@@ -295,9 +284,6 @@ fn parse_config_form(
     let mut out: Vec<(&'static str, String)> = Vec::new();
     if let Some(n) = poll_timeout {
         out.push(("TELEGRAM_POLL_TIMEOUT", n.to_string()));
-    }
-    if let Some(n) = max_output_chars {
-        out.push(("TELEGRAM_MAX_OUTPUT_CHARS", n.to_string()));
     }
     if let Some(d) = autostart_dir {
         out.push(("TELEGRAM_AUTOSTART_DIR", d));
@@ -450,15 +436,11 @@ mod tests {
 
     #[test]
     fn parse_config_form_accepts_valid_numeric_fields() {
-        let out = parse_config_form(b"poll_timeout=45&max_output_chars=5000").unwrap();
-        assert_eq!(out.len(), 2);
+        let out = parse_config_form(b"poll_timeout=45").unwrap();
+        assert_eq!(out.len(), 1);
         assert!(
             out.iter()
                 .any(|(k, v)| *k == "TELEGRAM_POLL_TIMEOUT" && v == "45")
-        );
-        assert!(
-            out.iter()
-                .any(|(k, v)| *k == "TELEGRAM_MAX_OUTPUT_CHARS" && v == "5000")
         );
     }
 
@@ -466,7 +448,6 @@ mod tests {
     fn parse_config_form_rejects_out_of_range() {
         assert!(parse_config_form(b"poll_timeout=0").is_err());
         assert!(parse_config_form(b"poll_timeout=99999").is_err());
-        assert!(parse_config_form(b"max_output_chars=50").is_err());
     }
 
     #[test]

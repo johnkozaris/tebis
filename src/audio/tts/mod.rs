@@ -12,7 +12,7 @@ pub mod kokoro;
 pub mod remote;
 pub mod wav;
 
-use secrecy::SecretString;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct TtsConfig {
@@ -39,7 +39,7 @@ pub enum BackendConfig {
     Remote {
         /// Base URL — client appends `/v1/audio/speech`.
         url: String,
-        api_key: Option<SecretString>,
+        api_key: Option<Arc<str>>,
         model: String,
         voice: String,
         /// 1..=300.

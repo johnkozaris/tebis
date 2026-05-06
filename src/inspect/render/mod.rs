@@ -92,7 +92,7 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext, query: &str) -
     <div class="stat">
       <div class="stat-label">Messages</div>
       <div class="stat-value">{updates_received}</div>
-      <div class="stat-sub">{updates_processed} processed · {rate_limited} rate-limited</div>
+      <div class="stat-sub">{updates_processed} processed</div>
     </div>
     <div class="stat">
       <div class="stat-label">Last message</div>
@@ -104,9 +104,9 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext, query: &str) -
       <div class="stat-sub">{last_response_secondary}</div>
     </div>
     <div class="stat">
-      <div class="stat-label">Handlers in-flight</div>
-      <div class="stat-value">{in_flight} / {max_handlers}</div>
-      <div class="stat-sub">{poll_success} polls ok · {poll_errors} err</div>
+      <div class="stat-label">Polls</div>
+      <div class="stat-value">{poll_success}</div>
+      <div class="stat-sub">{poll_errors} errors · {handler_errors} handler errors</div>
     </div>
   </div>
 </section>
@@ -125,7 +125,6 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext, query: &str) -
     <dt>Multiplexer version</dt><dd><code>{tmux_version}</code></dd>
     <dt>Last successful poll</dt><dd>{last_poll_success_ago}</dd>
     <dt>Handler errors</dt><dd>{handler_errors}</dd>
-    <dt>Live session slots</dt><dd><code>{dynamic_slots}</code></dd>
   </dl></div>
 </section>
 
@@ -134,8 +133,6 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext, query: &str) -
   <p class="section-lede">Read-only snapshot. Edit the env file (or use <em>Settings</em> below) and restart to reload.</p>
   <div class="panel"><dl>
     <dt>Poll timeout</dt><dd><code>{poll_timeout}s</code></dd>
-    <dt>Max output chars</dt><dd><code>{max_output_chars}</code></dd>
-    <dt>Max handlers</dt><dd><code>{max_handlers}</code></dd>
     <dt>Session allowlist</dt><dd>{allowlist_display}</dd>
     {autostart_rows}
     {notify_rows}
@@ -190,23 +187,18 @@ pub(super) async fn html(snapshot: &Snapshot, live: &LiveContext, query: &str) -
             )
         },
         poll_timeout = snapshot.poll_timeout,
-        max_output_chars = snapshot.max_output_chars,
-        max_handlers = snapshot.max_concurrent_handlers,
         dot_class = meta.dot_class,
         status_label = meta.status_label,
         uptime = meta.uptime,
         updates_received = meta.updates_received,
         updates_processed = meta.updates_processed,
-        rate_limited = meta.rate_limited,
         last_update_ago = meta.last_update_ago,
         last_response_primary = meta.last_response_primary,
         last_response_secondary = meta.last_response_secondary,
         last_poll_success_ago = meta.last_poll_success_ago,
         handler_errors = meta.handler_errors,
-        in_flight = meta.in_flight,
         poll_success = meta.poll_success,
         poll_errors = meta.poll_errors,
-        dynamic_slots = meta.dynamic_slots,
     )
 }
 
@@ -216,7 +208,6 @@ struct RenderMeta {
     status_label: &'static str,
     updates_received: u64,
     updates_processed: u64,
-    rate_limited: u64,
     handler_errors: u64,
     poll_success: u64,
     poll_errors: u64,
@@ -224,13 +215,10 @@ struct RenderMeta {
     last_response_primary: String,
     last_response_secondary: String,
     last_poll_success_ago: String,
-    in_flight: usize,
-    dynamic_slots: usize,
 }
 
 fn build_meta(snapshot: &Snapshot, live: &LiveContext) -> RenderMeta {
     let m = &live.metrics;
-    let available = live.handler_sem.available_permits();
     let last_response_raw = m.last_response_at.load(Ordering::Relaxed);
     let last_response_ms = m.last_response_duration_ms.load(Ordering::Relaxed);
     let (last_response_primary, last_response_secondary) = if last_response_raw == 0 {
@@ -258,7 +246,6 @@ fn build_meta(snapshot: &Snapshot, live: &LiveContext) -> RenderMeta {
         status_label,
         updates_received: m.updates_received.load(Ordering::Relaxed),
         updates_processed: m.updates_processed.load(Ordering::Relaxed),
-        rate_limited: m.rate_limited.load(Ordering::Relaxed),
         handler_errors: m.handler_errors.load(Ordering::Relaxed),
         poll_success: m.poll_success.load(Ordering::Relaxed),
         poll_errors: m.poll_errors.load(Ordering::Relaxed),
@@ -266,16 +253,12 @@ fn build_meta(snapshot: &Snapshot, live: &LiveContext) -> RenderMeta {
         last_response_primary,
         last_response_secondary,
         last_poll_success_ago: timefmt::format_ago(m.last_poll_success_at.load(Ordering::Relaxed)),
-        in_flight: snapshot.max_concurrent_handlers.saturating_sub(available),
-        dynamic_slots: live.tmux.dynamic_slot_count(),
     }
 }
 
 pub(super) async fn json(snapshot: &Snapshot, live: &LiveContext) -> String {
     use serde_json::json;
     let default_target = live.session.target();
-    let available = live.handler_sem.available_permits();
-    let in_flight = snapshot.max_concurrent_handlers.saturating_sub(available);
     let live_sessions: Vec<String> = live.cached_live_sessions().await.as_ref().clone();
     let m = &live.metrics;
 
@@ -295,8 +278,6 @@ pub(super) async fn json(snapshot: &Snapshot, live: &LiveContext) -> String {
             "allowed_user_id": snapshot.allowed_user_id,
             "allowed_sessions": snapshot.allowed_sessions,
             "poll_timeout": snapshot.poll_timeout,
-            "max_output_chars": snapshot.max_output_chars,
-            "max_handlers": snapshot.max_concurrent_handlers,
             "autostart": snapshot.autostart.as_ref().map(|a| json!({
                 "session": a.session, "dir": a.dir, "command": a.command,
             })),
@@ -307,14 +288,11 @@ pub(super) async fn json(snapshot: &Snapshot, live: &LiveContext) -> String {
         "runtime": {
             "uptime_secs": live.started_at.elapsed().as_secs(),
             "default_target": default_target,
-            "handlers_in_flight": in_flight,
-            "handlers_available": available,
             "live_sessions": live_sessions,
         },
         "metrics": {
             "updates_received": m.updates_received.load(Ordering::Relaxed),
             "updates_processed": m.updates_processed.load(Ordering::Relaxed),
-            "rate_limited": m.rate_limited.load(Ordering::Relaxed),
             "handler_errors": m.handler_errors.load(Ordering::Relaxed),
             "poll_success": m.poll_success.load(Ordering::Relaxed),
             "poll_errors": m.poll_errors.load(Ordering::Relaxed),

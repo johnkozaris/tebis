@@ -75,7 +75,6 @@ Tebis:
 | `/list` | Lists running terminal sessions |
 | `/status` | Shows the current target and uptime |
 | `/send <session> <text>` | Sends text to a specific session |
-| `/read [session] [lines]` | Reads recent output |
 | `/target <session>` | Makes a session the default target |
 | `/new <session>` | Creates an empty background session |
 | `/kill <session>` | Stops a session |

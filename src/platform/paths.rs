@@ -12,7 +12,6 @@
 //! | `lock_file_path`    | `$XDG_RUNTIME_DIR/tebis.lock` or `/tmp/tebis-$USER.lock` | `/tmp/tebis-$USER.lock` | `%LOCALAPPDATA%\tebis\run\tebis.lock`    |
 //! | `notify_address`    | `$XDG_RUNTIME_DIR/tebis.sock` or `/tmp/tebis-$USER.sock` | `/tmp/tebis-$USER.sock` | `\\.\pipe\tebis-<user>-notify` (pipe name) |
 //! | `models_dir`        | `<data_dir>/models`                              | `<data_dir>/models`             | `<data_dir>\models`                      |
-//! | `hook_manifest_path`| `<data_dir>/installed.json`                      | `<data_dir>/installed.json`     | `<data_dir>\installed.json`              |
 //!
 //! Unix paths preserve the flat layout tebis has always shipped —
 //! `$XDG_RUNTIME_DIR/tebis.sock` / `/tmp/tebis-$USER.sock`, not
@@ -164,11 +163,6 @@ pub fn env_file_path() -> Result<PathBuf> {
 /// `<data_dir>/models` — cached model files (Whisper, future Kokoro).
 pub fn models_dir() -> Result<PathBuf> {
     Ok(data_dir()?.join("models"))
-}
-
-/// `<data_dir>/installed.json` — host-wide hook manifest.
-pub fn hook_manifest_path() -> Result<PathBuf> {
-    Ok(data_dir()?.join("installed.json"))
 }
 
 /// Cross-platform home-dir lookup — honors `HOME` first (POSIX shells,

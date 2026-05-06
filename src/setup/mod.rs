@@ -441,7 +441,7 @@ fn build_env_file(
 }
 
 /// Lines for keys not in the wizard-managed set — preserved so user-added settings
-/// (`TELEGRAM_NOTIFY`, `TELEGRAM_AUTOREPLY`, …) survive re-runs. Comments/blanks dropped.
+/// (`TELEGRAM_NOTIFY`, …) survive re-runs. Comments/blanks dropped.
 fn extra_lines_to_preserve(env_path: &Path) -> Vec<String> {
     let Ok(content) = fs::read_to_string(env_path) else {
         return Vec::new();

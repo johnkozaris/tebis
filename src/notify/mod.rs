@@ -1,7 +1,7 @@
 //! Inbound-notify listener (via `platform::peer_listener` — UDS on Unix,
-//! Named Pipe on Windows) + `Forwarder` sink to Telegram. Invariants
-//! 9–12 apply to both transports; see `platform::peer_listener` for
-//! how each backend realizes the three-layer peer defense.
+//! Named Pipe on Windows) + `Forwarder` sink to Telegram. Both transports
+//! share the byte cap, newline framing, drain plumbing, and tracker-spawn;
+//! see `platform::peer_listener` for the per-OS peer defense.
 
 mod format;
 mod listener;
@@ -13,7 +13,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
+use crate::audio::AudioSubsystem;
+use crate::bridge::typing::TypingRegistry;
+use crate::bridge::voice_pref::VoicePref;
+use crate::metrics::Metrics;
 use crate::telegram::TelegramClient;
 
 pub struct NotifyConfig {
@@ -50,32 +56,65 @@ pub trait Forwarder: Send + Sync + 'static {
 pub struct TelegramForwarder {
     tg: Arc<TelegramClient>,
     chat_id: i64,
-    /// 2 permits cap fan-out under hook storms (Stop + several `SubagentStops`).
-    send_sem: Arc<tokio::sync::Semaphore>,
+    typing: Arc<TypingRegistry>,
+    /// `None` → TTS path skipped entirely.
+    tts: Option<TtsSpawn>,
+}
+
+/// Resources for spawning a detached TTS for hook-delivered replies.
+pub struct TtsSpawn {
+    pub audio: Arc<AudioSubsystem>,
+    pub voice_pref: Arc<VoicePref>,
+    pub metrics: Arc<Metrics>,
+    pub tracker: TaskTracker,
+    pub shutdown: CancellationToken,
 }
 
 impl TelegramForwarder {
-    pub fn new(tg: Arc<TelegramClient>, chat_id: i64) -> Self {
+    pub fn new(
+        tg: Arc<TelegramClient>,
+        chat_id: i64,
+        typing: Arc<TypingRegistry>,
+        tts: Option<TtsSpawn>,
+    ) -> Self {
         Self {
             tg,
             chat_id,
-            send_sem: Arc::new(tokio::sync::Semaphore::new(2)),
+            typing,
+            tts,
         }
     }
 }
 
 impl Forwarder for TelegramForwarder {
     async fn forward(&self, payload: Payload) -> Result<(), ForwardError> {
-        let _permit = self
-            .send_sem
-            .acquire()
-            .await
-            .map_err(|e| ForwardError::Delivery(format!("semaphore closed: {e}")))?;
         let body = format::body(&payload);
+        // Cancel typing first; otherwise the 4 s sendChatAction refresh
+        // can re-fire *after* the reply lands and clients flash "typing…".
+        self.typing.cancel(self.chat_id);
         self.tg
             .send_message(self.chat_id, &body)
             .await
             .map_err(|e| ForwardError::Delivery(e.to_string()))?;
+
+        // Mirror the synchronous `Response::Text` TTS path for hook replies.
+        if let Some(tts) = self.tts.as_ref() {
+            let was_voice = tts.voice_pref.last_was_voice(self.chat_id);
+            if tts.audio.should_tts_reply(was_voice) {
+                let tg = self.tg.clone();
+                let metrics = tts.metrics.clone();
+                let audio = tts.audio.clone();
+                let shutdown = tts.shutdown.clone();
+                let chat_id = self.chat_id;
+                let body_copy = body.clone();
+                tts.tracker.spawn(async move {
+                    crate::bridge::synthesize_and_send_voice_detached(
+                        &tg, &metrics, &audio, &shutdown, chat_id, &body_copy,
+                    )
+                    .await;
+                });
+            }
+        }
         Ok(())
     }
 }

@@ -1,27 +1,26 @@
-//! Per-message behavior: rate-limit → permit → parse → execute → reply.
+//! Per-message behavior: parse → execute → reply.
 
-pub mod autoreply;
 pub mod handler;
 pub mod session;
+mod tts_validation;
 pub mod typing;
+pub mod voice_pref;
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use autoreply::AutoreplyConfig;
 use handler::Response;
 use session::SessionState;
+use typing::TypingRegistry;
+use voice_pref::VoicePref;
 
 use crate::audio::AudioSubsystem;
 use crate::metrics::Metrics;
 use crate::platform::multiplexer::Mux;
 use crate::sanitize;
-use crate::security::RateLimiter;
 use crate::telegram::TelegramClient;
 
 pub enum Payload {
@@ -33,45 +32,40 @@ pub enum Payload {
     },
 }
 
-/// Cap on concurrent handlers — bounds subprocess fan-out on bursts.
-pub const MAX_CONCURRENT_HANDLERS: usize = 8;
-
 pub struct HandlerContext {
     pub tg: Arc<TelegramClient>,
     pub tmux: Arc<Mux>,
     pub session: Arc<SessionState>,
-    pub rate_limiter: Arc<RateLimiter>,
-    pub handler_sem: Arc<Semaphore>,
     pub started_at: Instant,
     pub metrics: Arc<Metrics>,
-    pub autoreply: Option<Arc<AutoreplyConfig>>,
-    /// Invariant 12: every spawn uses this so shutdown drains them.
+    /// Every spawn uses this so shutdown drains them.
     pub tracker: TaskTracker,
     pub shutdown: CancellationToken,
     pub audio: Option<Arc<AudioSubsystem>>,
     /// Required for runtime config writes (`/tts`, inspect Settings).
     pub env_file_path: Option<std::path::PathBuf>,
+    pub typing: Arc<TypingRegistry>,
+    /// Drives TTS for both sync replies and async hook replies.
+    pub voice_pref: Arc<VoicePref>,
 }
 
 pub async fn handle_update(ctx: HandlerContext, chat_id: i64, message_id: i64, payload: Payload) {
     let handler_start = Instant::now();
     ctx.metrics.record_update_received();
 
-    if let Err(retry_after) = ctx.rate_limiter.check(chat_id) {
-        ctx.metrics.record_rate_limited();
-        let secs = retry_after.as_secs().max(1);
-        let reply = sanitize::escape_html(&format!("Rate limited. Try again in {secs}s."));
-        let _ = ctx.tg.send_message(chat_id, &reply).await;
-        return;
-    }
-
-    // Acquire after rate-limit so spam doesn't starve real work.
-    let Ok(_permit) = ctx.handler_sem.acquire().await else {
-        tracing::warn!("handler semaphore closed; dropping update");
-        return;
-    };
+    // Fire typing up-front so every reply path inherits an active animation.
+    // Faster paths (`Response::Text`/`ReactSuccess`) cancel before sending so
+    // the 4 s refresh can't flash typing after the message lands.
+    ctx.typing.start(
+        &ctx.tracker,
+        ctx.tg.clone(),
+        chat_id,
+        SEND_TYPING_CAP,
+        &ctx.shutdown,
+    );
 
     let inbound_was_voice = matches!(payload, Payload::Voice { .. });
+    ctx.voice_pref.set(chat_id, inbound_was_voice);
     let text = match payload {
         Payload::Text(t) => t,
         Payload::Voice {
@@ -83,8 +77,8 @@ pub async fn handle_update(ctx: HandlerContext, chat_id: i64, message_id: i64, p
             match transcribe_voice(&ctx, chat_id, &file_id, duration_sec, size_bytes).await {
                 Ok(t) => t,
                 Err(reply) => {
-                    ctx.metrics.record_stt_failure();
                     let body = sanitize::escape_html(&reply);
+                    ctx.typing.cancel(chat_id);
                     if let Err(e) = ctx.tg.send_message(chat_id, &body).await {
                         ctx.metrics.record_handler_error();
                         tracing::error!(err = %e, "Failed to send voice-error reply");
@@ -100,12 +94,6 @@ pub async fn handle_update(ctx: HandlerContext, chat_id: i64, message_id: i64, p
 
     let cmd = handler::parse(&text);
 
-    // Fire a typing indicator early when autostart provisioning is likely — the
-    // 3s TUI boot delay would otherwise leave the user with no feedback.
-    if matches!(cmd, handler::Command::PlainText(_)) && ctx.session.target().is_none() {
-        let _ = ctx.tg.send_chat_action(chat_id, "typing").await;
-    }
-
     let response = if let handler::Command::Tts(verb) = cmd {
         handle_tts_command(&ctx, &verb)
     } else {
@@ -119,6 +107,7 @@ pub async fn handle_update(ctx: HandlerContext, chat_id: i64, message_id: i64, p
 
     match response {
         Response::Text(body) => {
+            ctx.typing.cancel(chat_id);
             let send_ok = match ctx.tg.send_message(chat_id, &body).await {
                 Ok(_) => true,
                 Err(e) => {
@@ -134,38 +123,22 @@ pub async fn handle_update(ctx: HandlerContext, chat_id: i64, message_id: i64, p
                 let tg = ctx.tg.clone();
                 let metrics = ctx.metrics.clone();
                 let audio = audio.clone();
+                let shutdown = ctx.shutdown.clone();
                 ctx.tracker.spawn(async move {
-                    synthesize_and_send_voice_detached(&tg, &metrics, &audio, chat_id, &body).await;
+                    synthesize_and_send_voice_detached(
+                        &tg, &metrics, &audio, &shutdown, chat_id, &body,
+                    )
+                    .await;
                 });
             }
         }
         Response::ReactSuccess => {
+            ctx.typing.cancel(chat_id);
             react_ok(&ctx, chat_id, message_id).await;
         }
-        Response::Sent { session, baseline } => {
-            if ctx.session.is_hooked(&session) {
-                typing::spawn_with_cap(
-                    &ctx.tracker,
-                    ctx.tg.clone(),
-                    chat_id,
-                    HOOK_TYPING_CAP,
-                    &ctx.shutdown,
-                );
-            } else if let Some(cfg) = ctx.autoreply.clone() {
-                ctx.tracker.spawn(autoreply::watch_and_forward(
-                    ctx.tracker.clone(),
-                    ctx.tg.clone(),
-                    ctx.tmux.clone(),
-                    session,
-                    chat_id,
-                    message_id,
-                    baseline,
-                    cfg,
-                    ctx.shutdown.clone(),
-                ));
-            } else {
-                react_ok(&ctx, chat_id, message_id).await;
-            }
+        Response::Sent { session: _ } => {
+            // Hooks deliver the reply asynchronously; typing stays live until
+            // the forwarder cancels it (or `SEND_TYPING_CAP` elapses).
         }
     }
 
@@ -245,14 +218,14 @@ fn switch_tts_backend(ctx: &HandlerContext, value: &str) -> Response {
     };
 
     if value == "kokoro-remote"
-        && let Err(msg) = validate_remote_tts_env(env_path)
+        && let Err(msg) = tts_validation::validate_remote_tts_env(env_path)
     {
         return Response::Text(msg);
     }
 
     let mut updates: Vec<(&str, String)> = vec![("TELEGRAM_TTS_BACKEND", value.to_string())];
     if value == "kokoro-local" {
-        match validate_kokoro_local_tts_env() {
+        match tts_validation::validate_kokoro_local_tts_env() {
             Ok(ort_path) => {
                 updates.push(("ORT_DYLIB_PATH", ort_path.to_string_lossy().into_owned()))
             }
@@ -288,126 +261,13 @@ fn switch_tts_backend(ctx: &HandlerContext, value: &str) -> Response {
     Response::Text(msg)
 }
 
-fn validate_kokoro_local_tts_env() -> Result<std::path::PathBuf, String> {
-    #[cfg(not(feature = "kokoro-local"))]
-    {
-        Err(
-            "Can't switch to <code>kokoro-local</code>: this binary was built without the \
-             <code>kokoro-local</code> cargo feature. Rebuild with \
-             <code>cargo build --features kokoro-local</code>, or use \
-             <code>kokoro-remote</code>."
-                .to_string(),
-        )
-    }
-
-    #[cfg(feature = "kokoro-local")]
-    {
-        if crate::audio::espeak::probe().is_none() {
-            return Err(kokoro_local_missing_espeak_msg());
-        }
-        crate::setup::onnxruntime::probe().ok_or_else(kokoro_local_missing_ort_msg)
-    }
-}
-
-#[cfg(feature = "kokoro-local")]
-fn kokoro_local_missing_espeak_msg() -> String {
-    #[cfg(windows)]
-    {
-        "Can't switch to <code>kokoro-local</code>: <code>espeak-ng</code> is not on \
-         PATH. Windows Kokoro-local is manual/Advanced only; install espeak-ng, \
-         open a new terminal, then retry. <code>kokoro-remote</code> or \
-         <code>winrt</code> are the recommended Windows paths."
-            .to_string()
-    }
-    #[cfg(not(windows))]
-    {
-        "Can't switch to <code>kokoro-local</code>: <code>espeak-ng</code> is not on \
-         PATH. Install it with your OS package manager or rerun <code>tebis setup</code>."
-            .to_string()
-    }
-}
-
-#[cfg(feature = "kokoro-local")]
-fn kokoro_local_missing_ort_msg() -> String {
-    #[cfg(windows)]
-    {
-        "Can't switch to <code>kokoro-local</code>: <code>onnxruntime.dll</code> is not \
-         on any known path. Set <code>ORT_DYLIB_PATH=C:\\path\\to\\onnxruntime.dll</code> \
-         or place it under <code>%LOCALAPPDATA%\\Programs\\onnxruntime\\lib\\</code> or \
-         <code>%ProgramFiles%\\onnxruntime\\lib\\</code>, then retry."
-            .to_string()
-    }
-    #[cfg(not(windows))]
-    {
-        "Can't switch to <code>kokoro-local</code>: <code>libonnxruntime</code> is not \
-         on any known path. Run <code>tebis setup</code> or set \
-         <code>ORT_DYLIB_PATH=/path/to/libonnxruntime</code>, then retry."
-            .to_string()
-    }
-}
-
-fn validate_remote_tts_env(env_path: &Path) -> Result<(), String> {
-    let url = read_env_key_for_tts(env_path, "TELEGRAM_TTS_REMOTE_URL")?;
-    let Some(url) = url.filter(|s| !s.trim().is_empty()) else {
-        return Err("Can't switch to <code>kokoro-remote</code>: set \
-             <code>TELEGRAM_TTS_REMOTE_URL=https://...</code> in the env file \
-             or run <code>tebis setup</code> first."
-            .to_string());
-    };
-
-    let allow_http = match read_env_key_for_tts(env_path, "TELEGRAM_TTS_REMOTE_ALLOW_HTTP")? {
-        Some(raw) => crate::env_file::parse_toggle(&raw)
-            .map_err(|e| {
-                format!(
-                    "Can't switch to <code>kokoro-remote</code>: \
-                     <code>TELEGRAM_TTS_REMOTE_ALLOW_HTTP</code> is invalid: <code>{}</code>.",
-                    sanitize::escape_html(&e.to_string())
-                )
-            })?
-            .unwrap_or(false),
-        None => false,
-    };
-
-    if let Some(raw) = read_env_key_for_tts(env_path, "TELEGRAM_TTS_REMOTE_TIMEOUT_SEC")? {
-        let timeout_sec = raw.parse::<u32>().map_err(|_| {
-            "Can't switch to <code>kokoro-remote</code>: \
-             <code>TELEGRAM_TTS_REMOTE_TIMEOUT_SEC</code> must be a positive integer."
-                .to_string()
-        })?;
-        if !(1..=300).contains(&timeout_sec) {
-            return Err("Can't switch to <code>kokoro-remote</code>: \
-                 <code>TELEGRAM_TTS_REMOTE_TIMEOUT_SEC</code> must be between 1 and 300."
-                .to_string());
-        }
-    }
-
-    let lower = url.trim().to_ascii_lowercase();
-    if !(lower.starts_with("https://") || allow_http && lower.starts_with("http://")) {
-        return Err("Can't switch to <code>kokoro-remote</code>: \
-         <code>TELEGRAM_TTS_REMOTE_URL</code> must start with <code>https://</code> \
-         (or set <code>TELEGRAM_TTS_REMOTE_ALLOW_HTTP=true</code> for LAN HTTP)."
-            .to_string());
-    }
-
-    Ok(())
-}
-
-fn read_env_key_for_tts(env_path: &Path, key: &str) -> Result<Option<String>, String> {
-    crate::env_file::read_key(env_path, key).map_err(|e| {
-        format!(
-            "Can't switch TTS at runtime: failed to read env file: <code>{}</code>.",
-            sanitize::escape_html(&e.to_string())
-        )
-    })
-}
-
-/// Invariant 18: cap transcript bytes fed into `parse` so long voice
+/// Cap transcript bytes fed into `parse` so long voice
 /// notes can't bypass text-size limits.
 const MAX_TRANSCRIPT_BYTES: usize = 4000;
 
 const PCM_SAMPLE_RATE: usize = 16_000;
 
-/// Invariant 5: never log transcript text (secrets can land there too).
+/// Never log transcript text (secrets can land there too).
 async fn transcribe_voice(
     ctx: &HandlerContext,
     chat_id: i64,
@@ -480,6 +340,7 @@ async fn transcribe_voice(
         .saturating_mul(16_000)
         .saturating_mul(2);
     let pcm = codec::decode_opus_to_pcm16k(&oga_bytes, max_samples).map_err(|e| {
+        ctx.metrics.record_stt_failure();
         format!("Voice decode failed: {e}. Tebis only accepts OGG/Opus voice notes — music files in other formats aren't supported.")
     })?;
 
@@ -493,10 +354,10 @@ async fn transcribe_voice(
     }
 
     let language = audio.stt_language().unwrap_or("");
-    let transcription = audio
-        .transcribe(&pcm, language)
-        .await
-        .map_err(|e| format!("Transcription failed: {e}"))?;
+    let transcription = audio.transcribe(&pcm, language).await.map_err(|e| {
+        ctx.metrics.record_stt_failure();
+        format!("Transcription failed: {e}")
+    })?;
 
     let mut text = transcription.text;
     // whisper.cpp emits `[BLANK_AUDIO]`/`[Music]`/`(silence)` when no speech.
@@ -526,10 +387,11 @@ async fn transcribe_voice(
     Ok(text)
 }
 
-async fn synthesize_and_send_voice_detached(
+pub(crate) async fn synthesize_and_send_voice_detached(
     tg: &crate::telegram::TelegramClient,
     metrics: &crate::metrics::Metrics,
     audio: &crate::audio::AudioSubsystem,
+    shutdown: &tokio_util::sync::CancellationToken,
     chat_id: i64,
     body: &str,
 ) {
@@ -538,7 +400,17 @@ async fn synthesize_and_send_voice_detached(
         return;
     }
     let synth_start = std::time::Instant::now();
-    let (voice_bytes, duration_sec) = match audio.synthesize(&plain).await {
+    // Race synthesize against shutdown so TTS can't keep the bridge alive
+    // past the drain window. The text reply was already sent.
+    let synth_result = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => {
+            tracing::debug!("shutdown observed before TTS synthesis; skipping voice reply");
+            return;
+        }
+        res = audio.synthesize(&plain) => res,
+    };
+    let (voice_bytes, duration_sec) = match synth_result {
         Ok(pair) => pair,
         Err(e) => {
             metrics.record_tts_failure();
@@ -547,10 +419,15 @@ async fn synthesize_and_send_voice_detached(
         }
     };
     let synth_ms = u64::try_from(synth_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-    if let Err(e) = tg
-        .send_voice(chat_id, voice_bytes, Some(duration_sec))
-        .await
-    {
+    let send_result = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => {
+            tracing::debug!("shutdown observed before sendVoice; skipping voice reply");
+            return;
+        }
+        res = tg.send_voice(chat_id, voice_bytes, Some(duration_sec)) => res,
+    };
+    if let Err(e) = send_result {
         metrics.record_tts_failure();
         tracing::warn!(err = %e, "sendVoice failed; text reply already sent");
         return;
@@ -579,16 +456,24 @@ const AMP_SENTINEL: char = '\u{0001}';
 
 fn platform_service_name() -> &'static str {
     #[cfg(target_os = "macos")]
-    { "launchd" }
+    {
+        "launchd"
+    }
     #[cfg(target_os = "linux")]
-    { "systemd" }
+    {
+        "systemd"
+    }
     #[cfg(target_os = "windows")]
-    { "Task Scheduler" }
+    {
+        "Task Scheduler"
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    { "your OS service manager" }
+    {
+        "your OS service manager"
+    }
 }
 
-const HOOK_TYPING_CAP: std::time::Duration = std::time::Duration::from_secs(20);
+const SEND_TYPING_CAP: std::time::Duration = std::time::Duration::from_secs(45);
 
 #[cfg(test)]
 mod strip_html_tests {
@@ -663,117 +548,6 @@ mod strip_html_tests {
                 format!("prefix {raw} suffix"),
                 "code-wrapper roundtrip failed for {raw:?}"
             );
-        }
-    }
-}
-
-#[cfg(test)]
-mod tts_switch_tests {
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use super::validate_remote_tts_env;
-
-    fn env_file(body: &str) -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "tebis-tts-remote-{pid}-{nonce:x}-{seq}",
-            pid = std::process::id(),
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("env");
-        fs::write(&path, body).unwrap();
-        path
-    }
-
-    fn cleanup(path: &Path) {
-        if let Some(parent) = path.parent() {
-            let _ = fs::remove_dir_all(parent);
-        }
-    }
-
-    #[test]
-    fn kokoro_remote_switch_requires_url() {
-        let path = env_file("TELEGRAM_TTS_BACKEND=none\n");
-        let err = validate_remote_tts_env(&path).unwrap_err();
-        assert!(err.contains("TELEGRAM_TTS_REMOTE_URL"));
-        cleanup(&path);
-    }
-
-    #[test]
-    fn kokoro_remote_switch_accepts_https_url() {
-        let path = env_file("TELEGRAM_TTS_REMOTE_URL=https://kokoro.example.com\n");
-        validate_remote_tts_env(&path).unwrap();
-        cleanup(&path);
-    }
-
-    #[test]
-    fn kokoro_remote_switch_rejects_http_by_default() {
-        let path = env_file("TELEGRAM_TTS_REMOTE_URL=http://127.0.0.1:8880\n");
-        let err = validate_remote_tts_env(&path).unwrap_err();
-        assert!(err.contains("https://"));
-        cleanup(&path);
-    }
-
-    #[test]
-    fn kokoro_remote_switch_allows_http_when_enabled() {
-        let path = env_file(
-            "TELEGRAM_TTS_REMOTE_URL=http://127.0.0.1:8880\n\
-             TELEGRAM_TTS_REMOTE_ALLOW_HTTP=true\n",
-        );
-        validate_remote_tts_env(&path).unwrap();
-        cleanup(&path);
-    }
-
-    #[test]
-    fn kokoro_remote_switch_rejects_invalid_allow_http_toggle() {
-        let path = env_file(
-            "TELEGRAM_TTS_REMOTE_URL=http://127.0.0.1:8880\n\
-             TELEGRAM_TTS_REMOTE_ALLOW_HTTP=maybe\n",
-        );
-        let err = validate_remote_tts_env(&path).unwrap_err();
-        assert!(err.contains("TELEGRAM_TTS_REMOTE_ALLOW_HTTP"));
-        cleanup(&path);
-    }
-
-    #[test]
-    fn kokoro_remote_switch_rejects_invalid_timeout() {
-        let path = env_file(
-            "TELEGRAM_TTS_REMOTE_URL=https://kokoro.example.com\n\
-             TELEGRAM_TTS_REMOTE_TIMEOUT_SEC=slow\n",
-        );
-        let err = validate_remote_tts_env(&path).unwrap_err();
-        assert!(err.contains("TELEGRAM_TTS_REMOTE_TIMEOUT_SEC"));
-        cleanup(&path);
-    }
-
-    #[test]
-    fn kokoro_remote_switch_rejects_out_of_range_timeout() {
-        let path = env_file(
-            "TELEGRAM_TTS_REMOTE_URL=https://kokoro.example.com\n\
-             TELEGRAM_TTS_REMOTE_TIMEOUT_SEC=301\n",
-        );
-        let err = validate_remote_tts_env(&path).unwrap_err();
-        assert!(err.contains("between 1 and 300"));
-        cleanup(&path);
-    }
-
-    #[test]
-    fn kokoro_remote_switch_accepts_timeout_range_edges() {
-        for timeout in ["1", "300"] {
-            let path = env_file(&format!(
-                "TELEGRAM_TTS_REMOTE_URL=https://kokoro.example.com\n\
-                 TELEGRAM_TTS_REMOTE_TIMEOUT_SEC={timeout}\n"
-            ));
-            validate_remote_tts_env(&path).unwrap();
-            cleanup(&path);
         }
     }
 }

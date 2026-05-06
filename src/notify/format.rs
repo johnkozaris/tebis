@@ -4,7 +4,7 @@
 use super::{Payload, markdown};
 use crate::sanitize;
 
-pub fn body(p: &Payload) -> String {
+pub(crate) fn body(p: &Payload) -> String {
     let tag_line = p
         .kind
         .as_deref()

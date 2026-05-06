@@ -12,8 +12,6 @@ use tokio_util::task::TaskTracker;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tebis::telegram::install_crypto_provider();
-
     let cfg = AudioConfig {
         stt: None,
         tts: Some(TtsConfig {

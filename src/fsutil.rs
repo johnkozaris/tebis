@@ -4,7 +4,7 @@
 //! re-asserted via `chmod`. On Windows the `mode` argument is ignored — NTFS
 //! DACL inheritance from the parent dir controls access, and atomic replace
 //! uses `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`. For owner-only private
-//! writes (env file, invariant 20), use `platform::secure_file::atomic_write_private`
+//! writes (env file), use `platform::secure_file::atomic_write_private`
 //! instead — that primitive sets an explicit owner-only DACL on Windows.
 
 use std::fs;

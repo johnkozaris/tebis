@@ -74,7 +74,7 @@ const E2M_RULES: &[(&str, &str)] = &[
 
 /// Single-pass: each rule's replacement is visible to every later rule.
 #[must_use]
-pub fn apply_e2m(ipa: &str) -> String {
+pub(crate) fn apply_e2m(ipa: &str) -> String {
     let mut s = ipa.to_string();
     for (pat, rep) in E2M_RULES {
         if s.contains(pat) {

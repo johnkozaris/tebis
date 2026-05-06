@@ -45,18 +45,16 @@ Set all three values together:
 When no target is selected, the first plain Telegram message starts this
 session and sends the message to it.
 
-## Telegram polling and output size
+## Telegram polling
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TELEGRAM_POLL_TIMEOUT` | `30` | Long-poll seconds, from 1 to 900 |
-| `TELEGRAM_MAX_OUTPUT_CHARS` | `4000` | Maximum size for command output sent to Telegram |
 
 ## Replies
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `TELEGRAM_AUTOREPLY` | `on` | Set `off` to stop watching terminal output for replies |
 | `TELEGRAM_HOOKS_MODE` | `off` | Set `auto` to install supported Claude Code or Copilot CLI hooks for the default project |
 | `TELEGRAM_NOTIFY` | `on` | Set `off` to disable local hook notifications |
 | `NOTIFY_CHAT_ID` | your user ID | Override which chat receives hook replies |

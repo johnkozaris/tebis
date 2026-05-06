@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -34,7 +33,7 @@ async fn main() -> Result<()> {
     let live: Vec<String> = if dummy {
         vec!["claude-code".into(), "shell".into(), "notes".into()]
     } else {
-        let probe = mux::Mux::new(vec![], 4000, Duration::from_millis(300));
+        let probe = mux::Mux::new(vec![], Duration::from_millis(300));
         probe.list_sessions().await.unwrap_or_default()
     };
     let real_allowlist: Vec<String> = live
@@ -48,7 +47,7 @@ async fn main() -> Result<()> {
     } else {
         real_allowlist.clone()
     };
-    let tmux = Arc::new(mux::Mux::new(allowlist.clone(), 4000, Duration::from_millis(300)));
+    let tmux = Arc::new(mux::Mux::new(allowlist.clone(), Duration::from_millis(300)));
     let default_target = allowlist.first().cloned();
 
     let sessions = Arc::new(session::SessionState::new(None, HooksMode::Off));
@@ -56,7 +55,6 @@ async fn main() -> Result<()> {
         sessions.set_target(t.clone());
     }
 
-    let handler_sem = Arc::new(Semaphore::new(8));
     let m = Arc::new(metrics::Metrics::new());
 
     for _ in 0..5 {
@@ -65,7 +63,6 @@ async fn main() -> Result<()> {
     m.record_handler_completed(342);
     m.record_handler_completed(218);
     m.record_handler_completed(1_173);
-    m.record_rate_limited();
     for _ in 0..120 {
         m.record_poll_success();
     }
@@ -119,8 +116,6 @@ async fn main() -> Result<()> {
         allowed_user_id: allowed_user,
         allowed_sessions: allowlist,
         poll_timeout: 30,
-        max_output_chars: 4000,
-        max_concurrent_handlers: 8,
         autostart: autostart_info,
         notify: notify_info,
         hooks: inspect::HooksInfo {
@@ -140,8 +135,7 @@ async fn main() -> Result<()> {
     let shutdown = CancellationToken::new();
     let tracker = TaskTracker::new();
 
-    let live_ctx =
-        inspect::LiveContext::new(tmux, sessions, handler_sem, m, started_at, shutdown.clone());
+    let live_ctx = inspect::LiveContext::new(tmux, sessions, m, started_at, shutdown.clone());
 
     let port: u16 = std::env::var("INSPECT_PORT")
         .ok()

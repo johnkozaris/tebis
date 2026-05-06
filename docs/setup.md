@@ -110,7 +110,6 @@ Useful commands:
 | --- | --- |
 | `/list` | Lists running terminal sessions |
 | `/status` | Shows current target and uptime |
-| `/read [session] [lines]` | Reads recent output |
 | `/target <session>` | Makes a session the default target |
 | `/restart` | Restarts the default agent on the next message |
 | `/help` | Shows all commands |
@@ -123,4 +122,4 @@ Useful commands:
 | The bot ignores your messages | Check `TELEGRAM_ALLOWED_USER`. It must be your numeric Telegram ID |
 | Setup cannot find the terminal session tool | Install `tmux` on macOS/Linux or `psmux` on Windows |
 | Config changes do not apply | Run `tebis restart` |
-| Replies are late or missing | Use `/read` to inspect the session. For Claude Code or Copilot CLI, check `tebis hooks status` |
+| Replies are late or missing | For Claude Code or Copilot CLI, check `tebis hooks status` |

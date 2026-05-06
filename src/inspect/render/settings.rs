@@ -31,13 +31,6 @@ pub(super) fn build_settings_section(snapshot: &Snapshot) -> String {
     </label>
     <input type="number" name="poll_timeout" min="1" max="900" value="{poll}" required>
   </div>
-  <div class="settings-row">
-    <label>
-      <div>Max capture output chars</div>
-      <div class="hint">Largest <code>/read</code> response before truncation. 100–20000.</div>
-    </label>
-    <input type="number" name="max_output_chars" min="100" max="20000" value="{max_chars}" required>
-  </div>
   {autostart_dir_row}
   <div class="settings-submit">
     <div class="desc">Writes to <code>{path_html}</code> and restarts the bridge.</div>
@@ -45,7 +38,6 @@ pub(super) fn build_settings_section(snapshot: &Snapshot) -> String {
   </div>
 </form></div>"#,
         poll = snapshot.poll_timeout,
-        max_chars = snapshot.max_output_chars,
         path_html = sanitize::escape_html(path),
     )
 }

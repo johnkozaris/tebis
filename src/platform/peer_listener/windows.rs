@@ -1,6 +1,8 @@
-//! Named-pipe backend. Invariants 9 / 17 (rewritten) + invariant 20.
+//! Named-pipe backend. Per-OS analogue of the Unix UDS path: kernel-
+//! verified peer auth + DACL-locked pipe + atomic-replace temp-file
+//! semantics inherited by the env-file writer.
 //!
-//! # Peer-auth invariant (20)
+//! # Peer-auth (kernel-verified, no PID-spoof window)
 //!
 //! The ONLY way this backend verifies a peer is via
 //! `ImpersonateNamedPipeClient` + `OpenThreadToken(TOKEN_QUERY)` +
@@ -9,7 +11,7 @@
 //! (Project Zero 2019-09, "Windows Exploitation Tricks: Spoofing
 //! Named Pipe Client PID"). The impersonation token is kernel-verified.
 //!
-//! # DACL (invariant 17-equivalent)
+//! # DACL
 //!
 //! `CreateNamedPipe` is called with a `SECURITY_ATTRIBUTES` whose
 //! `SECURITY_DESCRIPTOR` comes from

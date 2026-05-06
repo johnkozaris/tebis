@@ -17,7 +17,7 @@ use regex::Regex;
 
 /// Apply all normalization passes in order.
 #[must_use]
-pub fn preprocess(text: &str) -> String {
+pub(crate) fn preprocess(text: &str) -> String {
     let t = titles(text);
     let t = currency(&t);
     let t = percent(&t);

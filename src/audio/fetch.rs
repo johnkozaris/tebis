@@ -1,19 +1,11 @@
 //! HTTP GET + streaming SHA-256 + atomic rename. For HF model downloads.
-//! Invariants 6 (network error redaction), 10 (cap + timeout), 12 (cancel-safe).
 
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::{Method, Request};
-use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::{TokioExecutor, TokioTimer};
 use ring::digest::{Context as Sha256Ctx, SHA256};
-use rustls::ClientConfig;
 use tokio_util::sync::CancellationToken;
 
 use super::cache;
@@ -26,13 +18,11 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-const MAX_REDIRECTS: u8 = 5;
-
-type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+const MAX_REDIRECTS: usize = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
-    /// Description is pre-redacted via [`crate::telegram::redact_network_error`].
+    /// Description is pre-redacted of bot-token / api.telegram.org substrings.
     #[error("download failed: {0}")]
     Network(String),
 
@@ -70,7 +60,7 @@ impl FetchError {
 
 /// HTTPS-only client, decoupled from Telegram's so redaction/TLS can diverge.
 pub struct FetchClient {
-    client: HyperClient,
+    client: reqwest::Client,
 }
 
 impl Default for FetchClient {
@@ -80,30 +70,17 @@ impl Default for FetchClient {
 }
 
 impl FetchClient {
-    /// Build a client. `install_crypto_provider` must have run first.
     pub fn new() -> Self {
-        let tls = ClientConfig::builder()
-            .with_webpki_roots()
-            .with_no_client_auth();
-
-        let mut http = HttpConnector::new();
-        http.enforce_http(false);
-        http.set_connect_timeout(Some(CONNECT_TIMEOUT));
-        http.set_nodelay(true);
-
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls)
-            .https_only()
-            .enable_http1()
-            .wrap_connector(http);
-
-        let client = Client::builder(TokioExecutor::new())
+        let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .pool_max_idle_per_host(1)
-            .pool_timer(TokioTimer::new())
-            .timer(TokioTimer::new())
-            .build(https);
-
+            .tcp_nodelay(true)
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+            .user_agent("tebis-audio-fetch/0.1")
+            .build()
+            .expect("reqwest::Client::build: rustls features are static");
         Self { client }
     }
 
@@ -147,69 +124,26 @@ impl FetchClient {
         progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
         cancel: CancellationToken,
     ) -> Result<(), FetchError> {
-        // hyper-util's legacy Client doesn't auto-redirect — follow manually.
-        let mut current_url = url.to_string();
-        let mut hops: u8 = 0;
-        let response = loop {
-            if hops > MAX_REDIRECTS {
-                return Err(FetchError::Network(format!(
-                    "too many redirects (> {MAX_REDIRECTS}) starting from original URL"
-                )));
-            }
-            let uri: hyper::Uri = current_url
-                .parse()
-                .map_err(|e: hyper::http::uri::InvalidUri| FetchError::Network(e.to_string()))?;
-            let host = uri.host().unwrap_or("<unknown>").to_string();
-
-            let req = Request::builder()
-                .method(Method::GET)
-                .uri(&current_url)
-                .header(hyper::header::USER_AGENT, "tebis-audio-fetch/0.1")
-                .header(hyper::header::ACCEPT, "*/*")
-                .body(Full::<Bytes>::new(Bytes::new()))
-                .map_err(|e| FetchError::Network(e.to_string()))?;
-
-            // Cancel during redirects too — a chain would burn ~5× connect_timeout otherwise.
-            let resp = tokio::select! {
-                biased;
-                () = cancel.cancelled() => return Err(FetchError::Cancelled),
-                r = self.client.request(req) => r.map_err(|e| {
-                    FetchError::Network(crate::telegram::redact_network_error(&e))
-                })?,
-            };
-            let status = resp.status();
-
-            if status.is_redirection() {
-                let Some(location) = resp
-                    .headers()
-                    .get(hyper::header::LOCATION)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string)
-                else {
-                    return Err(FetchError::Network(format!(
-                        "redirect {status} missing Location header"
-                    )));
-                };
-                tracing::debug!(from = %host, to = %location, "following redirect");
-                current_url = location;
-                hops = hops.saturating_add(1);
-                continue;
-            }
-            if !status.is_success() {
-                return Err(FetchError::HttpStatus {
-                    status: status.as_u16(),
-                    url_host: host,
-                });
-            }
-            break resp;
+        let send_fut = self.client.get(url).send();
+        let mut response = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(FetchError::Cancelled),
+            r = send_fut => r.map_err(|e| FetchError::Network(redact_fetch_error(&e)))?,
         };
+        let host = response
+            .url()
+            .host_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let status = response.status();
+        if !status.is_success() {
+            return Err(FetchError::HttpStatus {
+                status: status.as_u16(),
+                url_host: host,
+            });
+        }
 
-        let content_length = response
-            .headers()
-            .get(hyper::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-
+        let content_length = response.content_length();
         if let Some(len) = content_length
             && len > MAX_DOWNLOAD_BYTES
         {
@@ -223,34 +157,21 @@ impl FetchClient {
         let file = cache::open_model_tmp(tmp_path).map_err(FetchError::from_io)?;
         let mut tee = TeeWriter::new(file);
 
-        let mut body = response.into_body();
         loop {
-            tokio::select! {
-                // `biased` — saturated network could consume thousands of chunks before cancel.
+            let chunk = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(FetchError::Cancelled),
-                frame = body.frame() => {
-                    match frame {
-                        None => break,
-                        Some(Err(e)) => {
-                            // invariant 6 — uniform redaction even for HF URLs.
-                            return Err(FetchError::Network(crate::sanitize::redact_hyper_error_string(
-                                &e.to_string(),
-                                |s| crate::sanitize::contains_bot_token_shape(s) || s.contains("api.telegram.org"),
-                            )));
-                        }
-                        Some(Ok(f)) => {
-                            if let Ok(chunk) = f.into_data() {
-                                if tee.bytes_written + chunk.len() as u64 > MAX_DOWNLOAD_BYTES {
-                                    return Err(FetchError::ResponseTooLarge);
-                                }
-                                tee.write_all(&chunk).map_err(FetchError::from_io)?;
-                                progress(tee.bytes_written, content_length);
-                            }
-                        }
-                    }
-                }
+                c = response.chunk() => match c {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break,
+                    Err(e) => return Err(FetchError::Network(redact_fetch_error(&e))),
+                },
+            };
+            if tee.bytes_written + chunk.len() as u64 > MAX_DOWNLOAD_BYTES {
+                return Err(FetchError::ResponseTooLarge);
             }
+            tee.write_all(&chunk).map_err(FetchError::from_io)?;
+            progress(tee.bytes_written, content_length);
         }
 
         if let Some(len) = content_length
@@ -279,6 +200,12 @@ impl FetchClient {
             .map_err(|e| FetchError::Io(e.to_string()))?;
         Ok(())
     }
+}
+
+fn redact_fetch_error(err: &reqwest::Error) -> String {
+    crate::sanitize::redact_hyper_error_string(&err.to_string(), |s| {
+        crate::sanitize::contains_bot_token_shape(s) || s.contains("api.telegram.org")
+    })
 }
 
 /// Tees each chunk into both the file and a SHA-256 hasher.

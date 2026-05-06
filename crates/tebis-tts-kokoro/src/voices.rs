@@ -30,7 +30,7 @@ const BYTES_PER_ROW: usize = STYLE_DIM * 4;
 /// that ndarray's internal refcount isn't worth the ceremony; caller
 /// clones on the `(1, 256)` row extraction, which is a 1 KB copy.
 #[derive(Debug)]
-pub struct Voice {
+pub(crate) struct Voice {
     table: Array3<f32>,
 }
 
@@ -39,7 +39,7 @@ impl Voice {
     /// - file doesn't exist / unreadable
     /// - byte count isn't a multiple of 1024 (= 1 × 256 × 4 bytes)
     /// - the implied outer dim is zero
-    pub fn load(path: &Path) -> Result<Self, KokoroError> {
+    pub(crate) fn load(path: &Path) -> Result<Self, KokoroError> {
         let meta = std::fs::metadata(path)
             .map_err(|e| KokoroError::Init(format!("stat voice `{}`: {e}", path.display())))?;
         if meta.len() > MAX_VOICE_BYTES {
@@ -85,7 +85,7 @@ impl Voice {
     }
 
     #[must_use]
-    pub fn max_tokens(&self) -> usize {
+    pub(crate) fn max_tokens(&self) -> usize {
         self.table.dim().0
     }
 
@@ -94,7 +94,7 @@ impl Voice {
     /// don't panic; the produced audio will be mildly less "shaped"
     /// but still intelligible. Empty inputs clamp to row 0.
     #[must_use]
-    pub fn style_for_token_count(&self, n_tokens: usize) -> Array2<f32> {
+    pub(crate) fn style_for_token_count(&self, n_tokens: usize) -> Array2<f32> {
         let last = self.max_tokens().saturating_sub(1);
         let row = n_tokens.min(last);
         self.table.index_axis(Axis(0), row).to_owned()

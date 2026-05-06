@@ -230,14 +230,7 @@ fn wait_for_active_linux() -> bool {
 #[cfg(target_os = "linux")]
 fn explain_systemd_failure() {
     let log = Command::new("journalctl")
-        .args([
-            "--user",
-            "-u",
-            SYSTEMD_UNIT_NAME,
-            "-n",
-            "30",
-            "--no-pager",
-        ])
+        .args(["--user", "-u", SYSTEMD_UNIT_NAME, "-n", "30", "--no-pager"])
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
@@ -248,7 +241,14 @@ fn explain_systemd_failure() {
         "{}  tebis is not active after install. Last journal lines:",
         style("✗").red().bold()
     );
-    for line in log.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev() {
+    for line in log
+        .lines()
+        .rev()
+        .take(15)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
         eprintln!("    {line}");
     }
 
@@ -264,10 +264,7 @@ fn explain_systemd_failure() {
             "      {}",
             style("tebis uninstall && tebis install   # re-run; install detects container").dim()
         );
-        eprintln!(
-            "      {}",
-            style("# or, manually:").dim()
-        );
+        eprintln!("      {}", style("# or, manually:").dim());
         eprintln!(
             "      {}",
             style("mkdir -p ~/.config/systemd/user/tebis.service.d").dim()

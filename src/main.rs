@@ -5,7 +5,6 @@ use std::env;
 use std::process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing_subscriber::EnvFilter;
@@ -48,7 +47,6 @@ Required env (set by `tebis setup` or your own scripts):
 Optional env:
   TELEGRAM_ALLOWED_SESSIONS     Comma-separated terminal session allowlist
   TELEGRAM_POLL_TIMEOUT         Long-poll seconds (default 30, 1..=900)
-  TELEGRAM_MAX_OUTPUT_CHARS     /read truncation cap (default 4000)
   TELEGRAM_SUBMIT_GAP_MS        Text→Enter sleep in ms (default 300, 50..=5000)
   TELEGRAM_AUTOSTART_SESSION    Autostart session name
   TELEGRAM_AUTOSTART_DIR        Autostart working directory
@@ -146,7 +144,6 @@ fn prepare_audio_downloads() -> Result<()> {
         "{}  Preparing audio models (one-time download)…",
         console::style("▶").cyan().bold()
     );
-    telegram::install_crypto_provider();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -219,8 +216,6 @@ fn unauthorized_dead_end(err: &telegram::TelegramError) -> anyhow::Error {
     anyhow::anyhow!("bot token rejected by Telegram (401 Unauthorized): {err}")
 }
 
-use bridge::MAX_CONCURRENT_HANDLERS;
-
 fn acquire_instance_lock() -> Result<lockfile::LockFile> {
     let path = lockfile::default_path();
     match lockfile::acquire(&path) {
@@ -291,8 +286,6 @@ async fn run_bridge() -> Result<()> {
         );
     }));
 
-    telegram::install_crypto_provider();
-
     let mut config = config::Config::from_env()?;
     tracing::info!(
         allowed_user = config.allowed_user_id,
@@ -347,8 +340,6 @@ async fn run_bridge() -> Result<()> {
         ),
         Err(_) => None,
     };
-
-    let autoreply_cfg = config.autoreply.take().map(Arc::new);
 
     // Fail-open: STT/TTS init problems log and continue text-only.
     let audio = if config.audio.any_enabled() {
@@ -411,8 +402,6 @@ async fn run_bridge() -> Result<()> {
             allowed_user_id: config.allowed_user_id,
             allowed_sessions: config.allowed_sessions.clone(),
             poll_timeout: config.poll_timeout,
-            max_output_chars: config.max_output_chars,
-            max_concurrent_handlers: MAX_CONCURRENT_HANDLERS,
             autostart: config.autostart.as_ref().map(|a| inspect::AutostartInfo {
                 session: a.session.clone(),
                 dir: a.dir.clone(),
@@ -440,10 +429,24 @@ async fn run_bridge() -> Result<()> {
         None
     };
 
-    let tmux = Arc::new(mux::Mux::new(
+    // Push tebis's resolved NOTIFY_SOCKET_PATH into every tmux session so
+    // hook scripts inside the session reach our listener regardless of
+    // whatever stale env the tmux server inherited.
+    let mux_extra_env: Vec<(String, String)> = config
+        .notify
+        .as_ref()
+        .map(|n| {
+            vec![(
+                "NOTIFY_SOCKET_PATH".into(),
+                n.socket_path.to_string_lossy().into_owned(),
+            )]
+        })
+        .unwrap_or_default();
+
+    let tmux = Arc::new(mux::Mux::with_env(
         config.allowed_sessions.clone(),
-        config.max_output_chars,
         Duration::from_millis(u64::from(config.submit_gap_ms)),
+        mux_extra_env,
     ));
     if let Some(a) = config.autostart.as_ref() {
         tracing::info!(
@@ -465,13 +468,25 @@ async fn run_bridge() -> Result<()> {
         config.autostart.take(),
         config.hooks_mode,
     ));
-    let rate_limiter = Arc::new(security::RateLimiter::new(30, 10));
-    let handler_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS));
     let metrics = Arc::new(metrics::Metrics::new());
     let started_at = Instant::now();
+    let typing = bridge::typing::TypingRegistry::new();
+    let voice_pref = bridge::voice_pref::VoicePref::new();
 
     if let Some(n) = config.notify {
-        let forwarder = Arc::new(notify::TelegramForwarder::new(tg.clone(), n.chat_id));
+        let tts_spawn = audio.as_ref().map(|a| notify::TtsSpawn {
+            audio: a.clone(),
+            voice_pref: voice_pref.clone(),
+            metrics: metrics.clone(),
+            tracker: tracker.clone(),
+            shutdown: shutdown.clone(),
+        });
+        let forwarder = Arc::new(notify::TelegramForwarder::new(
+            tg.clone(),
+            n.chat_id,
+            typing.clone(),
+            tts_spawn,
+        ));
         notify::spawn(&tracker, shutdown.clone(), n.socket_path, forwarder)?;
     }
 
@@ -479,7 +494,6 @@ async fn run_bridge() -> Result<()> {
         let live = inspect::LiveContext::new(
             tmux.clone(),
             session_state.clone(),
-            handler_sem.clone(),
             metrics.clone(),
             started_at,
             shutdown.clone(),
@@ -487,19 +501,16 @@ async fn run_bridge() -> Result<()> {
         inspect::spawn(&tracker, shutdown.clone(), port, snapshot, live)?;
     }
 
-    let env_file_path: Option<std::path::PathBuf> =
-        env::var("BRIDGE_ENV_FILE").ok().map(std::path::PathBuf::from);
+    let env_file_path: Option<std::path::PathBuf> = env::var("BRIDGE_ENV_FILE")
+        .ok()
+        .map(std::path::PathBuf::from);
 
     let mut offset: Option<i64> = None;
     let mut backoff = Duration::from_secs(1);
     // 409: wait poll_timeout+5s so the other poller's long-poll expires.
     let conflict_backoff = Duration::from_secs(u64::from(config.poll_timeout) + 5);
 
-    tracing::info!(
-        max_concurrent_handlers = MAX_CONCURRENT_HANDLERS,
-        poll_timeout_secs = config.poll_timeout,
-        "Bridge ready"
-    );
+    tracing::info!(poll_timeout_secs = config.poll_timeout, "Bridge ready");
 
     print_ready_status(
         &me,
@@ -576,15 +587,14 @@ async fn run_bridge() -> Result<()> {
                         tg: tg.clone(),
                         tmux: tmux.clone(),
                         session: session_state.clone(),
-                        rate_limiter: rate_limiter.clone(),
-                        handler_sem: handler_sem.clone(),
                         started_at,
                         metrics: metrics.clone(),
-                        autoreply: autoreply_cfg.clone(),
                         tracker: tracker.clone(),
                         shutdown: shutdown.clone(),
                         audio: audio.clone(),
                         env_file_path: env_file_path.clone(),
+                        typing: typing.clone(),
+                        voice_pref: voice_pref.clone(),
                     };
 
                     tracker.spawn(bridge::handle_update(ctx, chat_id, message_id, payload));

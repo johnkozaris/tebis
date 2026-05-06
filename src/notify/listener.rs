@@ -1,7 +1,7 @@
 //! Accept loop + per-connection protocol. Platform-specific bind /
 //! peer-auth lives in `crate::platform::peer_listener`; this file is
-//! pure protocol: newline-framed JSON (invariant 11), byte-capped
-//! (invariant 10), forwarded through the `Forwarder` trait.
+//! pure protocol: newline-framed JSON, byte-capped at 16 KiB, forwarded
+//! through the `Forwarder` trait.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ use crate::platform::peer_listener::{Conn, Listener};
 
 use super::{Forwarder, Payload};
 
-/// Invariant 10: 16 KiB max, ~10× the advertised 1500-char body.
+/// 16 KiB max, ~10× the advertised 1500-char body.
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -107,7 +107,7 @@ where
         }
     };
 
-    // Invariant 5: metadata only; never the text.
+    // Metadata only; never the text.
     tracing::debug!(
         bytes = payload.text.len(),
         has_cwd = payload.cwd.is_some(),
@@ -155,7 +155,7 @@ where
     Ok(payload)
 }
 
-/// Invariant 11: newline-framed, not EOF-framed — macOS `nc` lacks `-N` for UDS
+/// Newline-framed, not EOF-framed — macOS `nc` lacks `-N` for UDS
 /// half-close, so hook scripts use `nc -U -w 2` and depend on `\n` to flush.
 async fn read_until_bounded<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,

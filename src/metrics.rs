@@ -8,7 +8,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct Metrics {
     pub updates_received: AtomicU64,
     pub updates_processed: AtomicU64,
-    pub rate_limited: AtomicU64,
     pub handler_errors: AtomicU64,
     pub poll_success: AtomicU64,
     pub poll_errors: AtomicU64,
@@ -37,10 +36,6 @@ impl Metrics {
     pub fn record_update_received(&self) {
         self.updates_received.fetch_add(1, Ordering::Relaxed);
         self.last_update_at.store(now_secs(), Ordering::Relaxed);
-    }
-
-    pub fn record_rate_limited(&self) {
-        self.rate_limited.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_handler_completed(&self, duration_ms: u64) {
@@ -111,11 +106,9 @@ mod tests {
         assert_eq!(m.updates_processed.load(Ordering::Relaxed), 1);
         assert_eq!(m.last_response_duration_ms.load(Ordering::Relaxed), 42);
 
-        m.record_rate_limited();
         m.record_handler_error();
         m.record_poll_success();
         m.record_poll_error();
-        assert_eq!(m.rate_limited.load(Ordering::Relaxed), 1);
         assert_eq!(m.handler_errors.load(Ordering::Relaxed), 1);
         assert_eq!(m.poll_success.load(Ordering::Relaxed), 1);
         assert_eq!(m.poll_errors.load(Ordering::Relaxed), 1);

@@ -21,7 +21,6 @@ ort = {version = "=2.0.0-rc.10", default-features = false, features = ["std", "l
 regex = {version = "1", default-features = false, features = ["std", "unicode-perl"]}
 thiserror = "2"
 tokio = {version = "1", features = ["process", "rt", "time"]}
-tracing = "0.1"
 
 [dev-dependencies]
 tokio = {version = "1", features = ["macros", "rt"]}

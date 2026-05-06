@@ -9,7 +9,6 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -24,8 +23,6 @@ pub struct Snapshot {
     pub allowed_user_id: i64,
     pub allowed_sessions: Vec<String>,
     pub poll_timeout: u32,
-    pub max_output_chars: usize,
-    pub max_concurrent_handlers: usize,
     pub autostart: Option<AutostartInfo>,
     pub notify: Option<NotifyInfo>,
     pub hooks: HooksInfo,
@@ -88,7 +85,6 @@ pub struct NotifyInfo {
 pub struct LiveContext {
     pub tmux: Arc<Mux>,
     pub session: Arc<SessionState>,
-    pub handler_sem: Arc<Semaphore>,
     pub metrics: Arc<Metrics>,
     pub started_at: Instant,
     pub shutdown: CancellationToken,
@@ -100,7 +96,6 @@ impl LiveContext {
     pub fn new(
         tmux: Arc<Mux>,
         session: Arc<SessionState>,
-        handler_sem: Arc<Semaphore>,
         metrics: Arc<Metrics>,
         started_at: Instant,
         shutdown: CancellationToken,
@@ -108,7 +103,6 @@ impl LiveContext {
         Self {
             tmux,
             session,
-            handler_sem,
             metrics,
             started_at,
             shutdown,

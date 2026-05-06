@@ -70,7 +70,7 @@ fn binary_on_path(name: &str) -> bool {
 }
 
 /// Display form — mirror `install_argv` joined by spaces.
-pub fn install_cmd_display(pm: PackageManager, pkg: &str) -> String {
+pub(crate) fn install_cmd_display(pm: PackageManager, pkg: &str) -> String {
     match pm {
         PackageManager::Brew => format!("brew install {pkg}"),
         PackageManager::MacPorts => format!("sudo port install {pkg}"),
@@ -83,7 +83,7 @@ pub fn install_cmd_display(pm: PackageManager, pkg: &str) -> String {
 }
 
 /// Argv for `Command::new(argv[0]).args(&argv[1..])`. Linux PMs prepend `sudo`.
-pub fn install_argv(pm: PackageManager, pkg: &str) -> Vec<String> {
+pub(crate) fn install_argv(pm: PackageManager, pkg: &str) -> Vec<String> {
     let pkg = pkg.to_string();
     match pm {
         PackageManager::Brew => vec!["brew".into(), "install".into(), pkg],

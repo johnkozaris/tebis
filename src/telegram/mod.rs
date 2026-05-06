@@ -1,16 +1,11 @@
-//! Telegram Bot API client on `hyper` + `hyper-rustls` + `ring`. Bot token
-//! lives in the URL path; `redact_network_error` keeps it out of logs.
+//! Telegram Bot API client on `reqwest` + rustls. Bot token lives in the URL
+//! path; `redact_network_error` keeps it out of logs.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
-use hyper::{Method, Request};
-use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::{TokioExecutor, TokioTimer};
-use rustls::ClientConfig;
-use secrecy::{ExposeSecret, SecretString};
+use reqwest::StatusCode;
 
 pub mod types;
 
@@ -27,9 +22,9 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
-const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
 /// Ceiling for `download_file`. Sized for the local Bot API (50 MiB); cloud is 20 MiB.
-const MAX_FILE_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
+const MAX_FILE_DOWNLOAD_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_RETRIES: usize = 5;
 
 #[derive(Debug, thiserror::Error)]
@@ -41,7 +36,7 @@ pub enum TelegramError {
         description: String,
     },
 
-    /// `description` is pre-redacted — raw hyper errors can carry URL data.
+    /// `description` is pre-redacted — raw reqwest errors can carry URL data.
     #[error("{method}: network error: {description}")]
     Network {
         method: String,
@@ -75,12 +70,12 @@ impl TelegramError {
 
 pub type Result<T> = std::result::Result<T, TelegramError>;
 
-type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
-
 pub struct TelegramClient {
-    client: HyperClient,
-    /// URL prefix including the bot token. `SecretString` redacts via `Debug`.
-    base_url: SecretString,
+    client: reqwest::Client,
+    /// URL prefix including the bot token. Private; never logged
+    /// directly — `redact_network_error` strips it from error chains
+    /// and the manual `Debug` impl below redacts it.
+    base_url: String,
 }
 
 #[derive(Debug)]
@@ -94,35 +89,21 @@ enum FetchError {
 }
 
 impl TelegramClient {
-    /// Build a client. `install_crypto_provider` must have run first.
-    pub fn new(token: &SecretString) -> Self {
-        let tls = ClientConfig::builder()
-            .with_webpki_roots()
-            .with_no_client_auth();
-
-        let mut http = HttpConnector::new();
-        http.enforce_http(false);
-        http.set_connect_timeout(Some(CONNECT_TIMEOUT));
-        http.set_nodelay(true);
-        http.set_keepalive(Some(TCP_KEEPALIVE));
-
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls)
-            .https_only()
-            .enable_http1()
-            .wrap_connector(http);
-
-        let client: HyperClient = Client::builder(TokioExecutor::new())
+    /// Build a client. Reqwest's rustls integration uses the ring crypto
+    /// provider via the `__rustls-ring` feature internally; no explicit
+    /// install needed.
+    pub fn new(token: &Arc<str>) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .pool_max_idle_per_host(2)
-            .pool_timer(TokioTimer::new())
-            .timer(TokioTimer::new())
-            .build(https);
+            .tcp_keepalive(TCP_KEEPALIVE)
+            .tcp_nodelay(true)
+            .https_only(true)
+            .build()
+            .expect("reqwest::Client::build: rustls + ring features are static");
 
-        let base_url = SecretString::from(format!(
-            "https://api.telegram.org/bot{}",
-            token.expose_secret()
-        ));
+        let base_url = format!("https://api.telegram.org/bot{token}");
         Self { client, base_url }
     }
 
@@ -229,7 +210,7 @@ impl TelegramClient {
 
         // Swap `/bot<TOKEN>` → `/file/bot<TOKEN>`.
         let url = {
-            let base = self.base_url.expose_secret();
+            let base = self.base_url.as_str();
             debug_assert!(
                 base.starts_with("https://api.telegram.org/bot"),
                 "base_url shape invariant broken"
@@ -263,26 +244,20 @@ impl TelegramClient {
     }
 
     async fn download_file_once(&self, url: &str) -> Result<Bytes> {
-        let deadline = tokio::time::Instant::now() + DEFAULT_REQUEST_TIMEOUT;
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(url)
-            .body(Full::<Bytes>::new(Bytes::new()))
-            .expect("hyper Request::builder: inputs are known-valid");
-        let response = match tokio::time::timeout_at(deadline, self.client.request(req)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
+        let response = match self
+            .client
+            .get(url)
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let retryable = e.is_connect() || e.is_timeout();
                 return Err(TelegramError::Network {
                     method: "download_file".to_string(),
-                    description: redact_network_error(&e),
-                    retryable: e.is_connect(),
-                });
-            }
-            Err(_) => {
-                return Err(TelegramError::Network {
-                    method: "download_file".to_string(),
-                    description: format!("timed out after {DEFAULT_REQUEST_TIMEOUT:?}"),
-                    retryable: true,
+                    description: redact_reqwest_error(&e),
+                    retryable,
                 });
             }
         };
@@ -294,86 +269,64 @@ impl TelegramClient {
                 description: "non-success HTTP status".to_string(),
             });
         }
-        let limited = Limited::new(response.into_body(), MAX_FILE_DOWNLOAD_BYTES);
-        let body = match limited.collect().await {
-            Ok(b) => b.to_bytes(),
-            Err(e) => {
-                return Err(TelegramError::Network {
-                    method: "download_file".to_string(),
-                    description: format!("body read: {e}"),
-                    retryable: false,
-                });
-            }
-        };
+        if let Some(len) = response.content_length()
+            && len > MAX_FILE_DOWNLOAD_BYTES
+        {
+            return Err(TelegramError::Network {
+                method: "download_file".to_string(),
+                description: format!("response too large: {len} > {MAX_FILE_DOWNLOAD_BYTES}"),
+                retryable: false,
+            });
+        }
+        let body = collect_capped(response, MAX_FILE_DOWNLOAD_BYTES, "download_file").await?;
         Ok(body)
     }
 
-    /// Send an OGG/Opus voice note. Any other codec degrades to a file attachment
-    /// in the Telegram UI. Hand-rolled multipart body; boundary from ring RNG.
+    /// Send an OGG/Opus voice note. Any other codec degrades to a file
+    /// attachment in the Telegram UI.
     pub async fn send_voice(
         &self,
         chat_id: i64,
         voice_ogg: Bytes,
         duration_sec: Option<u32>,
     ) -> Result<Message> {
-        use ring::rand::{SecureRandom, SystemRandom};
+        let url = format!("{}/sendVoice", self.base_url);
 
-        let mut boundary_bytes = [0u8; 16];
-        SystemRandom::new()
-            .fill(&mut boundary_bytes)
-            .map_err(|_| TelegramError::Network {
-                method: "sendVoice".to_string(),
-                description: "ring RNG failure (/dev/urandom unavailable?)".to_string(),
-                retryable: false,
-            })?;
-        let mut boundary = String::with_capacity(boundary_bytes.len() * 2);
-        for byte in boundary_bytes {
-            use std::fmt::Write as _;
-            let _ = write!(boundary, "{byte:02x}");
+        let voice_part = reqwest::multipart::Part::bytes(voice_ogg.to_vec())
+            .file_name("voice.oga")
+            .mime_str("audio/ogg")
+            .expect("audio/ogg is a static valid MIME");
+
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("voice", voice_part);
+        if let Some(d) = duration_sec {
+            form = form.text("duration", d.to_string());
         }
 
-        let body = build_send_voice_body(chat_id, &voice_ogg, duration_sec, &boundary);
-        let content_type = format!("multipart/form-data; boundary={boundary}");
-        let url = format!("{}/sendVoice", self.base_url.expose_secret());
-
-        let deadline = tokio::time::Instant::now() + DEFAULT_REQUEST_TIMEOUT;
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri(&url)
-            .header(hyper::header::CONTENT_TYPE, content_type)
-            .body(Full::new(body))
-            .expect("hyper Request::builder: inputs are known-valid");
-
-        let response = match tokio::time::timeout_at(deadline, self.client.request(req)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
+        let response = match self
+            .client
+            .post(&url)
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
+            .multipart(form)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let retryable = e.is_connect() || e.is_timeout();
                 return Err(TelegramError::Network {
                     method: "sendVoice".to_string(),
-                    description: redact_network_error(&e),
-                    retryable: e.is_connect(),
-                });
-            }
-            Err(_) => {
-                return Err(TelegramError::Network {
-                    method: "sendVoice".to_string(),
-                    description: format!("timed out after {DEFAULT_REQUEST_TIMEOUT:?}"),
-                    retryable: true,
+                    description: redact_reqwest_error(&e),
+                    retryable,
                 });
             }
         };
 
         let status = response.status();
-        let limited = Limited::new(response.into_body(), MAX_RESPONSE_BYTES);
-        let body_bytes = limited
-            .collect()
-            .await
-            .map_err(|e| TelegramError::Network {
-                method: "sendVoice".to_string(),
-                description: format!("body read: {e}"),
-                retryable: false,
-            })?;
-        let envelope: ApiResponse<Message> = serde_json::from_slice(&body_bytes.to_bytes())
-            .map_err(|e| TelegramError::Parse {
+        let body_bytes = collect_capped(response, MAX_RESPONSE_BYTES, "sendVoice").await?;
+        let envelope: ApiResponse<Message> =
+            serde_json::from_slice(&body_bytes).map_err(|e| TelegramError::Parse {
                 method: "sendVoice".to_string(),
                 description: format!("response parse: {e}"),
             })?;
@@ -402,49 +355,40 @@ impl TelegramClient {
         Ok(())
     }
 
-    async fn fetch_once(
+    async fn fetch_once<Req>(
         &self,
         url: &str,
-        body_bytes: &Bytes,
-        deadline: tokio::time::Instant,
+        body: &Req,
         request_timeout: Duration,
-    ) -> std::result::Result<(hyper::StatusCode, Bytes), FetchError> {
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri(url)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(Full::new(body_bytes.clone()))
-            .expect("hyper Request::builder: inputs are known-valid");
-
-        let response = match tokio::time::timeout_at(deadline, self.client.request(req)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
+    ) -> std::result::Result<(StatusCode, Bytes), FetchError>
+    where
+        Req: serde::Serialize + Sync,
+    {
+        let response = match self
+            .client
+            .post(url)
+            .timeout(request_timeout)
+            .json(body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
                 return Err(FetchError::Request {
-                    retryable: e.is_connect(),
-                    description: redact_network_error(&e),
-                });
-            }
-            Err(_) => {
-                return Err(FetchError::Request {
-                    retryable: true,
-                    description: format!("send timed out after {request_timeout:?}"),
+                    retryable: e.is_connect() || e.is_timeout(),
+                    description: redact_reqwest_error(&e),
                 });
             }
         };
         let status = response.status();
-
-        let body = Limited::new(response.into_body(), MAX_RESPONSE_BYTES);
-        let body_bytes_resp = match tokio::time::timeout_at(deadline, body.collect()).await {
-            Ok(Ok(c)) => c.to_bytes(),
-            Ok(Err(e)) => return Err(FetchError::Body(format!("body read: {e}"))),
-            Err(_) => {
-                return Err(FetchError::Body(format!(
-                    "body read timed out after {request_timeout:?}"
-                )));
+        let body_bytes = match collect_capped(response, MAX_RESPONSE_BYTES, "fetch").await {
+            Ok(b) => b,
+            Err(TelegramError::Network { description, .. }) => {
+                return Err(FetchError::Body(description));
             }
+            Err(e) => return Err(FetchError::Body(e.to_string())),
         };
-
-        Ok((status, body_bytes_resp))
+        Ok((status, body_bytes))
     }
 
     /// Retry policy: 429 honors `retry_after`; 5xx and retryable network
@@ -459,16 +403,10 @@ impl TelegramClient {
         Req: serde::Serialize + Sync,
         Resp: serde::de::DeserializeOwned + Send,
     {
-        let url = format!("{}/{}", self.base_url.expose_secret(), method);
-
-        let body_bytes = serde_json::to_vec(body).map_err(|e| TelegramError::Parse {
-            method: method.into(),
-            description: format!("request serialize: {e}"),
-        })?;
-        let body_bytes = Bytes::from(body_bytes);
+        let url = format!("{}/{}", self.base_url, method);
 
         const MAX_RATE_LIMIT_HITS: usize = 10;
-        // Wall-clock cap so retries can't starve the handler semaphore permit.
+        // Wall-clock cap so retries can't run forever on a flapping link.
         const TOTAL_RETRY_BUDGET: Duration = Duration::from_mins(3);
 
         let mut backoff = Duration::from_secs(1);
@@ -483,11 +421,8 @@ impl TelegramClient {
                     retryable: false,
                 });
             }
-            let deadline = tokio::time::Instant::now() + request_timeout;
 
-            let (status, body_bytes_resp) = match self
-                .fetch_once(&url, &body_bytes, deadline, request_timeout)
-                .await
+            let (status, body_bytes_resp) = match self.fetch_once(&url, body, request_timeout).await
             {
                 Ok(pair) => pair,
                 Err(FetchError::Request {
@@ -538,7 +473,9 @@ impl TelegramClient {
                 if rate_limit_hits > MAX_RATE_LIMIT_HITS {
                     return Err(TelegramError::Network {
                         method: method.into(),
-                        description: format!("exceeded {MAX_RATE_LIMIT_HITS} consecutive 429 rate limits"),
+                        description: format!(
+                            "exceeded {MAX_RATE_LIMIT_HITS} consecutive 429 rate limits"
+                        ),
                         retryable: false,
                     });
                 }
@@ -549,7 +486,11 @@ impl TelegramClient {
                     .and_then(|p| p.retry_after)
                     .unwrap_or(10)
                     .min(MAX_RETRY_AFTER_SECS);
-                tracing::warn!(retry_after, hits = rate_limit_hits, "{method}: rate limited");
+                tracing::warn!(
+                    retry_after,
+                    hits = rate_limit_hits,
+                    "{method}: rate limited"
+                );
                 tokio::time::sleep(Duration::from_secs(retry_after)).await;
                 continue;
             }
@@ -576,58 +517,49 @@ impl TelegramClient {
     }
 }
 
-/// Install rustls's process-wide crypto provider. Idempotent: wizard + foreground both call;
-/// second `install_default` returns `Err(existing)` which we swallow (ring-only per deny.toml).
-pub fn install_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-/// Build a `multipart/form-data` body for `sendVoice`. CRLF per RFC 7578.
-fn build_send_voice_body(
-    chat_id: i64,
-    voice: &[u8],
-    duration_sec: Option<u32>,
-    boundary: &str,
-) -> Bytes {
-    let mut out: Vec<u8> = Vec::with_capacity(voice.len() + 512);
-
-    let write_text_field = |out: &mut Vec<u8>, name: &str, value: &str| {
-        out.extend_from_slice(b"--");
-        out.extend_from_slice(boundary.as_bytes());
-        out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(
-            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
-        );
-        out.extend_from_slice(value.as_bytes());
-        out.extend_from_slice(b"\r\n");
-    };
-
-    write_text_field(&mut out, "chat_id", &chat_id.to_string());
-    if let Some(d) = duration_sec {
-        write_text_field(&mut out, "duration", &d.to_string());
+/// Read the response body up to `max_bytes`. Surfaces network errors as
+/// retryable=false (the request may have already had server-side effects).
+async fn collect_capped(
+    response: reqwest::Response,
+    max_bytes: u64,
+    method: &str,
+) -> Result<Bytes> {
+    if let Some(len) = response.content_length()
+        && len > max_bytes
+    {
+        return Err(TelegramError::Network {
+            method: method.to_string(),
+            description: format!("response too large: {len} > {max_bytes}"),
+            retryable: false,
+        });
     }
-
-    out.extend_from_slice(b"--");
-    out.extend_from_slice(boundary.as_bytes());
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(
-        b"Content-Disposition: form-data; name=\"voice\"; filename=\"voice.oga\"\r\n",
-    );
-    out.extend_from_slice(b"Content-Type: audio/ogg\r\n\r\n");
-    out.extend_from_slice(voice);
-    out.extend_from_slice(b"\r\n");
-
-    out.extend_from_slice(b"--");
-    out.extend_from_slice(boundary.as_bytes());
-    out.extend_from_slice(b"--\r\n");
-
-    Bytes::from(out)
+    let bytes = response.bytes().await.map_err(|e| TelegramError::Network {
+        method: method.to_string(),
+        description: format!("body read: {}", redact_reqwest_error(&e)),
+        retryable: false,
+    })?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(TelegramError::Network {
+            method: method.to_string(),
+            description: format!("response exceeded {max_bytes} bytes"),
+            retryable: false,
+        });
+    }
+    Ok(bytes)
 }
 
-/// Invariant 6: redact `/bot<digit>` or `api.telegram.org` from hyper errors.
-pub(crate) fn redact_network_error(err: &hyper_util::client::legacy::Error) -> String {
-    crate::sanitize::redact_hyper_error(err, |raw| {
-        crate::sanitize::contains_bot_token_shape(raw) || raw.contains("api.telegram.org")
+/// Redact `/bot<digit>` or `api.telegram.org` from reqwest errors before logging.
+pub(crate) fn redact_reqwest_error(err: &reqwest::Error) -> String {
+    let kind = if err.is_connect() {
+        "connect"
+    } else if err.is_timeout() {
+        "timeout"
+    } else {
+        "request"
+    };
+    let raw = format!("{kind}: {err}");
+    crate::sanitize::redact_hyper_error_string(&raw, |s| {
+        crate::sanitize::contains_bot_token_shape(s) || s.contains("api.telegram.org")
     })
 }
 
@@ -658,46 +590,10 @@ mod tests {
 
     #[test]
     fn debug_impl_redacts_base_url() {
-        use secrecy::SecretString;
-        let token = SecretString::from("12345:TESTTESTTEST".to_string());
-        install_crypto_provider_idempotent();
+        let token: Arc<str> = Arc::from("12345:TESTTESTTEST");
         let client = TelegramClient::new(&token);
         let dbg = format!("{client:?}");
         assert!(dbg.contains("<redacted>"));
         assert!(!dbg.contains("TESTTESTTEST"));
-    }
-
-    /// Real `install_crypto_provider` panics on repeat; tests share a process.
-    fn install_crypto_provider_idempotent() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
-
-    #[test]
-    fn send_voice_body_shape() {
-        let voice = b"OggS\x00\x02fake-opus-bytes\x00";
-        let body = build_send_voice_body(987_654, voice, Some(3), "abcdef0123456789");
-        let as_str = std::str::from_utf8(&body).unwrap_or("");
-        assert!(as_str.contains("--abcdef0123456789\r\n"));
-        assert!(as_str.contains("--abcdef0123456789--\r\n"));
-        assert!(
-            as_str.contains("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n987654\r\n")
-        );
-        assert!(as_str.contains("Content-Disposition: form-data; name=\"duration\"\r\n\r\n3\r\n"));
-        assert!(as_str.contains(
-            "Content-Disposition: form-data; name=\"voice\"; filename=\"voice.oga\"\r\n"
-        ));
-        assert!(as_str.contains("Content-Type: audio/ogg\r\n\r\n"));
-        let offset = body
-            .windows(voice.len())
-            .position(|w| w == voice)
-            .expect("voice bytes embedded verbatim");
-        assert!(offset > 0);
-    }
-
-    #[test]
-    fn send_voice_body_omits_duration_when_none() {
-        let body = build_send_voice_body(1, b"x", None, "bnd");
-        let as_str = std::str::from_utf8(&body).unwrap_or("");
-        assert!(!as_str.contains("name=\"duration\""));
     }
 }

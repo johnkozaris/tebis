@@ -1,6 +1,5 @@
-//! Default-target + autostart + provisioning lock + hooked-session tracking.
+//! Default-target + autostart + provisioning lock.
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -21,7 +20,6 @@ pub struct SessionState {
     autostart: Option<AutostartConfig>,
     autostart_lock: tokio::sync::Mutex<()>,
     hooks_mode: HooksMode,
-    hooked_sessions: Mutex<HashSet<String>>,
 }
 
 impl SessionState {
@@ -31,30 +29,7 @@ impl SessionState {
             autostart,
             autostart_lock: tokio::sync::Mutex::new(()),
             hooks_mode,
-            hooked_sessions: Mutex::new(HashSet::new()),
         }
-    }
-
-    pub fn mark_hooked(&self, session: &str) {
-        self.hooked_sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session.to_string());
-    }
-
-    pub fn unmark_hooked(&self, session: &str) {
-        self.hooked_sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session);
-    }
-
-    #[must_use]
-    pub fn is_hooked(&self, session: &str) -> bool {
-        self.hooked_sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(session)
     }
 
     pub fn target(&self) -> Option<String> {
@@ -77,8 +52,9 @@ impl SessionState {
         self.autostart.as_ref().map(|a| a.session.as_str())
     }
 
-    /// Invariant 14: `autostart_lock` serializes provisioning so concurrent messages don't
-    /// race the TUI-boot sleep. Hook install runs outside — idempotent, no ordering dep.
+    /// `autostart_lock` serializes provisioning so concurrent messages don't
+    /// race the TUI-boot sleep, and so hook install runs only once per cold
+    /// start — the second caller hits the `target()` early-return.
     pub async fn resolve_or_autostart(&self, tmux: &Mux) -> Result<String, ResolveError> {
         if let Some(existing) = self.target() {
             return Ok(existing);
@@ -88,13 +64,13 @@ impl SessionState {
             return Err(ResolveError::NoTarget);
         };
 
-        let hooked = self.try_install_hooks(auto).await;
-
         let _guard = self.autostart_lock.lock().await;
 
         if let Some(existing) = self.target() {
             return Ok(existing);
         }
+
+        self.try_install_hooks(auto).await;
 
         // `has_session`/`new_session` is a TOCTOU window; fold `AlreadyExists` into success.
         let we_provisioned = if tmux.has_session(&auto.session).await? {
@@ -124,32 +100,25 @@ impl SessionState {
             return Err(ResolveError::AutostartCommandDied(auto.command.clone()));
         }
 
-        // `else` branch is load-bearing: a re-provision after hook install
-        // failure must clear a stale `is_hooked` or pane-settle stays suppressed.
-        if hooked {
-            self.mark_hooked(&auto.session);
-        } else {
-            self.unmark_hooked(&auto.session);
-        }
         self.set_target(auto.session.clone());
         Ok(auto.session.clone())
     }
 
-    /// Returns `true` when hooks were installed. Any error falls through to
-    /// pane-settle via `false`. Filesystem I/O runs under `spawn_blocking`.
-    async fn try_install_hooks(&self, auto: &AutostartConfig) -> bool {
+    /// Best-effort hook install. Failures log but never block provisioning.
+    /// Filesystem I/O runs under `spawn_blocking`.
+    async fn try_install_hooks(&self, auto: &AutostartConfig) {
         if self.hooks_mode != HooksMode::Auto {
-            return false;
+            return;
         }
         let Some(kind) = AgentKind::detect(&auto.command) else {
             tracing::info!(
                 command = %auto.command,
                 "TELEGRAM_HOOKS_MODE=auto but autostart command is not a recognized agent \
-                 — skipping hook install, pane-settle will handle replies"
+                 — skipping hook install"
             );
-            return false;
+            return;
         };
-        // Warn about pre-Phase-2 repo-path entries that would double-deliver.
+        // Pre-Phase-2 repo-path entries can cause double delivery.
         if matches!(kind, AgentKind::Claude) {
             let legacy = agent_hooks::legacy::scan_claude(Path::new(&auto.dir));
             if !legacy.is_empty() {
@@ -189,14 +158,12 @@ impl SessionState {
                         auto.dir
                     );
                 }
-                true
             }
             Err(e) => {
                 tracing::warn!(
                     err = %e, agent = %kind.display(), dir = %auto.dir,
-                    "hook install failed; falling back to pane-settle"
+                    "hook install failed; replies for this session won't be forwarded"
                 );
-                false
             }
         }
     }

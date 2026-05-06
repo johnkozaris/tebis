@@ -36,13 +36,25 @@ pub struct Check {
 
 impl Check {
     fn info(title: impl Into<String>) -> Self {
-        Self { severity: Severity::Info, title: title.into(), fix: None }
+        Self {
+            severity: Severity::Info,
+            title: title.into(),
+            fix: None,
+        }
     }
     fn warn(title: impl Into<String>, fix: impl Into<String>) -> Self {
-        Self { severity: Severity::Warn, title: title.into(), fix: Some(fix.into()) }
+        Self {
+            severity: Severity::Warn,
+            title: title.into(),
+            fix: Some(fix.into()),
+        }
     }
     fn block(title: impl Into<String>, fix: impl Into<String>) -> Self {
-        Self { severity: Severity::Block, title: title.into(), fix: Some(fix.into()) }
+        Self {
+            severity: Severity::Block,
+            title: title.into(),
+            fix: Some(fix.into()),
+        }
     }
 }
 
@@ -68,7 +80,10 @@ impl Report {
 pub fn run_install_preflight() -> Report {
     let mut checks = common_checks();
     let container_kind = platform_checks(&mut checks);
-    Report { checks, container_kind }
+    Report {
+        checks,
+        container_kind,
+    }
 }
 
 /// Doctor mode: preflight + runtime/service state.
@@ -165,7 +180,11 @@ fn check_writable(v: &mut Vec<Check>, dir: &Path, label: &str, blocking: bool) {
     if let Err(e) = fs::create_dir_all(dir) {
         let msg = format!("cannot create {label} ({}): {e}", short(dir));
         let fix = format!("ensure {} is writable by your user", short(dir));
-        v.push(if blocking { Check::block(msg, fix) } else { Check::warn(msg, fix) });
+        v.push(if blocking {
+            Check::block(msg, fix)
+        } else {
+            Check::warn(msg, fix)
+        });
         return;
     }
     // Probe write by creating a temp file. fs::create_dir_all alone
@@ -178,7 +197,11 @@ fn check_writable(v: &mut Vec<Check>, dir: &Path, label: &str, blocking: bool) {
         Err(e) => {
             let msg = format!("{label} not writable ({}): {e}", short(dir));
             let fix = format!("check mount/permissions on {}", short(dir));
-            v.push(if blocking { Check::block(msg, fix) } else { Check::warn(msg, fix) });
+            v.push(if blocking {
+                Check::block(msg, fix)
+            } else {
+                Check::warn(msg, fix)
+            });
         }
     }
 }
@@ -312,7 +335,7 @@ pub(crate) fn detect_container() -> Option<String> {
 fn push_xdg_runtime_check(v: &mut Vec<Check>) {
     // The notify UDS prefers $XDG_RUNTIME_DIR/tebis.sock. Without it,
     // the daemon falls back to /tmp — functional, but world-readable
-    // dir defeats the per-user mode-0600 invariant slightly less
+    // dir defeats the per-user mode-0600 guarantee slightly less
     // cleanly than the per-uid runtime dir would.
     match env::var("XDG_RUNTIME_DIR") {
         Ok(s) if !s.is_empty() && Path::new(&s).is_dir() => {}
@@ -402,7 +425,9 @@ fn push_macos_service_state(v: &mut Vec<Check>) {
         Err(_) => return,
     };
     if !plist.exists() {
-        v.push(Check::info("LaunchAgent not installed (run `tebis install`)"));
+        v.push(Check::info(
+            "LaunchAgent not installed (run `tebis install`)",
+        ));
         return;
     }
     let loaded = Command::new("launchctl")

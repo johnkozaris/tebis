@@ -29,7 +29,7 @@ const PHONEMIZE_TIMEOUT: Duration = Duration::from_secs(10);
 ///   edge case.
 /// - [`KokoroError::Synthesis`] for non-zero exits, timeouts, empty output,
 ///   or if normalization collapses the input to whitespace.
-pub async fn phonemize(text: &str) -> Result<String, KokoroError> {
+pub(crate) async fn phonemize(text: &str) -> Result<String, KokoroError> {
     if text.trim().is_empty() {
         return Err(KokoroError::Synthesis(
             "empty input to phonemize".to_string(),

@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 
 /// Hard cap from the model export — `input_ids` is `(1, <=512)` with two
 /// boundary pads, so the useful phoneme budget is 510.
-pub const MAX_PHONEMES: usize = 510;
+pub(crate) const MAX_PHONEMES: usize = 510;
 
 /// (IPA char, token id) pairs. 114 entries, copied verbatim from
 /// `onnx-community/Kokoro-82M-v1.0-ONNX/config.json`. Any change here
@@ -77,7 +77,7 @@ fn vocab() -> &'static HashMap<char, i64> {
 /// the caller's job because the model takes `[0] + tokens + [0]` and
 /// needs the raw `len(tokens)` for style-row indexing.
 #[must_use]
-pub fn ipa_to_token_ids(ipa: &str) -> Vec<i64> {
+pub(crate) fn ipa_to_token_ids(ipa: &str) -> Vec<i64> {
     let v = vocab();
     ipa.chars().filter_map(|c| v.get(&c).copied()).collect()
 }
