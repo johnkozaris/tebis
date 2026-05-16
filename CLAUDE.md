@@ -259,22 +259,49 @@ Distribution invariants:
   Gatekeeper does not prompt on first run. Safe because we own the
   verified download. The Windows installer cannot do the equivalent
   for SmartScreen — document the "More info → Run anyway" workaround.
-- **Install scripts append PATH idempotently** but do not edit shell
-  rc files on uninstall — too risky after the fact. Print the line
-  to remove. Windows is different: User PATH edits are surgical via
-  `[Environment]::SetEnvironmentVariable('Path', ..., 'User')`, so
-  uninstall can clean them safely. Never use `setx` — it silently
-  truncates User PATH at 1024 chars.
-- **Uninstall ordering matters**: stop daemon → iterate manifest →
-  uninstall per-project hooks → remove materialized hook scripts →
-  remove service unit → remove config/data → remove binary last. On
-  Windows the binary removal is deferred via a detached PowerShell
-  trampoline (sleep 2s, then `Remove-Item -Recurse`) because the
-  running `.exe` is locked.
-- **`tebis uninstall` never removes** `tmux`, `jq`, `nc`, the user's
-  project repos, running multiplexer sessions, or unrelated entries
-  in `.claude/settings.local.json`. We identify our hook entries by
-  matching script paths under `<data_dir>/scripts/`.
+  install.ps1 does call `Unblock-File` to clear Zone.Identifier on the
+  downloaded binary; this skips MOTW-driven prompts on first run when
+  AppLocker policy permits it.
+- **PATH cleanup is asymmetric.** Both installers append PATH
+  idempotently. Windows `--purge` removes the User PATH entry
+  surgically via `[Environment]::SetEnvironmentVariable('Path', ..., 'User')`;
+  never `setx` — it silently truncates User PATH at 1024 chars. Unix
+  installers print the `export PATH=…` line for the user to add to
+  their rc file and we never edit dotfiles on uninstall — too risky
+  after the fact.
+- **`tebis install` is idempotent w.r.t. the binary copy.** Both
+  `service::unix::install_binary` and `service::windows::copy_binary`
+  short-circuit when `src == dst` (canonicalized). This matters
+  because the primary Windows flow is `install.ps1` (writes to
+  `installed_binary_path()`) followed by `tebis install` (would
+  otherwise `fs::copy` the running .exe to itself).
+- **Default `tebis uninstall` removes only the service.** Binary,
+  env, data, and per-project hook entries persist so a re-install
+  is a quick `tebis install` away. `--purge` is the zero-trace
+  path. Past PRs landed code that surprised users who expected
+  `uninstall` alone to be terminal.
+- **`--purge` ordering** (verified against `service::{unix,windows}::uninstall`):
+  service-unit stop+delete → kill any standalone daemon still holding
+  the lockfile → iterate the manifest and uninstall per-project hooks
+  → remove config dir and data dir (data dir held back if hook
+  cleanup was partial — the manifest must survive for a retry) →
+  remove the lockfile + notify socket that live outside data_dir on
+  Unix → remove the binary (immediate `fs::remove_file` on Unix;
+  deferred PowerShell trampoline with a 30 s retry budget on Windows
+  because the running `.exe` is loader-locked). On Windows, the
+  surgical User-PATH cleanup runs BEFORE the trampoline so a new
+  shell opened immediately after uninstall sees the corrected PATH.
+- **`tebis uninstall` never removes** `tmux`, `jq`, `nc`, `psmux`,
+  the user's project repos, running multiplexer sessions, or
+  unrelated entries in `.claude/settings.local.json`. We identify
+  our hook entries by matching script paths under `<data_dir>/scripts/`.
+- **Custom install locations are not auto-tracked.** Both Unix
+  (`~/.local/bin/tebis`) and Windows
+  (`%LOCALAPPDATA%\Programs\tebis\tebis.exe`) hard-code the
+  service-binary path. A user who installed via `install.sh
+  --dir=/opt/...` and then ran `tebis install` will end up with two
+  copies. `--purge` only cleans the service path. docs/install.md
+  troubleshooting calls this out.
 
 ## Build / test / audit
 

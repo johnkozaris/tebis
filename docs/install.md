@@ -133,25 +133,42 @@ on the next manual restart.
 ## Uninstall
 
 ```sh
-tebis uninstall          # remove binary, service, hooks
-tebis uninstall --purge  # also remove config + data + manifest
+tebis uninstall          # remove service only; binary + config remain
+tebis uninstall --purge  # also remove binary, config, data, hooks
 ```
 
-`--purge` performs a zero-trace removal: config dir, data dir, lock
-files, sockets, the manifest of installed hooks, and the hook script
-copies under `<data_dir>/scripts/`. The Windows path uses a small
-PowerShell trampoline to delete the running binary's parent dir
-after our process exits.
+`tebis uninstall` (no flag) stops the daemon and removes the service
+unit (`launchctl unload`, `systemctl --user disable`, or `schtasks /Delete`).
+That's it — the binary, env file, models cache, and project hooks are
+left in place so a re-install is a quick `tebis install` away.
 
-What `uninstall` does NOT touch:
+`--purge` is the zero-trace path:
 
-- `tmux`, `jq`, `nc` — those may be in use by other tools.
+- Iterates the manifest at `<data_dir>/installed.json` and uninstalls
+  every project's hook entries (Claude `settings.local.json` block,
+  Copilot `tebis.json` sentinel).
+- Removes config dir (`~/.config/tebis/` or `%APPDATA%\tebis\`).
+- Removes data dir (`$XDG_DATA_HOME/tebis/` or
+  `%LOCALAPPDATA%\tebis\`) unless hook cleanup reported failures —
+  then the manifest is preserved so a retry can resume.
+- Removes the service-installed binary
+  (`~/.local/bin/tebis` on Unix; `%LOCALAPPDATA%\Programs\tebis\` on
+  Windows via a 30-second self-delete trampoline).
+- Windows: surgically removes the install dir from User PATH (the
+  entry `install.ps1` appended). Unix: prints the `export PATH=…`
+  line you originally added so you can remove it from your rc file —
+  we never edit dotfiles.
+
+What `--purge` does NOT touch:
+
+- `tmux`, `jq`, `nc`, `psmux` — those may be in use by other tools.
 - Your project repositories themselves (only our hook entries are
   removed from `.claude/settings.local.json` / `.github/hooks/tebis.json`).
 - Running multiplexer sessions — they keep going.
-- User shell rc files — we appended `export PATH=...` on install but
-  do not edit dotfiles on uninstall. The PATH line is printed for
-  you to remove manually.
+- Custom install locations. If you installed the binary somewhere
+  other than the service's default (`~/.local/bin/tebis` /
+  `%LOCALAPPDATA%\Programs\tebis\tebis.exe`), `--purge` won't find
+  it. Remove it manually.
 
 ## Doctor
 
@@ -170,10 +187,13 @@ every OS; the per-OS specifics live inside each check.
 |---|---|
 | `install.sh` exits with "checksum mismatch" | re-run; you may have hit a CDN cache mid-publish |
 | macOS first run still shows Gatekeeper prompt | `xattr -d com.apple.quarantine ~/.local/bin/tebis` |
-| Windows SmartScreen blocks the binary | click **More info → Run anyway**; unsigned binaries are not signed in v0.x |
+| Windows SmartScreen blocks the binary | click **More info → Run anyway**; binaries aren't code-signed in v0.x. install.ps1 already calls `Unblock-File` to clear the MOTW. |
 | `tebis upgrade` says "no compatible asset" | your host triple is not in the release matrix; build from source |
 | `tebis upgrade` fails to replace on Windows | another `tebis.exe` is running; stop it and retry |
-| Post-uninstall, `~/.local/bin/tebis` still on PATH | nothing to clean; the binary itself is gone — close and reopen your shell |
+| `tebis upgrade` fails with "permission denied" | binary was installed system-wide; reinstall under `~/.local/bin` or run upgrade with the same privileges as install |
+| You installed with `--dir` / `TEBIS_INSTALL_DIR`, then `tebis install` | the service hard-codes `~/.local/bin/tebis` / `%LOCALAPPDATA%\Programs\tebis\`. You'll end up with two copies; remove the custom-path one manually before / after `--purge`. |
+| Post-uninstall on Unix, `export PATH=…` line still in your `.zshrc` | nothing to clean automatically — we never edit dotfiles. Remove the line yourself. |
+| Post-uninstall on Windows, `%LOCALAPPDATA%\Programs\tebis` still in PATH | `--purge` removes it; plain `uninstall` does not. Re-run with `--purge` if you want the PATH entry gone. |
 
 ## Behind a proxy / offline install
 

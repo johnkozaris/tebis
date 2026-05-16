@@ -174,15 +174,19 @@ pub fn print_hook_cleanup_summary(report: &HookCleanupReport) {
     }
 }
 
-/// Windows-only: spawn a detached PowerShell trampoline that waits 2s
-/// (long enough for our process to exit and release the .exe handle)
-/// then removes the install directory recursively.
+/// Windows-only: spawn a detached PowerShell trampoline that waits for
+/// the parent's `.exe` lock to release, then removes the install dir.
 ///
-/// We can't simply `fs::remove_file(current_exe())` on Windows like Unix
-/// allows — the running .exe is mapped + locked by the loader, so the
-/// remove fails with sharing-violation. The trampoline is the standard
-/// Windows pattern: a sibling short-lived process holds the cleanup,
-/// the doomed process exits first.
+/// We can't simply `fs::remove_file(current_exe())` on Windows — the
+/// running .exe is mapped + locked by the loader, so the remove fails
+/// with sharing-violation. The trampoline is the standard pattern: a
+/// sibling short-lived process holds the cleanup; the doomed process
+/// exits first.
+///
+/// The script retries the remove for up to 30 seconds. A static 2s
+/// sleep is not enough in the wild: Task Scheduler may still be
+/// reaping the parent, Windows Defender may briefly hold the .exe
+/// after exit, and indexing services scan post-write.
 #[cfg(windows)]
 pub fn spawn_self_delete_trampoline(install_dir: &std::path::Path) -> anyhow::Result<()> {
     use anyhow::Context;
@@ -195,9 +199,16 @@ pub fn spawn_self_delete_trampoline(install_dir: &std::path::Path) -> anyhow::Re
     // Single-quoted PowerShell string; embedded single quotes are
     // escaped by doubling them per PS lexical rules.
     let path = install_dir.display().to_string().replace('\'', "''");
+    // 30 retries × ~1 s = 30 s budget. SilentlyContinue on each attempt
+    // so a transient sharing-violation doesn't surface as a script
+    // error; the loop exits early on success or on path-already-gone.
     let script = format!(
-        "Start-Sleep -Milliseconds 2000; \
-         Remove-Item -Recurse -Force '{path}' -ErrorAction SilentlyContinue"
+        "Start-Sleep -Milliseconds 1500; \
+         for ($i = 0; $i -lt 30; $i++) {{ \
+             if (-not (Test-Path -LiteralPath '{path}')) {{ break }}; \
+             try {{ Remove-Item -Recurse -Force -LiteralPath '{path}' -ErrorAction Stop; break }} \
+             catch {{ Start-Sleep -Milliseconds 1000 }} \
+         }}"
     );
     Command::new("powershell.exe")
         .args([
@@ -212,6 +223,91 @@ pub fn spawn_self_delete_trampoline(install_dir: &std::path::Path) -> anyhow::Re
         .spawn()
         .context("spawning self-delete trampoline")?;
     Ok(())
+}
+
+/// Windows-only: surgically remove `install_dir` from the User PATH.
+///
+/// Counterpart to the PATH append `install.ps1` performs. Iterates
+/// entries (`;`-separated), drops case-insensitive matches of
+/// `install_dir`, rejoins, and writes back via the .NET API — never
+/// `setx`, which truncates at 1024 chars and would silently corrupt a
+/// long User PATH.
+///
+/// Best-effort: registry-write failures log warn but never fail the
+/// uninstall. Returns `true` when the entry was found and removed.
+#[cfg(windows)]
+pub fn remove_from_user_path(install_dir: &std::path::Path) -> bool {
+    use std::process::Command;
+
+    let target = install_dir.display().to_string();
+    // Read via PowerShell so we get the unexpanded User-scope value
+    // (Rust's `env::var("PATH")` returns the merged Machine+User PATH
+    // with variables already expanded — wrong for an idempotent
+    // write-back).
+    let read = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Environment]::GetEnvironmentVariable('Path','User')",
+        ])
+        .output();
+    let Ok(read) = read else {
+        tracing::warn!("uninstall: PATH read via powershell failed");
+        return false;
+    };
+    if !read.status.success() {
+        return false;
+    }
+    let current = String::from_utf8_lossy(&read.stdout).trim().to_string();
+    if current.is_empty() {
+        return false;
+    }
+    let target_norm = target.trim_end_matches('\\').to_ascii_lowercase();
+    let mut found = false;
+    let kept: Vec<&str> = current
+        .split(';')
+        .filter(|entry| {
+            let norm = entry.trim().trim_end_matches('\\').to_ascii_lowercase();
+            let matches = norm == target_norm;
+            if matches {
+                found = true;
+            }
+            !matches && !entry.is_empty()
+        })
+        .collect();
+    if !found {
+        return false;
+    }
+    let new_value = kept.join(";");
+    // Write-back script. Single-quote new_value with PS-style escape
+    // (double the single quotes).
+    let escaped = new_value.replace('\'', "''");
+    let script = format!(
+        "[Environment]::SetEnvironmentVariable('Path','{escaped}','User')"
+    );
+    let write = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ])
+        .output();
+    match write {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            tracing::warn!(
+                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                "uninstall: PATH write returned non-zero"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "uninstall: PATH write spawn failed");
+            false
+        }
+    }
 }
 
 #[cfg(test)]

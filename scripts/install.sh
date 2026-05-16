@@ -23,7 +23,7 @@
 set -eu
 
 REPO="johnkozaris/tebis"
-INSTALL_DIR="${HOME}/.local/bin"
+INSTALL_DIR="${TEBIS_INSTALL_DIR:-${HOME}/.local/bin}"
 BIN_NAME="tebis"
 TAG="${TEBIS_VERSION:-latest}"
 
@@ -41,14 +41,36 @@ warn() { printf '%b⚠%b  %s\n' "$YELLOW$BOLD" "$RESET" "$1"; }
 die()  { printf '%b✗%b  %s\n' "$RED$BOLD"   "$RESET" "$1" >&2; exit 1; }
 
 # ─── Argument parsing ────────────────────────────────────────────────
+print_help() {
+    # Heredoc avoids reading $0 — when piped via `curl | sh`, $0 is
+    # `sh` and any self-scrape would fail.
+    cat <<EOF
+install.sh — one-shot installer for tebis on macOS and Linux.
+
+Usage:
+  curl -fsSL https://github.com/${REPO}/releases/latest/download/install.sh | sh
+  curl -fsSL https://.../install.sh | sh -s -- --version v0.1.0
+  curl -fsSL https://.../install.sh | TEBIS_INSTALL_DIR=/opt/tebis/bin sh
+
+Options:
+  --version, -v <tag>   release tag (e.g. v0.1.0); default: latest
+  --dir, -d <path>      install directory; default: \${HOME}/.local/bin
+
+Env:
+  TEBIS_VERSION         same as --version
+  TEBIS_INSTALL_DIR     same as --dir
+  NO_COLOR              disable ANSI escapes
+
+The installer writes a single file (\${INSTALL_DIR}/tebis) and never
+touches sudo, shell rc files, or system package managers.
+EOF
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --version|-v) TAG="${2:-}"; shift 2 ;;
         --dir|-d)     INSTALL_DIR="${2:-}"; shift 2 ;;
-        --help|-h)
-            sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
-            exit 0
-            ;;
+        --help|-h)    print_help; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
 done

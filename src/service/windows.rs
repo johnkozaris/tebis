@@ -155,9 +155,21 @@ pub fn uninstall(purge_flag: bool) -> Result<()> {
         if let Some(dir) = install_dir.as_deref()
             && dir.exists()
         {
+            // Remove the User PATH entry BEFORE the trampoline runs —
+            // editing PATH after our process exits would race with any
+            // shell the user opens immediately after uninstall. The
+            // append is idempotent on the install side, so the remove
+            // is too: a no-op if PATH was never modified by install.ps1.
+            if crate::uninstall::remove_from_user_path(dir) {
+                println!(
+                    "    {}  removed {} from User PATH",
+                    style("✓").green(),
+                    dir.display()
+                );
+            }
             match crate::uninstall::spawn_self_delete_trampoline(dir) {
                 Ok(()) => println!(
-                    "    {}  scheduled removal of {} (in ~2s)",
+                    "    {}  scheduled removal of {} (retries up to 30s)",
                     style("✓").green(),
                     dir.display()
                 ),
@@ -275,6 +287,13 @@ fn installed_binary_path() -> Result<PathBuf> {
 fn copy_binary(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // Same-path no-op. The primary Windows install journey is
+    // `install.ps1` (places binary at installed_binary_path()) then
+    // `tebis install` (would otherwise copy that running .exe to
+    // itself — UB-adjacent and may fail with sharing-violation).
+    if fs::canonicalize(src).ok() == fs::canonicalize(dst).ok() {
+        return Ok(());
     }
     fs::copy(src, dst).with_context(|| format!("copying {} → {}", src.display(), dst.display()))?;
     Ok(())

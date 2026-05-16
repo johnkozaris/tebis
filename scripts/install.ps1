@@ -29,10 +29,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-# Force TLS 1.2 on PS 5.1 — older defaults break the GitHub Releases
-# CDN handshake on Windows Server boxes. PS 7+ already defaults to 1.2/1.3.
-[Net.ServicePointManager]::SecurityProtocol = `
-    [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+# Force TLS 1.2 (and TLS 1.3 when available) on PS 5.1 — older
+# defaults break the GitHub CDN handshake on Windows Server boxes.
+# .NET Framework on some PS 5.1 hosts does NOT define Tls13, so we
+# add it only when present. PS 7+ already defaults to 1.2/1.3.
+$protocols = [Net.SecurityProtocolType]::Tls12
+if ([enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') {
+    $protocols = $protocols -bor [Net.SecurityProtocolType]::Tls13
+}
+[Net.ServicePointManager]::SecurityProtocol = $protocols
 
 $Repo = 'johnkozaris/tebis'
 $BinName = 'tebis.exe'
@@ -114,6 +119,11 @@ Stop the running tebis first, then re-run the installer:
         }
     }
     Move-Item -Path $tmpBin -Destination $installPath -Force
+    # Strip the Zone.Identifier alternate-data-stream that Invoke-WebRequest
+    # attaches to downloads. Without this, SmartScreen / AppLocker treat
+    # the binary as MOTW-tagged and may interrupt the first run. Safe
+    # because we just verified the SHA-256 ourselves.
+    Unblock-File -Path $installPath -ErrorAction SilentlyContinue
     Write-Ok ("Installed tebis to " + $installPath)
 
     # ── PATH (user scope) ────────────────────────────────────────────
