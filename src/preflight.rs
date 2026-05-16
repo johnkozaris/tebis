@@ -388,10 +388,38 @@ fn push_runtime_state(v: &mut Vec<Check>) {
         None => v.push(Check::info("foreground tebis: not running")),
     }
 
+    push_hooks_state(v);
+
     #[cfg(target_os = "linux")]
     push_linux_service_state(v);
     #[cfg(target_os = "macos")]
     push_macos_service_state(v);
+}
+
+/// Enumerate hook installs from the manifest. Per-project rows let users
+/// audit where tebis has injected hooks across their host — and notice
+/// stale entries for project dirs they've since deleted.
+fn push_hooks_state(v: &mut Vec<Check>) {
+    let entries = crate::agent_hooks::manifest::load_entries();
+    if entries.is_empty() {
+        v.push(Check::info(
+            "no agent hooks installed (run `tebis hooks install`)",
+        ));
+        return;
+    }
+    v.push(Check::info(format!(
+        "agent hooks installed in {} project(s):",
+        entries.len()
+    )));
+    for entry in &entries {
+        let exists = entry.dir.is_dir();
+        let marker = if exists { "" } else { " (dir missing)" };
+        v.push(Check::info(format!(
+            "  · {} → {}{marker}",
+            entry.agent,
+            short(&entry.dir)
+        )));
+    }
 }
 
 #[cfg(target_os = "linux")]
