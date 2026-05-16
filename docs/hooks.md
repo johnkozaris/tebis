@@ -40,11 +40,8 @@ config file.
 
 | Agent | Forwarded events |
 | --- | --- |
-| Claude Code | Final replies, subagent replies, permission prompts, idle notifications |
-| Copilot CLI | Completion, permission, and idle notifications |
-
-Copilot CLI does not expose the same final-reply events as Claude Code, so some
-Copilot replies may still come from terminal output.
+| Claude Code | Final replies, subagent replies, permission prompts |
+| Copilot CLI | Final replies, subagent replies, permission prompts |
 
 ## Safety
 

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 #
 # GitHub Copilot CLI hook for tebis. Dispatches on the event name found
-# in the stdin JSON (`hook_event_name` for VS Code/snake_case payloads
-# since v1.0.21; falls back to inferring from `eventName` field).
+# in the stdin JSON (`hook_event_name` is the snake_case form Copilot
+# sends for `_vsCodeCompat` hooks; native hooks send `eventName`).
 #
-# Events handled (all confirmed in the Copilot CLI changelog; see
-# src/agent_hooks/copilot.rs for the version-added map):
+# Events handled (verified against @github/copilot 1.0.48 app.js, May 2026):
 #   userPromptSubmitted → inject "conclude with a summary" context
-#   notification        → forward completion / permission / idle messages
+#   agentStop           → forward tail of last assistant message
+#                         (added Copilot CLI v1.0.45, fires on task_complete)
+#   subagentStop        → forward tail of sub-agent's last assistant message
+#   notification        → forward permission / completion notifications
+#                         (idle pings dropped — see Notification branch)
 #
 # sessionStart / sessionEnd intentionally not handled — same
 # rationale as Claude: the agent reply itself proves the session is
@@ -53,6 +56,29 @@ tail_trim() {
     '
 }
 
+# Read Copilot's events.jsonl and tail-trim the last `assistant.message`.
+# `data.content` is the model's text. Subagent messages carry an `agentId`
+# field; main-agent messages omit it. For agentStop we want the last
+# main-agent message; for subagentStop we want the last subagent message.
+# Caller passes "main" or "sub" as the second arg.
+tail_of_last_assistant() {
+    local transcript="$1"
+    local scope="$2"
+    [[ -f "$transcript" ]] || return 0
+    local filter
+    if [[ "$scope" == "sub" ]]; then
+        filter='select(.type == "assistant.message" and (.agentId // "") != "")'
+    else
+        filter='select(.type == "assistant.message" and (.agentId // "") == "")'
+    fi
+    jq -rs --argjson max "$MAX_CHARS" "
+        (map($filter) | last // empty | .data.content // \"\") as \$s |
+        if (\$s | length) == 0 then empty
+        elif (\$s | length) > \$max then (\"…\" + \$s[-\$max:])
+        else \$s end
+    " "$transcript" 2>/dev/null
+}
+
 forward() {
     local text="$1"
     local kind="$2"
@@ -82,6 +108,7 @@ EVENT="$(
 
 CWD="$(jq -r '.cwd // ""' <<<"$INPUT")"
 SESSION="$(jq -r '.sessionId // .session_id // ""' <<<"$INPUT")"
+TRANSCRIPT="$(jq -r '.transcriptPath // .transcript_path // ""' <<<"$INPUT")"
 
 case "$EVENT" in
 
@@ -95,9 +122,32 @@ case "$EVENT" in
         exit 0
         ;;
 
+    agentstop)
+        if [[ -n "$TRANSCRIPT" ]]; then
+            SUMMARY="$(tail_of_last_assistant "$TRANSCRIPT" main)"
+            if [[ -n "$SUMMARY" ]]; then
+                forward "$SUMMARY" "stop" "$CWD" "$SESSION"
+            fi
+        fi
+        ;;
+
+    subagentstop)
+        if [[ -n "$TRANSCRIPT" ]]; then
+            SUMMARY="$(tail_of_last_assistant "$TRANSCRIPT" sub)"
+            if [[ -n "$SUMMARY" ]]; then
+                forward "$SUMMARY" "subagent_stop" "$CWD" "$SESSION"
+            fi
+        fi
+        ;;
+
     notification)
         MSG="$(jq -r '.message // ""' <<<"$INPUT")"
         KIND="$(jq -r '.notificationType // .notification_type // "notification"' <<<"$INPUT")"
+        # Drop idle/"waiting for input" pings — they fire on every turn
+        # end and duplicate the agentStop signal.
+        case "$KIND" in
+            idle | idle_*) exit 0 ;;
+        esac
         if [[ -n "$MSG" ]]; then
             TRIMMED="$(tail_trim "$MSG")"
             if [[ -n "$TRIMMED" ]]; then

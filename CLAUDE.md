@@ -160,25 +160,39 @@ less likely to silently break):
   `UserPromptSubmit` wrap that asks Claude to end with a summary, so the
   tail *is* the summary in the common case.
 
-## Agent hooks — April 2026 reality
+## Agent hooks — May 2026 reality
 
 **Claude Code** ships 25+ events. We install the four that matter for a
 chat-forwarding bridge: `UserPromptSubmit` (inject "conclude with a
 summary" context), `Stop` (forward the final assistant message),
-`SubagentStop` (tagged `[agent]`), `Notification` (permission /
-idle prompts). Claude hot-reloads `.claude/settings.local.json` — no
-session restart needed after install. Non-zero exit is non-blocking on
-every event we install; exit 2 is the only blocking signal and we
-never emit it. Default timeout is 600 s; we set 5–15 s which is plenty.
+`SubagentStop` (tagged `[agent]`), `Notification` (permission prompts;
+the hook script drops idle/"waiting for input" pings at source — they
+duplicate the Stop signal). Claude hot-reloads
+`.claude/settings.local.json` — no session restart needed after
+install. Non-zero exit is non-blocking on every event we install;
+exit 2 is the only blocking signal and we never emit it. Default
+timeout is 600 s; we set 5–15 s which is plenty.
 
-**Copilot CLI** (v1.0.32, GA 2026-02-25) does **not** ship an
-`agentStop` event — that's Claude-Code-only. The closest signal is
-`notification` (async on agent completion, permission prompts, idle).
-We install just `userPromptSubmitted` + `notification`. Copilot loads
-every `*.json` in `.github/hooks/` and merges them, so our sentinel
-file (`tebis.json`) co-exists cleanly with user files. Per-turn reply
-delivery via hooks is less precise on Copilot than on Claude; without
-a hook, replies don't reach the chat for that session.
+**Copilot CLI** (verified against @github/copilot 1.0.48 app.js, May
+2026): `agentStop` was added in v1.0.45 (2026-05-11) and fires
+reliably on `task_complete`. We install four events:
+`userPromptSubmitted`, `agentStop` (forward final reply), `subagentStop`
+(rubber-duck / research / explore / task sub-agents), and
+`notification` (permission prompts; idle dropped at source same as
+Claude). Copilot loads every `*.json` in `.github/hooks/` and merges
+them, so our sentinel file (`tebis.json`) co-exists cleanly with user
+files. Both `_vsCodeCompat` (snake_case `hook_event_name`,
+`session_id`, `transcript_path`) and native (camelCase `eventName`,
+`sessionId`, `transcriptPath`) payload shapes are accepted by the
+hook scripts.
+
+**Transcript shape**: Copilot writes one JSON object per line to
+`events.jsonl`. Assistant text lives in events with
+`type == "assistant.message"` and `data.content` as a string. Sub-agent
+events carry an `agentId`; main-agent events omit it — we use that to
+route `agentStop` (main only) vs. `subagentStop` (sub only) tail
+extraction. Claude's transcript shape is different (`assistant` events
+with structured content blocks); see `claude-hook.sh` for that variant.
 
 **Dependencies**: the embedded hook scripts shell out to `jq` and `nc`
 (BSD netcat on macOS; `netcat-openbsd` on Debian/Ubuntu). `tebis hooks

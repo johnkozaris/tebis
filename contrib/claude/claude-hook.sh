@@ -7,8 +7,10 @@
 #   UserPromptSubmit   → inject summarize-at-end instruction into context
 #   Stop               → forward tail of last assistant message
 #   SubagentStop       → forward tail of pre-extracted last_assistant_message
-#   Notification       → forward the notification message (permission asks,
-#                        idle prompts, etc.)
+#   Notification       → forward the notification message (permission asks
+#                        and similar). Idle/"waiting for input" pings are
+#                        intentionally dropped — they fire on every turn end
+#                        and duplicate the Stop signal.
 #
 # SessionStart / SessionEnd are intentionally not handled — tebis is a
 # single-user bot where the agent is provisioned BY the user's first
@@ -168,10 +170,16 @@ case "$EVENT" in
         ;;
 
     Notification)
-        # Permission prompts, idle prompts, auth-success. The message field
-        # is already human-readable; no transcript parsing needed.
+        # Permission prompts, auth-success, etc. Idle pings are dropped:
+        # Claude raises Notification with notification_type=idle (or
+        # idle_prompt) every time the assistant goes quiet, which on a
+        # bridge that already forwards Stop/SubagentStop is just duplicate
+        # signal. Filter on prefix so future "idle_*" variants are caught.
         MSG="$(jq -r '.message // ""' <<<"$INPUT")"
         KIND="$(jq -r '.notification_type // "notification"' <<<"$INPUT")"
+        case "$KIND" in
+            idle | idle_*) exit 0 ;;
+        esac
         CWD="$(jq -r '.cwd // ""' <<<"$INPUT")"
         SESSION="$(jq -r '.session_id // ""' <<<"$INPUT")"
 

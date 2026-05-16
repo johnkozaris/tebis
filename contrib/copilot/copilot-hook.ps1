@@ -4,10 +4,14 @@
 # dispatch + wire format; transport is a Named Pipe instead of a Unix
 # socket.
 #
-# Events handled:
+# Events handled (verified against @github/copilot 1.0.48 app.js, May 2026):
 #
 #   userPromptSubmitted → inject summarize-at-end instruction
-#   notification        → forward completion / permission / idle messages
+#   agentStop           → forward tail of last assistant message
+#                         (added Copilot CLI v1.0.45)
+#   subagentStop        → forward tail of sub-agent's last assistant message
+#   notification        → forward permission / completion notifications
+#                         (idle pings dropped — see Notification branch)
 #
 # Safety: same as .sh — never blocks Copilot on delivery failure; never
 # echoes transcript content except in the hookSpecificOutput contract.
@@ -39,6 +43,42 @@ function Tail-Trim {
     if (-not $Text) { return $null }
     if ($Text.Length -le $MaxChars) { return $Text }
     return '…' + $Text.Substring($Text.Length - $MaxChars)
+}
+
+# Read Copilot's events.jsonl, return the tail of the last
+# `assistant.message` event's `data.content`. $Scope is "main" (filter
+# OUT events with an agentId — root-agent only) or "sub" (only events
+# WITH an agentId — sub-agent messages).
+function Tail-Of-Last-Assistant {
+    param(
+        [string]$TranscriptPath,
+        [string]$Scope
+    )
+    if (-not $TranscriptPath -or -not (Test-Path -LiteralPath $TranscriptPath)) {
+        return $null
+    }
+    $last = $null
+    try {
+        foreach ($line in [System.IO.File]::ReadLines($TranscriptPath)) {
+            if (-not $line) { continue }
+            try {
+                $evt = $line | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                continue
+            }
+            if ($evt.type -ne 'assistant.message') { continue }
+            $hasAgentId = $null -ne $evt.agentId -and $evt.agentId -ne ''
+            if ($Scope -eq 'sub' -and -not $hasAgentId) { continue }
+            if ($Scope -eq 'main' -and $hasAgentId) { continue }
+            if ($evt.data -and $evt.data.content) {
+                $last = [string]$evt.data.content
+            }
+        }
+    } catch {
+        return $null
+    }
+    if (-not $last) { return $null }
+    return Tail-Trim $last
 }
 
 function Forward {
@@ -106,6 +146,9 @@ $cwd     = if ($in.cwd) { $in.cwd } else { '' }
 $session = if ($in.sessionId)  { $in.sessionId }
            elseif ($in.session_id) { $in.session_id }
            else { '' }
+$transcript = if ($in.transcriptPath)  { $in.transcriptPath }
+              elseif ($in.transcript_path) { $in.transcript_path }
+              else { '' }
 
 switch ($event) {
 
@@ -120,11 +163,31 @@ switch ($event) {
         exit 0
     }
 
+    'agentstop' {
+        if ($transcript) {
+            $summary = Tail-Of-Last-Assistant -TranscriptPath $transcript -Scope 'main'
+            if ($summary) {
+                Forward -Text $summary -Kind 'stop' -Cwd $cwd -Session $session
+            }
+        }
+    }
+
+    'subagentstop' {
+        if ($transcript) {
+            $summary = Tail-Of-Last-Assistant -TranscriptPath $transcript -Scope 'sub'
+            if ($summary) {
+                Forward -Text $summary -Kind 'subagent_stop' -Cwd $cwd -Session $session
+            }
+        }
+    }
+
     'notification' {
         $msg = if ($in.message) { $in.message } else { '' }
         $kind = if ($in.notificationType) { $in.notificationType }
                 elseif ($in.notification_type) { $in.notification_type }
                 else { 'notification' }
+        # Drop idle pings — they fire on every turn end and duplicate agentStop.
+        if ($kind -eq 'idle' -or $kind -like 'idle_*') { exit 0 }
         if ($msg) {
             $trimmed = Tail-Trim $msg
             if ($trimmed) {

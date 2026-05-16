@@ -8,7 +8,10 @@
 #   UserPromptSubmit → inject summarize-at-end instruction into context
 #   Stop             → forward tail of last assistant message
 #   SubagentStop     → forward tail of pre-extracted last_assistant_message
-#   Notification     → forward the notification message
+#   Notification     → forward the notification message (permission asks
+#                      and similar). Idle/"waiting for input" pings are
+#                      intentionally dropped — they fire on every turn end
+#                      and duplicate the Stop signal.
 #
 # Safety (same as .sh):
 # - Always exits 0; never blocks Claude stopping.
@@ -184,6 +187,8 @@ switch ($event) {
     'Notification' {
         $msg     = if ($in.message) { $in.message } else { '' }
         $kind    = if ($in.notification_type) { $in.notification_type } else { 'notification' }
+        # Drop idle pings — they fire every turn end and duplicate Stop.
+        if ($kind -eq 'idle' -or $kind -like 'idle_*') { exit 0 }
         $cwd     = if ($in.cwd) { $in.cwd } else { '' }
         $session = if ($in.session_id) { $in.session_id } else { '' }
 

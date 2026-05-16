@@ -22,10 +22,14 @@ pub(crate) fn body(p: &Payload) -> String {
 
 /// Tag non-obvious kinds. Plain stop gets no prefix. Claude ships both
 /// `permission_prompt` and `permission_request` across versions.
+///
+/// Idle / "waiting for input" notifications are intentionally NOT tagged
+/// here — the hook scripts drop them at source so they never reach the
+/// bridge. They're noise on a phone (the agent reaches idle whenever a
+/// turn ends, which is exactly when we already get a Stop / agentStop).
 fn kind_tag(raw: &str) -> Option<&'static str> {
     match raw {
         "permission_prompt" | "permission_request" => Some("ask"),
-        "idle_prompt" | "idle" => Some("idle"),
         "subagent_stop" => Some("agent"),
         _ => None,
     }
@@ -58,11 +62,14 @@ mod tests {
     }
 
     #[test]
-    fn idle_gets_italic_tag_prefix() {
+    fn idle_kind_gets_no_tag_prefix() {
+        // Hooks drop idle at source, but if one slips through (e.g. older
+        // hook script in the wild), it must still render as plain text.
         assert_eq!(
-            body(&payload("Claude is waiting for input", Some("idle_prompt"))),
-            "<i>[idle]</i>\nClaude is waiting for input"
+            body(&payload("Waiting for input", Some("idle_prompt"))),
+            "Waiting for input",
         );
+        assert_eq!(body(&payload("idle", Some("idle"))), "idle");
     }
 
     #[test]

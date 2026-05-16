@@ -12,9 +12,27 @@ use super::jsonfile;
 
 pub struct CopilotHooks;
 
-/// Events + timeouts. Copilot CLI exposes `notification` for async agent
-/// completion / permission prompts; there is no Claude-style `agentStop`.
-const EVENTS: &[(&str, u64)] = &[("userPromptSubmitted", 5), ("notification", 10)];
+/// Events + timeouts. Copilot CLI's hook surface as of v1.0.45 (2026-05-11):
+///
+/// - `userPromptSubmitted`: inject summarize-at-end context.
+/// - `agentStop`: fires when the main agent finishes a turn (`task_complete`).
+///   Payload includes `transcript_path` (events.jsonl) + `stop_reason`. We
+///   tail-extract the last `assistant.message` from the transcript — same
+///   strategy as Claude's Stop hook.
+/// - `subagentStop`: same shape with `agent_name`/`agent_display_name` for
+///   sub-agents (rubber-duck, research, explore, task).
+/// - `notification`: completion / permission prompts (idle pings dropped at
+///   the script level, see contrib/copilot/copilot-hook.sh).
+///
+/// Timeouts: 5s for the prompt-submit hook (cheap, blocks the request);
+/// 15s for stop hooks because reading + parsing events.jsonl can be slow
+/// on long sessions.
+const EVENTS: &[(&str, u64)] = &[
+    ("userPromptSubmitted", 5),
+    ("agentStop", 15),
+    ("subagentStop", 15),
+    ("notification", 10),
+];
 
 const TEBIS_HOOKS_FILE: &str = "tebis.json";
 
