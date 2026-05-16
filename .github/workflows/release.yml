@@ -1,0 +1,187 @@
+name: Release
+
+# Triggered by pushing a `v*` tag. The tag IS the release version —
+# tebis::upgrade reads `tag_name` from the GitHub API and matches
+# against `CARGO_PKG_VERSION` (with the leading `v` stripped), so the
+# tag and Cargo.toml version must agree before tagging.
+#
+# Manual `workflow_dispatch` builds artifacts but does NOT publish a
+# release — useful for testing the build matrix without polluting the
+# release history.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# Each release job downloads its target's stdlib + builds the daemon
+# from scratch, so cache hits are partial at best. Limit concurrency
+# per ref to avoid wasting runner minutes on tag-spam.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write  # required to upload release assets via softprops/action-gh-release
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            ext: ''
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            ext: ''
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            ext: ''
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            ext: ''
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            ext: '.exe'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # whisper-rs vendors whisper.cpp via CMake. CMake is preinstalled
+      # on all GitHub-hosted runners we use here. Windows needs explicit
+      # MSVC dev-tools activation, which the runner image handles via
+      # the default `cargo` invocation.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: cargo build --release
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Stage the artifact at a predictable name. The asset filename
+      # MUST match what `src/upgrade.rs::current_target` expects:
+      # `tebis-<target-triple>` (with `.exe` on Windows).
+      - name: stage artifact (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/tebis${{ matrix.ext }}" \
+             "dist/tebis-${{ matrix.target }}${{ matrix.ext }}"
+          # POSIX `shasum -a 256`: writes "<hex>  <filename>"; we keep
+          # only the hex since `tebis upgrade` reads the first token.
+          ( cd dist && shasum -a 256 "tebis-${{ matrix.target }}${{ matrix.ext }}" \
+            > "tebis-${{ matrix.target }}${{ matrix.ext }}.sha256" )
+
+      - name: stage artifact (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $bin = "target/${{ matrix.target }}/release/tebis${{ matrix.ext }}"
+          $dst = "dist/tebis-${{ matrix.target }}${{ matrix.ext }}"
+          Copy-Item $bin $dst
+          $hash = (Get-FileHash $dst -Algorithm SHA256).Hash.ToLower()
+          # Mirror the POSIX format: "<hex>  <filename>"
+          "$hash  tebis-${{ matrix.target }}${{ matrix.ext }}" | Out-File -Encoding ascii "$dst.sha256"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tebis-${{ matrix.target }}
+          path: |
+            dist/tebis-${{ matrix.target }}${{ matrix.ext }}
+            dist/tebis-${{ matrix.target }}${{ matrix.ext }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    # Only attach assets to an actual release tag push — manual
+    # `workflow_dispatch` runs the build matrix above for verification
+    # but doesn't create a release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: flatten artifact tree
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # actions/download-artifact@v4 places each artifact in its
+          # own subdir; flatten so softprops can glob a single directory.
+          find artifacts -type f -name 'tebis-*' -exec cp {} release/ \;
+          ls -la release
+
+      # Provides shell-side install instructions that the install
+      # scripts (install.sh / install.ps1) can `curl | grep` against
+      # if they need to pin against a known release body.
+      - name: render release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          {
+            echo "# tebis ${GITHUB_REF_NAME}"
+            echo
+            echo "Install or upgrade:"
+            echo
+            echo '```sh'
+            echo "# macOS / Linux"
+            echo "curl -fsSL https://github.com/johnkozaris/tebis/releases/latest/download/install.sh | sh"
+            echo
+            echo "# Windows (PowerShell)"
+            echo "iwr -useb https://github.com/johnkozaris/tebis/releases/latest/download/install.ps1 | iex"
+            echo
+            echo "# Existing install"
+            echo "tebis upgrade"
+            echo '```'
+            echo
+            echo "## Assets"
+            echo
+            for f in release/tebis-*; do
+              if [[ "$f" == *.sha256 ]]; then
+                echo "- \`$(basename "$f")\` — SHA-256 sidecar"
+              else
+                echo "- \`$(basename "$f")\`"
+              fi
+            done
+          } > release-notes.md
+          cat release-notes.md
+          echo "path=release-notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: tebis ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.path }}
+          files: |
+            release/*
+            scripts/install.sh
+            scripts/install.ps1
+          fail_on_unmatched_files: false
+          generate_release_notes: false
+          draft: false
+          prerelease: false
