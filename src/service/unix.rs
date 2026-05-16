@@ -286,12 +286,25 @@ pub fn uninstall(purge_flag: bool) -> Result<()> {
         "{}  Removing tebis background service…",
         style("▶").cyan().bold()
     );
+
+    // Service stop FIRST. If the service is the lockfile holder, this
+    // is the orderly way to bring it down (launchctl unload / systemctl
+    // stop will reap the process and the lockfile releases).
     #[cfg(target_os = "macos")]
     uninstall_macos()?;
     #[cfg(target_os = "linux")]
     uninstall_linux()?;
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     bail!("unsupported platform");
+
+    // Standalone (foreground) tebis may still be running. After service
+    // shutdown, anything still holding the lockfile is a non-managed
+    // process — terminate it so the lockfile + socket are free for the
+    // purge-cleanup path below.
+    if let Some(pid) = crate::uninstall::kill_standalone_daemon() {
+        println!("    standalone tebis (pid {pid}) terminated");
+    }
+
     let bin = home_dir()?.join(".local/bin/tebis");
     let env_dir = home_dir()?.join(".config/tebis");
     let data_dir = crate::agent_hooks::data_dir().ok();
@@ -300,7 +313,9 @@ pub fn uninstall(purge_flag: bool) -> Result<()> {
     println!("{}  Service removed.", style("✓").green().bold());
 
     // Show what's eligible for purge (binary, env, data cache). If
-    // nothing, skip the prompt entirely.
+    // nothing, skip the prompt entirely — but still run the purge path
+    // when --purge was passed so runtime files (lock + socket, which
+    // may live outside data_dir) get cleaned.
     let purge_candidates: Vec<&Path> = {
         let mut v: Vec<&Path> = Vec::new();
         if bin.exists() {
@@ -317,15 +332,17 @@ pub fn uninstall(purge_flag: bool) -> Result<()> {
         v
     };
 
-    if purge_candidates.is_empty() {
+    if purge_candidates.is_empty() && !purge_flag {
         println!();
         return Ok(());
     }
 
-    println!();
-    println!("    {}", style("User-state paths still on disk:").dim());
-    for p in &purge_candidates {
-        println!("    {}", short(p));
+    if !purge_candidates.is_empty() {
+        println!();
+        println!("    {}", style("User-state paths still on disk:").dim());
+        for p in &purge_candidates {
+            println!("    {}", short(p));
+        }
     }
 
     // CLI flag wins. Otherwise prompt on a TTY; non-interactive
@@ -362,6 +379,17 @@ fn purge_user_state(bin: &Path, env_dir: &Path, data_dir: Option<&Path>) -> Resu
     println!();
     println!("{}  Purging user state…", style("▶").cyan().bold());
 
+    // Run hook cleanup BEFORE we touch data_dir — the manifest that
+    // drives per-project uninstall lives at <data_dir>/installed.json.
+    let hooks = crate::uninstall::uninstall_all_project_hooks();
+    crate::uninstall::print_hook_cleanup_summary(&hooks);
+
+    // Partial hook cleanup ⇒ preserve the manifest so a retry can pick
+    // up the unfinished entries. Bin + env_dir still go; only data_dir
+    // is held back. The user can re-run `tebis uninstall --purge`
+    // after fixing the failed projects.
+    let manifest_must_survive = hooks.is_partial();
+
     let mut removed: Vec<PathBuf> = Vec::new();
     for p in [bin, env_dir] {
         if p.exists() {
@@ -376,8 +404,37 @@ fn purge_user_state(bin: &Path, env_dir: &Path, data_dir: Option<&Path>) -> Resu
     if let Some(d) = data_dir
         && d.exists()
     {
-        fs::remove_dir_all(d).with_context(|| format!("removing {}", d.display()))?;
-        removed.push(d.to_path_buf());
+        if manifest_must_survive {
+            println!(
+                "    {} {} (kept — hook cleanup had failures; re-run after fixing)",
+                style("·").dim(),
+                style(d.display()).dim()
+            );
+        } else {
+            fs::remove_dir_all(d).with_context(|| format!("removing {}", d.display()))?;
+            removed.push(d.to_path_buf());
+        }
+    }
+
+    // Lockfile + notify socket on Unix can live in /tmp or $XDG_RUNTIME_DIR
+    // — outside data_dir. `remove_dir_all` above wouldn't catch them.
+    let extra = crate::uninstall::remove_runtime_files();
+    removed.extend(extra);
+
+    // macOS launchd plist writes /tmp/tebis.log (configured in
+    // contrib/macos/local.tebis.plist). Not covered by runtime_files
+    // since it's a log, not a runtime socket/lock.
+    #[cfg(target_os = "macos")]
+    {
+        let log = Path::new("/tmp/tebis.log");
+        if log.exists() {
+            match fs::remove_file(log) {
+                Ok(()) => removed.push(log.to_path_buf()),
+                Err(e) => {
+                    tracing::warn!(path = %log.display(), err = %e, "purge: remove log failed");
+                }
+            }
+        }
     }
 
     println!();
@@ -401,17 +458,7 @@ fn purge_user_state(bin: &Path, env_dir: &Path, data_dir: Option<&Path>) -> Resu
     println!();
     println!(
         "    {}",
-        style("Per-project agent hooks (if any) stay — remove with:").dim()
-    );
-    println!(
-        "    {}",
-        style("    tebis hooks list       # see which dirs have hooks").dim()
-    );
-    println!("    {}", style("    tebis hooks uninstall <dir>").dim());
-    println!();
-    println!(
-        "    {}",
-        style("System packages (espeak-ng) stay. Remove manually if unused:").dim()
+        style("System packages (espeak-ng, jq, nc) stay. Remove manually if unused:").dim()
     );
     #[cfg(target_os = "macos")]
     println!("    {}", style("    brew uninstall espeak-ng").dim());

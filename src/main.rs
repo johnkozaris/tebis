@@ -26,10 +26,12 @@ Usage:
   tebis install         Install as a background service (launchd / systemd user).
   tebis uninstall [--purge]
                         Remove the background service. `--purge` also
-                        deletes the installed binary and per-user tebis
-                        config/data dirs (env + model cache + hook
-                        manifest). Per-project hooks and system
-                        packages (espeak-ng) are left alone.
+                        deletes the installed binary, per-user config +
+                        data dirs (env, model cache, manifest), the
+                        Unix lockfile/socket, and runs the per-project
+                        hook uninstaller for every project recorded in
+                        the manifest. System packages (espeak-ng, jq,
+                        nc) are left alone.
   tebis start           Start the installed background service.
   tebis stop            Stop the installed background service.
   tebis restart         Stop + start the installed service (e.g. after config edit).

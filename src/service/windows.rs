@@ -75,7 +75,10 @@ pub fn install() -> Result<()> {
 }
 
 pub fn uninstall(purge_flag: bool) -> Result<()> {
-    // End the task first if running — `schtasks /End` then `/Delete`.
+    // End the task first — `schtasks /End` then `/Delete`. Doing this
+    // before the standalone-kill ensures a service-managed tebis dies
+    // through its normal stop path, not via SIGKILL-equivalent. After
+    // this, anything still holding the lockfile is a standalone.
     let _ = run_schtasks(&["/End", "/TN", TASK_NAME]);
     let del = Command::new("schtasks")
         .args(["/Delete", "/TN", TASK_NAME, "/F"])
@@ -90,28 +93,76 @@ pub fn uninstall(purge_flag: bool) -> Result<()> {
         }
     }
 
+    // Standalone foreground tebis must die before we try to remove the
+    // install dir — the running .exe is mapped + locked by the loader.
+    if let Some(pid) = crate::uninstall::kill_standalone_daemon() {
+        println!("    standalone tebis (pid {pid}) terminated");
+    }
+
     println!();
     println!("{}  Service removed.", style("✓").green().bold());
 
     if purge_flag {
+        // Per-project hook cleanup BEFORE we touch data_dir — manifest
+        // lives at <data_dir>\installed.json and is consumed here.
+        let hooks = crate::uninstall::uninstall_all_project_hooks();
+        crate::uninstall::print_hook_cleanup_summary(&hooks);
+        let manifest_must_survive = hooks.is_partial();
+
         let bin = installed_binary_path().ok();
-        let env_file = setup::env_file_path().ok();
+        let install_dir = bin.as_deref().and_then(|p| p.parent()).map(Path::to_path_buf);
+        // The whole config dir, not just the env file — APPDATA\tebis\
+        // contains the env file plus any future per-user state.
+        let config = crate::platform::paths::config_dir().ok();
         let data = crate::platform::paths::data_dir().ok();
-        for entry in [bin.as_deref(), env_file.as_deref(), data.as_deref()]
-            .into_iter()
-            .flatten()
+
+        // Delete config dir directly — not the running process.
+        // Data dir is held back when hook cleanup failed (preserves the
+        // manifest for a retry). The binary directory is handled by the
+        // trampoline after we exit (can't unlink our own running .exe).
+        if let Some(entry) = config.as_deref()
+            && entry.exists()
         {
-            if entry.exists() {
-                let kind = if entry.is_dir() { "dir " } else { "file" };
-                match if entry.is_dir() {
-                    fs::remove_dir_all(entry)
-                } else {
-                    fs::remove_file(entry)
-                } {
-                    Ok(()) => println!("    {}  {} {}", style("✓").green(), kind, entry.display()),
+            match fs::remove_dir_all(entry) {
+                Ok(()) => println!("    {}  dir  {}", style("✓").green(), entry.display()),
+                Err(e) => {
+                    tracing::warn!(path = %entry.display(), err = %e, "purge: remove failed");
+                }
+            }
+        }
+        if let Some(entry) = data.as_deref()
+            && entry.exists()
+        {
+            if manifest_must_survive {
+                println!(
+                    "    {} {} (kept — hook cleanup had failures; re-run after fixing)",
+                    style("·").dim(),
+                    entry.display()
+                );
+            } else {
+                match fs::remove_dir_all(entry) {
+                    Ok(()) => println!("    {}  dir  {}", style("✓").green(), entry.display()),
                     Err(e) => {
                         tracing::warn!(path = %entry.display(), err = %e, "purge: remove failed");
                     }
+                }
+            }
+        }
+
+        // Schedule install-dir removal AFTER we exit. The running
+        // tebis.exe is locked by the loader; a sibling PowerShell sleeps
+        // 2s then nukes the whole directory.
+        if let Some(dir) = install_dir.as_deref()
+            && dir.exists()
+        {
+            match crate::uninstall::spawn_self_delete_trampoline(dir) {
+                Ok(()) => println!(
+                    "    {}  scheduled removal of {} (in ~2s)",
+                    style("✓").green(),
+                    dir.display()
+                ),
+                Err(e) => {
+                    tracing::warn!(path = %dir.display(), err = %e, "purge: trampoline failed");
                 }
             }
         }
