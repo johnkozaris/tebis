@@ -138,15 +138,36 @@ Stop the running tebis first, then re-run the installer:
         $newPath = if ($userPath) { "$userPath;$InstallDir" } else { $InstallDir }
         [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
         Write-Ok "Appended $InstallDir to user PATH"
-        Write-Warn2 'Open a new terminal for the PATH change to take effect.'
     }
 
+    # The CURRENT shell's process-scope $env:Path is unchanged by
+    # editing User-scope PATH. We could try `$env:Path = "$env:Path;$InstallDir"`
+    # to patch the current scope, but that only persists to the
+    # caller when the script ran via `irm | iex` (top-level scope) —
+    # not when invoked via `& ([scriptblock]::Create(...))` which
+    # runs in a child scope. To keep the UX consistent regardless of
+    # invocation, the next-steps below use the full install path
+    # whenever the original $env:Path didn't already contain it.
+    $procPath = $env:Path -split ';'
+    $onProcessPath = $procPath | Where-Object { $_ -ieq $InstallDir }
+
     # ── Next steps ───────────────────────────────────────────────────
+    # When the current shell's PATH already had InstallDir (e.g. a
+    # re-install in a shell opened after a previous install), bare
+    # `tebis` works. Otherwise we hand out the full path so copy/paste
+    # is fool-proof; a new shell will pick up the bare name.
+    $tebisCmd = if ($onProcessPath) { 'tebis' } else { $installPath }
+
     Write-Host ''
     Write-Host 'Next steps' -ForegroundColor White
-    Write-Host '    tebis setup              run the interactive config wizard' -ForegroundColor DarkGray
-    Write-Host '    tebis install            install as a Task Scheduler job'  -ForegroundColor DarkGray
-    Write-Host '    tebis --help             see all commands'                 -ForegroundColor DarkGray
+    if ($tebisCmd -ne 'tebis') {
+        Write-Host ("    (this shell does not have " + $InstallDir + " on PATH; using full path below.") -ForegroundColor DarkGray
+        Write-Host ("     Open a new terminal to use just 'tebis'.)") -ForegroundColor DarkGray
+        Write-Host ''
+    }
+    Write-Host ("    " + $tebisCmd + " setup              run the interactive config wizard") -ForegroundColor DarkGray
+    Write-Host ("    " + $tebisCmd + " install            install as a Task Scheduler job")  -ForegroundColor DarkGray
+    Write-Host ("    " + $tebisCmd + " --help             see all commands")                 -ForegroundColor DarkGray
     Write-Host ''
 }
 finally {

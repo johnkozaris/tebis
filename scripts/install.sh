@@ -304,10 +304,25 @@ case ":${PATH}:" in
 esac
 
 # ─── Next steps ──────────────────────────────────────────────────────
+# When the rc was just edited, the *current* shell still doesn't have
+# the new PATH — env vars don't backflow into the parent process. So
+# `tebis setup` would be "command not found" right now. We use the
+# absolute path in the next-steps so the user can copy/paste and have
+# it work immediately. After they open a new shell, the bare `tebis`
+# name will work too (which is what their muscle memory will type).
+case ":${PATH}:" in
+    *":${INSTALL_DIR}:"*) tebis_cmd="$BIN_NAME" ;;
+    *)                    tebis_cmd="$INSTALL_PATH" ;;
+esac
+
 printf '\n%bNext steps%b\n' "$BOLD" "$RESET"
+if [ "$tebis_cmd" != "$BIN_NAME" ]; then
+    printf '    %b(current shell does not have %s on PATH yet — using full path below)%b\n\n' \
+        "$DIM" "$INSTALL_DIR" "$RESET"
+fi
 printf '    %s setup              %brun the interactive config wizard%b\n' \
-    "$BIN_NAME" "$DIM" "$RESET"
+    "$tebis_cmd" "$DIM" "$RESET"
 printf '    %s install            %binstall as a background service%b\n' \
-    "$BIN_NAME" "$DIM" "$RESET"
+    "$tebis_cmd" "$DIM" "$RESET"
 printf '    %s --help             %bsee all commands%b\n\n' \
-    "$BIN_NAME" "$DIM" "$RESET"
+    "$tebis_cmd" "$DIM" "$RESET"
