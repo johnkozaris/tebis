@@ -1,19 +1,20 @@
 name: Release
 
-# Triggered by pushing a `v*` tag. The tag IS the release version —
+# Triggered ONLY by pushing a `v*` tag. The tag IS the release version —
 # tebis::upgrade reads `tag_name` from the GitHub API and matches
 # against `CARGO_PKG_VERSION` (with the leading `v` stripped), so the
 # tag and Cargo.toml version must agree before tagging.
 #
-# Manual `workflow_dispatch` builds artifacts but does NOT publish a
-# release — useful for testing the build matrix without polluting the
-# release history.
+# We deliberately do NOT expose `workflow_dispatch` here. Building the
+# macOS + Windows matrix costs ~10× the Linux minute rate; gating the
+# matrix behind tag push only is the cheapest correct policy. To
+# smoke-test a build locally before tagging, run
+# `cargo build --release --target <triple>` on your dev box.
 
 on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
 
 # Each release job downloads its target's stdlib + builds the daemon
 # from scratch, so cache hits are partial at best. Limit concurrency

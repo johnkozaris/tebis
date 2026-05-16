@@ -37,11 +37,6 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked -- -D warnings
-      # Pedantic + nursery run non-fatally so style hints surface in CI
-      # logs without blocking merges. Promote to `-D warnings` after a
-      # dedicated polish pass.
-      - run: cargo clippy --all-targets --locked -- -W clippy::pedantic -W clippy::nursery
-        continue-on-error: true
 
   test:
     name: cargo test
