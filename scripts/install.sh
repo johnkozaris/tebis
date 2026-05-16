@@ -143,6 +143,21 @@ else
     die "need shasum or sha256sum to verify the download"
 fi
 
+# Validate INSTALL_DIR for shell-safety BEFORE we write its value
+# into the user's rc. We reject characters that have shell meaning
+# inside a double-quoted string (or `set -gx` argument for fish):
+# "  → terminates the string
+# $  → variable / arithmetic / command substitution
+# `  → command substitution (backticks)
+# \  → escape
+# newline / CR → multi-line break
+# Practical install dirs never contain these. Rejecting up front is
+# safer than per-shell escaping.
+case "$INSTALL_DIR" in
+    *\"*|*\$*|*\`*|*\\*|*'
+'*) die "install dir contains shell-unsafe characters: $INSTALL_DIR" ;;
+esac
+
 # ─── Resolve target + tag ────────────────────────────────────────────
 TARGET="$(detect_target)"
 ASSET="tebis-${TARGET}"
@@ -254,15 +269,31 @@ case ":${PATH}:" in
                     ;;
             esac
 
-            # Idempotent: if marker is already present, skip the edit.
+            # Idempotent: if marker is already present, check that the
+            # line below it matches what we'd write now. Stale-dir case:
+            # user installed to /foo, re-installs to /bar — the marker
+            # still says /foo. We don't silently replace; we warn and
+            # ask them to fix it (or --no-modify-path + manual edit).
             if [ -f "$rc" ] && grep -Fq "$PATH_MARKER" "$rc"; then
-                ok "PATH entry already present in ${rc}"
+                # Pull the line immediately after the marker line.
+                existing="$(grep -F -A1 "$PATH_MARKER" "$rc" | tail -n1)"
+                if [ "$existing" = "$line" ]; then
+                    ok "PATH entry already present in ${rc}"
+                else
+                    warn "PATH marker present in ${rc} but points elsewhere:"
+                    printf '    %bexisting:%b %s\n' "$DIM" "$RESET" "$existing"
+                    printf '    %bwanted:  %b %s\n' "$DIM" "$RESET" "$line"
+                    printf '    %brun:     %b tebis uninstall --purge && re-run this installer%b\n' \
+                        "$DIM" "$RESET" "$RESET"
+                fi
             else
                 mkdir -p "$(dirname "$rc")"
-                # Leading newline + marker + line. Two lines total so
-                # uninstall can strip exactly what we wrote.
+                # Marker + line. Two lines exactly so uninstall can strip
+                # what we wrote and nothing else. No leading blank line —
+                # repeated install→purge→install would otherwise leave a
+                # growing run of blanks at the bottom of the rc.
                 {
-                    printf '\n%s\n' "$PATH_MARKER"
+                    printf '%s\n' "$PATH_MARKER"
                     printf '%s\n' "$line"
                 } >> "$rc"
                 ok "Added ${INSTALL_DIR} to PATH in ${rc}"

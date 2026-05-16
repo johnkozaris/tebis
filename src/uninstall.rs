@@ -189,28 +189,48 @@ pub fn strip_path_line_from_rc_files() -> Vec<PathBuf> {
     modified
 }
 
-/// Pure helper for `strip_path_line_from_rc_files`: removes any line
-/// matching `marker` AND the immediately-following line. Preserves a
-/// single blank line where the block was, but does not collapse
-/// multiple blanks elsewhere.
+/// Pure helper for `strip_path_line_from_rc_files`. Removes lines
+/// matching `marker` (after trimming horizontal whitespace), plus the
+/// single line that follows IFF that line begins with one of the
+/// tebis-generated PATH prefixes (`export PATH=` or `set -gx PATH`).
+///
+/// Why the prefix check: docs promise we never delete code we didn't
+/// write. If a user copies our marker above their own line, the
+/// stripper must leave their line alone — we just drop the marker.
+///
+/// Preserves original line endings (LF and CRLF) byte-for-byte by
+/// operating on `split_inclusive('\n')`. Files that happen to be
+/// CRLF on Unix (rare, but possible via git or shared dotfiles) are
+/// not silently normalised.
 #[cfg(unix)]
 fn strip_marker_block(content: &str, marker: &str) -> String {
+    // Acceptable prefixes for the line that follows a tebis marker.
+    // Match what scripts/install.sh writes (or has ever written —
+    // keep historical prefixes here so old installs still uninstall).
+    const ALLOWED_NEXT_PREFIXES: &[&str] = &["export PATH=", "set -gx PATH "];
+
     let mut out = String::with_capacity(content.len());
-    let mut lines = content.lines().peekable();
-    while let Some(line) = lines.next() {
-        if line.trim() == marker {
-            // Drop this line + the next one (the export/set line).
-            let _ = lines.next();
+    let mut chunks = content.split_inclusive('\n').peekable();
+    while let Some(chunk) = chunks.next() {
+        // `chunk` keeps its trailing '\n' (or is the unterminated final
+        // line). Strip trailing CR + LF for marker comparison only.
+        let trimmed = chunk.trim_end_matches(['\n', '\r']).trim();
+        if trimmed == marker {
+            // Marker hit. Peek the next chunk. Only consume it if it
+            // looks like a tebis-generated PATH line. Otherwise we
+            // drop the marker but leave the user's line in place.
+            if let Some(next) = chunks.peek() {
+                let next_trimmed = next.trim_start();
+                let looks_ours = ALLOWED_NEXT_PREFIXES
+                    .iter()
+                    .any(|p| next_trimmed.starts_with(p));
+                if looks_ours {
+                    chunks.next();
+                }
+            }
             continue;
         }
-        out.push_str(line);
-        out.push('\n');
-    }
-    // Preserve trailing newline iff the original had one.
-    if !content.ends_with('\n')
-        && out.ends_with('\n')
-    {
-        out.pop();
+        out.push_str(chunk);
     }
     out
 }
@@ -451,7 +471,8 @@ alias ll='ls -la'
     #[test]
     fn strip_marker_block_handles_marker_at_eof() {
         // Pathological: marker is the LAST line, no export after it.
-        // We still want to drop the marker; "next line" is empty.
+        // We still drop the marker; "next line" doesn't exist so the
+        // prefix check is vacuous and nothing else is touched.
         let input = "export EDITOR=vim\n# added by tebis installer\n";
         let got = strip_marker_block(input, "# added by tebis installer");
         assert_eq!(got, "export EDITOR=vim\n");
@@ -465,5 +486,44 @@ alias ll='ls -la'
         let twice = strip_marker_block(&once, "# added by tebis installer");
         assert_eq!(once, twice);
         assert_eq!(once, "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_marker_block_preserves_crlf() {
+        // CRLF rc file (rare on Unix but possible via shared dotfiles).
+        // The marker block should drop, everything else stays byte-exact.
+        let input = "export EDITOR=vim\r\n# added by tebis installer\r\nexport PATH=x\r\nalias ll=ls\r\n";
+        let got = strip_marker_block(input, "# added by tebis installer");
+        assert_eq!(got, "export EDITOR=vim\r\nalias ll=ls\r\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_marker_block_keeps_user_line_if_not_tebis_pattern() {
+        // Defends the "we never edit code we didn't write" contract:
+        // a marker copied above the user's own code drops the marker
+        // but leaves the user's line intact.
+        let input = "# added by tebis installer\necho hello\n";
+        let got = strip_marker_block(input, "# added by tebis installer");
+        assert_eq!(got, "echo hello\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_marker_block_matches_fish_syntax() {
+        // Fish uses `set -gx PATH …` rather than `export PATH=…`.
+        let input = "# added by tebis installer\nset -gx PATH /Users/me/.local/bin $PATH\n";
+        let got = strip_marker_block(input, "# added by tebis installer");
+        assert_eq!(got, "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_marker_block_tolerates_trailing_whitespace_on_marker() {
+        // Defensive: editors sometimes strip / add trailing whitespace.
+        let input = "# added by tebis installer   \nexport PATH=x\n";
+        let got = strip_marker_block(input, "# added by tebis installer");
+        assert_eq!(got, "");
     }
 }
