@@ -34,20 +34,33 @@ setup.
 
 ## Quick start
 
+**macOS / Linux:**
+
+```sh
+curl -fsSL https://github.com/johnkozaris/tebis/releases/latest/download/install.sh | sh
+tebis setup
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://github.com/johnkozaris/tebis/releases/latest/download/install.ps1 | iex
+tebis setup
+```
+
+Both installers verify SHA-256 against the release sidecar, drop a
+single binary in a per-user prefix (`~/.local/bin/` or
+`%LOCALAPPDATA%\Programs\tebis\`), and surface PATH instructions if
+needed. See [Install guide](docs/install.md) for upgrade, uninstall,
+and offline install.
+
+**From source** (Rust 1.95+ and a C++ toolchain):
+
 ```sh
 git clone https://github.com/johnkozaris/tebis.git
 cd tebis
 cargo build --release
 ./target/release/tebis setup
-```
-
-Windows PowerShell:
-
-```powershell
-git clone https://github.com/johnkozaris/tebis.git
-cd tebis
-cargo build --release
-.\target\release\tebis.exe setup
 ```
 
 The setup wizard walks you through:
@@ -98,6 +111,7 @@ See [Dashboard](docs/dashboard.md) for setup.
 
 | Guide | When to read it |
 | --- | --- |
+| [Install](docs/install.md) | One-shot install, upgrade, and uninstall on every platform |
 | [Setup](docs/setup.md) | Install, run, and manage Tebis as a background service |
 | [Configuration](docs/configuration.md) | Edit the env file by hand |
 | [Agent hooks](docs/hooks.md) | Get faster replies from Claude Code or Copilot CLI |

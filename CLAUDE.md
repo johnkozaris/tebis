@@ -212,6 +212,70 @@ every entry look user-owned).
 uninstall. Read by `tebis hooks list` and the inspect dashboard so
 users can enumerate installs across the whole host.
 
+## Distribution lifecycle
+
+End-to-end install/upgrade/uninstall story. Source of truth lives in:
+
+- `scripts/install.sh` — POSIX sh installer for macOS + Linux.
+- `scripts/install.ps1` — PowerShell 5.1+ installer for Windows.
+- `.github/workflows/release.yml` — matrix build for the 5 supported
+  targets on `v*` tag push.
+- `src/upgrade.rs` — `tebis upgrade` (GitHub Releases client, SHA-256
+  streaming verify, 64 MiB cap).
+- `src/platform/binary_replace.rs` — atomic-replace abstraction
+  (Unix `rename(2)`, Windows `MoveFileExW` with `.old` staging).
+- `src/uninstall.rs` — zero-trace `tebis uninstall --purge`.
+
+Supported release targets (must match `upgrade::current_target()`
+exactly; adding a target requires changes in both places):
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `aarch64-apple-darwin`
+- `x86_64-apple-darwin`
+- `x86_64-pc-windows-msvc`
+
+Each release ships the binary plus a sidecar `<asset>.sha256` whose
+first whitespace-delimited token is the hex hash (matches
+`shasum -a 256` output). Both `install.sh` and `tebis upgrade` parse
+just the first token — do not change the format unless you update
+both readers.
+
+Distribution invariants:
+
+- **`tebis upgrade` does not auto-restart** by default. The new binary
+  only takes effect after a manual restart (Unix) or on the next
+  `MoveFileExW` cycle (Windows). Pass `--restart` to re-exec the
+  freshly-installed image's `restart` subcommand — that ensures the
+  *new* image runs `restart`, not the still-loaded old image.
+- **Unix binary replacement uses `rename(2)`.** The loader keeps the
+  old inode mapped while the new binary lives at the same path. Safe
+  to run while the daemon is up.
+- **Windows binary replacement** moves `tebis.exe` → `tebis.exe.old`
+  (allowed while running because we only need the directory entry, not
+  the file handle), then moves the new image into place. The `.old`
+  is best-effort unlinked on the next upgrade.
+- **macOS installer strips `com.apple.quarantine`** after download so
+  Gatekeeper does not prompt on first run. Safe because we own the
+  verified download. The Windows installer cannot do the equivalent
+  for SmartScreen — document the "More info → Run anyway" workaround.
+- **Install scripts append PATH idempotently** but do not edit shell
+  rc files on uninstall — too risky after the fact. Print the line
+  to remove. Windows is different: User PATH edits are surgical via
+  `[Environment]::SetEnvironmentVariable('Path', ..., 'User')`, so
+  uninstall can clean them safely. Never use `setx` — it silently
+  truncates User PATH at 1024 chars.
+- **Uninstall ordering matters**: stop daemon → iterate manifest →
+  uninstall per-project hooks → remove materialized hook scripts →
+  remove service unit → remove config/data → remove binary last. On
+  Windows the binary removal is deferred via a detached PowerShell
+  trampoline (sleep 2s, then `Remove-Item -Recurse`) because the
+  running `.exe` is locked.
+- **`tebis uninstall` never removes** `tmux`, `jq`, `nc`, the user's
+  project repos, running multiplexer sessions, or unrelated entries
+  in `.claude/settings.local.json`. We identify our hook entries by
+  matching script paths under `<data_dir>/scripts/`.
+
 ## Build / test / audit
 
 ```sh

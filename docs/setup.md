@@ -24,7 +24,27 @@ choco install psmux
 cargo install psmux
 ```
 
-## 2. Build Tebis
+## 2. Install Tebis
+
+The fastest path is the prebuilt binary installer; from-source is fine
+when you want to track `main` or build locally.
+
+**Prebuilt (macOS / Linux):**
+
+```sh
+curl -fsSL https://github.com/johnkozaris/tebis/releases/latest/download/install.sh | sh
+```
+
+**Prebuilt (Windows PowerShell):**
+
+```powershell
+irm https://github.com/johnkozaris/tebis/releases/latest/download/install.ps1 | iex
+```
+
+Both verify SHA-256 and drop the binary on PATH. See
+[install.md](install.md) for upgrade, uninstall, and offline install.
+
+**From source:**
 
 ```sh
 git clone https://github.com/johnkozaris/tebis.git
@@ -42,7 +62,13 @@ cargo build --release
 
 ## 3. Run the setup wizard
 
-macOS and Linux:
+If you installed via the prebuilt script, `tebis` is on PATH already:
+
+```sh
+tebis setup
+```
+
+From a source build, point at the release binary:
 
 ```sh
 ./target/release/tebis setup
@@ -82,7 +108,10 @@ tebis start
 tebis status
 tebis stop
 tebis restart
-tebis uninstall
+tebis uninstall          # remove the service + binary
+tebis uninstall --purge  # also remove config and data (zero trace)
+tebis upgrade            # in-place upgrade to the latest release
+tebis doctor             # health-check all installed pieces
 ```
 
 `tebis install` registers a per-user background service:
