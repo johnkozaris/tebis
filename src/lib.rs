@@ -28,3 +28,4 @@ pub mod setup;
 pub mod shutdown;
 pub mod telegram;
 pub mod uninstall;
+pub mod upgrade;

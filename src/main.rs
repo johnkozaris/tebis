@@ -36,6 +36,11 @@ Usage:
   tebis stop            Stop the installed background service.
   tebis restart         Stop + start the installed service (e.g. after config edit).
   tebis status          Show service + foreground state.
+  tebis upgrade [--restart]
+                        Self-upgrade by downloading the latest release
+                        from GitHub, verifying its SHA-256, and atomic-
+                        replacing the running binary. With `--restart`,
+                        also restart the background service after.
   tebis doctor          Diagnose system, privileges, deps, and service state.
                         Pass `-v` / `--verbose` to include OK rows.
   tebis hooks <verb>    Manage agent hooks: install | uninstall | status.
@@ -84,6 +89,17 @@ fn main() -> Result<()> {
         Some("stop") => service::stop(),
         Some("restart") => service::restart(),
         Some("status") => service::status(),
+        Some("upgrade") => {
+            let restart = env::args().any(|a| a == "--restart");
+            // Spin up a minimal Tokio runtime — the upgrade flow is
+            // async (reqwest), but we don't need the full multi-thread
+            // bridge runtime for a one-shot download.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building upgrade runtime")?;
+            rt.block_on(tebis::upgrade::run(restart))
+        }
         Some("doctor") => {
             let verbose = env::args().any(|a| a == "-v" || a == "--verbose");
             let report = tebis::preflight::run_doctor();
