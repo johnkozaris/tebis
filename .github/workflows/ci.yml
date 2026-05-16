@@ -1,8 +1,11 @@
 name: CI
 
+# Manual-only. No `push:` or `pull_request:` triggers — the user runs
+# this from the Actions tab when they want a remote verification pass.
+# Local `cargo test` + `cargo clippy -- -D warnings` cover the
+# day-to-day loop; this workflow is the belt-and-suspenders pre-release
+# check. Tag-push triggers release.yml separately.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:

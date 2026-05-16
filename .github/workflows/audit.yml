@@ -1,13 +1,9 @@
 name: Audit
 
+# Manual-only. `cargo audit` + `cargo deny` are useful pre-release but
+# don't need to fire on every Cargo.toml touch; the user runs this from
+# the Actions tab when cutting a release or after a dep bump.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/audit.yml'
-      - 'deny.toml'
   workflow_dispatch:
 
 permissions:
