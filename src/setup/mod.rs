@@ -12,6 +12,7 @@ use dialoguer::{Confirm, Select};
 use crate::env_file;
 
 mod discover;
+mod hook_deps;
 mod installer;
 mod mux_prereq;
 pub mod onnxruntime;
@@ -137,6 +138,7 @@ pub fn run() -> Result<Next> {
     let theme = ColorfulTheme::default();
     ui::print_welcome();
     mux_prereq::ensure_or_offer_install(&theme)?;
+    hook_deps::ensure_or_offer_install(&theme)?;
 
     let env_path = env_file_path()?;
     let discovered = discover::discover(&env_path);
