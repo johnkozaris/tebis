@@ -421,6 +421,19 @@ fn purge_user_state(bin: &Path, env_dir: &Path, data_dir: Option<&Path>) -> Resu
     let extra = crate::uninstall::remove_runtime_files();
     removed.extend(extra);
 
+    // Strip the marker-tagged PATH line that install.sh appended to the
+    // user's shell rc. Counterpart to the auto-edit at install time.
+    // Best-effort: a stale rc-write doesn't block the rest of purge.
+    let rc_modified = crate::uninstall::strip_path_line_from_rc_files();
+    for path in &rc_modified {
+        println!(
+            "    {}  stripped PATH line from {}",
+            style("✓").green(),
+            style(path.display()).dim()
+        );
+    }
+    removed.extend(rc_modified);
+
     // macOS launchd plist writes /tmp/tebis.log (configured in
     // contrib/macos/local.tebis.plist). Not covered by runtime_files
     // since it's a log, not a runtime socket/lock.

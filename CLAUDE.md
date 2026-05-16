@@ -262,13 +262,25 @@ Distribution invariants:
   install.ps1 does call `Unblock-File` to clear Zone.Identifier on the
   downloaded binary; this skips MOTW-driven prompts on first run when
   AppLocker policy permits it.
-- **PATH cleanup is asymmetric.** Both installers append PATH
-  idempotently. Windows `--purge` removes the User PATH entry
-  surgically via `[Environment]::SetEnvironmentVariable('Path', ..., 'User')`;
-  never `setx` — it silently truncates User PATH at 1024 chars. Unix
-  installers print the `export PATH=…` line for the user to add to
-  their rc file and we never edit dotfiles on uninstall — too risky
-  after the fact.
+- **PATH cleanup is symmetric.** Both installers append PATH
+  idempotently and `--purge` removes the entry surgically.
+  - **Unix**: install.sh detects `$SHELL` and appends a
+    marker-tagged (`# added by tebis installer`) `export PATH=…`
+    block to the matching rc (`~/.zshrc`, `~/.bash_profile` on
+    macOS / `~/.bashrc` on Linux, `~/.config/fish/config.fish`,
+    fallback `~/.profile`). `--purge` runs
+    `uninstall::strip_path_line_from_rc_files` which removes
+    exactly the marker line + the one that follows. Marker MUST
+    match between `scripts/install.sh::PATH_MARKER` and
+    `uninstall::strip_path_line_from_rc_files::MARKER` —
+    changing one without the other breaks idempotent uninstall.
+    `--no-modify-path` (or `TEBIS_NO_MODIFY_PATH=1`) opts out.
+  - **Windows**: install.ps1 appends to the User PATH via
+    `[Environment]::SetEnvironmentVariable('Path', …, 'User')`.
+    `--purge` calls `uninstall::remove_from_user_path`, which
+    reads the User PATH via PowerShell, drops case-insensitive
+    matches of the install dir, and writes back via the .NET
+    API. Never `setx` — it silently truncates at 1024 chars.
 - **`tebis install` is idempotent w.r.t. the binary copy.** Both
   `service::unix::install_binary` and `service::windows::copy_binary`
   short-circuit when `src == dst` (canonicalized). This matters

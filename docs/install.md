@@ -33,10 +33,18 @@ The script:
 3. Verifies SHA-256 (`shasum -a 256` or `sha256sum`, whichever is on
    PATH).
 4. Moves the binary to `~/.local/bin/tebis` and `chmod 0755`.
-5. On macOS, strips `com.apple.quarantine` so Gatekeeper does not
+5. Detects your shell (`$SHELL`) and appends a marker-tagged
+   `export PATH=…` line to the matching rc file when
+   `~/.local/bin` is not already on `$PATH`. Idempotent: re-runs
+   skip rc edits when the marker is present. Pass
+   `--no-modify-path` (or set `TEBIS_NO_MODIFY_PATH=1`) to
+   suppress the edit and just print the line.
+   - `zsh` → `~/.zshrc` (or `$ZDOTDIR/.zshrc`)
+   - `bash` → `~/.bash_profile` on macOS, `~/.bashrc` on Linux
+   - `fish` → `~/.config/fish/config.fish` (uses `set -gx PATH …`)
+   - other → `~/.profile`
+6. On macOS, strips `com.apple.quarantine` so Gatekeeper does not
    prompt on first run.
-6. Prints the `export PATH=...` line if `~/.local/bin` is not on your
-   PATH (you paste it into `~/.zshrc` or equivalent).
 
 Options:
 
@@ -46,6 +54,9 @@ curl -fsSL .../install.sh | sh -s -- --version v0.2.0
 
 # Override install dir
 curl -fsSL .../install.sh | TEBIS_INSTALL_DIR=/opt/tebis/bin sh
+
+# Skip the shell-rc edit (you'll add `export PATH=…` yourself)
+curl -fsSL .../install.sh | sh -s -- --no-modify-path
 ```
 
 ### Windows (PowerShell 5.1+)
@@ -154,10 +165,12 @@ left in place so a re-install is a quick `tebis install` away.
 - Removes the service-installed binary
   (`~/.local/bin/tebis` on Unix; `%LOCALAPPDATA%\Programs\tebis\` on
   Windows via a 30-second self-delete trampoline).
+- Strips the marker-tagged PATH line that `install.sh` appended to
+  your shell rc on Unix (`~/.zshrc` / `~/.bashrc` / `~/.bash_profile`
+  / `~/.profile` / `~/.config/fish/config.fish`). Lines without the
+  marker are left alone — we never edit code we didn't write.
 - Windows: surgically removes the install dir from User PATH (the
-  entry `install.ps1` appended). Unix: prints the `export PATH=…`
-  line you originally added so you can remove it from your rc file —
-  we never edit dotfiles.
+  entry `install.ps1` appended).
 
 What `--purge` does NOT touch:
 
@@ -192,7 +205,7 @@ every OS; the per-OS specifics live inside each check.
 | `tebis upgrade` fails to replace on Windows | another `tebis.exe` is running; stop it and retry |
 | `tebis upgrade` fails with "permission denied" | binary was installed system-wide; reinstall under `~/.local/bin` or run upgrade with the same privileges as install |
 | You installed with `--dir` / `TEBIS_INSTALL_DIR`, then `tebis install` | the service hard-codes `~/.local/bin/tebis` / `%LOCALAPPDATA%\Programs\tebis\`. You'll end up with two copies; remove the custom-path one manually before / after `--purge`. |
-| Post-uninstall on Unix, `export PATH=…` line still in your `.zshrc` | nothing to clean automatically — we never edit dotfiles. Remove the line yourself. |
+| Post-uninstall on Unix, `export PATH=…` line still in your `.zshrc` | `--purge` strips marker-tagged lines automatically. If you added the line manually (or passed `--no-modify-path`), remove it yourself. |
 | Post-uninstall on Windows, `%LOCALAPPDATA%\Programs\tebis` still in PATH | `--purge` removes it; plain `uninstall` does not. Re-run with `--purge` if you want the PATH entry gone. |
 
 ## Behind a proxy / offline install

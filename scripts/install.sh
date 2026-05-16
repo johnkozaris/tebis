@@ -26,6 +26,14 @@ REPO="johnkozaris/tebis"
 INSTALL_DIR="${TEBIS_INSTALL_DIR:-${HOME}/.local/bin}"
 BIN_NAME="tebis"
 TAG="${TEBIS_VERSION:-latest}"
+MODIFY_PATH=1
+if [ -n "${TEBIS_NO_MODIFY_PATH:-}" ]; then
+    MODIFY_PATH=0
+fi
+# Marker tag written into shell rc files. Uninstall greps for this
+# exact string to find the line to remove — do NOT change without
+# updating src/uninstall.rs::strip_path_line_from_rc_files.
+PATH_MARKER="# added by tebis installer"
 
 # ─── ANSI helpers (skip when stdout isn't a TTY) ─────────────────────
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -55,22 +63,27 @@ Usage:
 Options:
   --version, -v <tag>   release tag (e.g. v0.1.0); default: latest
   --dir, -d <path>      install directory; default: \${HOME}/.local/bin
+  --no-modify-path      do not edit any shell rc file
 
 Env:
   TEBIS_VERSION         same as --version
   TEBIS_INSTALL_DIR     same as --dir
+  TEBIS_NO_MODIFY_PATH  same as --no-modify-path (any non-empty value)
   NO_COLOR              disable ANSI escapes
 
-The installer writes a single file (\${INSTALL_DIR}/tebis) and never
-touches sudo, shell rc files, or system package managers.
+By default we append a single, marker-tagged line to your shell's rc
+file when \${INSTALL_DIR} is not on \$PATH. \`tebis uninstall --purge\`
+removes that line. To skip the rc edit entirely, pass --no-modify-path
+and add the export line yourself.
 EOF
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --version|-v) TAG="${2:-}"; shift 2 ;;
-        --dir|-d)     INSTALL_DIR="${2:-}"; shift 2 ;;
-        --help|-h)    print_help; exit 0 ;;
+        --version|-v)     TAG="${2:-}"; shift 2 ;;
+        --dir|-d)         INSTALL_DIR="${2:-}"; shift 2 ;;
+        --no-modify-path) MODIFY_PATH=0; shift ;;
+        --help|-h)        print_help; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
 done
@@ -191,16 +204,71 @@ fi
 
 ok "Installed tebis to ${INSTALL_PATH}"
 
-# ─── PATH hint ───────────────────────────────────────────────────────
+# ─── PATH hint / auto-edit ───────────────────────────────────────────
 case ":${PATH}:" in
-    *":${INSTALL_DIR}:"*) ;;
+    *":${INSTALL_DIR}:"*)
+        # Already on PATH (e.g. Debian/Ubuntu's default ~/.profile, or
+        # the user's existing rc). Nothing to do.
+        ;;
     *)
-        warn "${INSTALL_DIR} is not on your \$PATH"
-        printf '    %bAdd to your shell rc (~/.zshrc, ~/.bashrc, etc):%b\n' "$DIM" "$RESET"
-        # shellcheck disable=SC2016
-        # The literal `$PATH` is the point — user pastes this verbatim
-        # into their shell rc where the shell expands it at init time.
-        printf '\n        export PATH="%s:$PATH"\n\n' "$INSTALL_DIR"
+        if [ "$MODIFY_PATH" -eq 0 ]; then
+            warn "${INSTALL_DIR} is not on your \$PATH"
+            printf '    %bAdd to your shell rc (~/.zshrc, ~/.bashrc, etc):%b\n' "$DIM" "$RESET"
+            # shellcheck disable=SC2016
+            # The literal `$PATH` is the point — user pastes this verbatim
+            # into their shell rc where the shell expands it at init time.
+            printf '\n        export PATH="%s:$PATH"\n\n' "$INSTALL_DIR"
+        else
+            # Detect shell from $SHELL basename. On macOS bash users
+            # typically use login shells from Terminal.app, which reads
+            # .bash_profile rather than .bashrc — so platform-branch
+            # the bash case.
+            shell_name="$(basename "${SHELL:-/bin/sh}")"
+            case "$shell_name" in
+                zsh)
+                    rc="${ZDOTDIR:-$HOME}/.zshrc"
+                    # shellcheck disable=SC2016
+                    line="export PATH=\"${INSTALL_DIR}:\$PATH\""
+                    ;;
+                bash)
+                    if [ "$(uname -s)" = "Darwin" ]; then
+                        rc="$HOME/.bash_profile"
+                    else
+                        rc="$HOME/.bashrc"
+                    fi
+                    # shellcheck disable=SC2016
+                    line="export PATH=\"${INSTALL_DIR}:\$PATH\""
+                    ;;
+                fish)
+                    rc="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
+                    # shellcheck disable=SC2016
+                    line="set -gx PATH ${INSTALL_DIR} \$PATH"
+                    ;;
+                *)
+                    # Unknown shell — fall back to ~/.profile, which
+                    # most POSIX login shells will source (sh, dash,
+                    # ksh, and bash when no .bash_profile exists).
+                    rc="$HOME/.profile"
+                    # shellcheck disable=SC2016
+                    line="export PATH=\"${INSTALL_DIR}:\$PATH\""
+                    ;;
+            esac
+
+            # Idempotent: if marker is already present, skip the edit.
+            if [ -f "$rc" ] && grep -Fq "$PATH_MARKER" "$rc"; then
+                ok "PATH entry already present in ${rc}"
+            else
+                mkdir -p "$(dirname "$rc")"
+                # Leading newline + marker + line. Two lines total so
+                # uninstall can strip exactly what we wrote.
+                {
+                    printf '\n%s\n' "$PATH_MARKER"
+                    printf '%s\n' "$line"
+                } >> "$rc"
+                ok "Added ${INSTALL_DIR} to PATH in ${rc}"
+                warn "Open a new terminal or run: source ${rc}"
+            fi
+        fi
         ;;
 esac
 

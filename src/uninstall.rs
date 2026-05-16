@@ -128,6 +128,93 @@ pub fn remove_runtime_files() -> Vec<PathBuf> {
     removed
 }
 
+/// Unix-only: strip the `# added by tebis installer` marker block from
+/// known shell rc files. Counterpart to the auto-edit `install.sh`
+/// performs when `~/.local/bin` isn't on `$PATH`.
+///
+/// The marker MUST stay in sync with `scripts/install.sh::PATH_MARKER`.
+/// We strip exactly two consecutive lines: the marker comment and the
+/// `export PATH=…` / `set -gx PATH …` line that follows it. Anything
+/// the user wrote between the marker and the next line is left alone
+/// (the marker is only ever on its own line by construction).
+///
+/// Best-effort: failures log warn but never block the rest of purge.
+/// Returns the paths whose contents were rewritten.
+#[cfg(unix)]
+pub fn strip_path_line_from_rc_files() -> Vec<PathBuf> {
+    const MARKER: &str = "# added by tebis installer";
+
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+
+    let candidates = [
+        home.join(".zshrc"),
+        home.join(".bashrc"),
+        home.join(".bash_profile"),
+        home.join(".profile"),
+        home.join(".config/fish/config.fish"),
+    ];
+
+    let mut modified = Vec::new();
+    for path in &candidates {
+        if !path.exists() {
+            continue;
+        }
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), err = %e, "uninstall: rc read failed");
+                continue;
+            }
+        };
+        if !content.contains(MARKER) {
+            continue;
+        }
+        let new_content = strip_marker_block(&content, MARKER);
+        // No-op write protection: if we somehow produce identical
+        // content (marker present but our strip didn't change anything),
+        // skip the write to avoid touching mtime needlessly.
+        if new_content == content {
+            continue;
+        }
+        // Plain write preserves the file's existing permissions and
+        // ownership. Atomic for our needs — rc files are small.
+        if let Err(e) = std::fs::write(path, &new_content) {
+            tracing::warn!(path = %path.display(), err = %e, "uninstall: rc write failed");
+            continue;
+        }
+        modified.push(path.clone());
+    }
+    modified
+}
+
+/// Pure helper for `strip_path_line_from_rc_files`: removes any line
+/// matching `marker` AND the immediately-following line. Preserves a
+/// single blank line where the block was, but does not collapse
+/// multiple blanks elsewhere.
+#[cfg(unix)]
+fn strip_marker_block(content: &str, marker: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut lines = content.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.trim() == marker {
+            // Drop this line + the next one (the export/set line).
+            let _ = lines.next();
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // Preserve trailing newline iff the original had one.
+    if !content.ends_with('\n')
+        && out.ends_with('\n')
+    {
+        out.pop();
+    }
+    out
+}
+
 /// Print a hook-cleanup summary using the standard `tebis` glyph palette.
 /// Called from both Unix and Windows service-uninstall flows.
 pub fn print_hook_cleanup_summary(report: &HookCleanupReport) {
@@ -328,5 +415,55 @@ mod tests {
         // Just asserts the call doesn't panic — captured output isn't
         // checked since both paths are valid (print or no-op).
         print_hook_cleanup_summary(&HookCleanupReport::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_marker_block_removes_marker_and_following_line() {
+        let input = "\
+# my comment
+export EDITOR=vim
+
+# added by tebis installer
+export PATH=\"/Users/me/.local/bin:$PATH\"
+
+alias ll='ls -la'
+";
+        let got = strip_marker_block(input, "# added by tebis installer");
+        assert!(!got.contains("added by tebis"), "marker still present");
+        assert!(
+            !got.contains(".local/bin"),
+            "export PATH line was not stripped"
+        );
+        assert!(got.contains("export EDITOR=vim"), "unrelated lines removed");
+        assert!(got.contains("alias ll"), "trailing lines removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_marker_block_no_op_without_marker() {
+        let input = "export EDITOR=vim\nalias ll='ls -la'\n";
+        let got = strip_marker_block(input, "# added by tebis installer");
+        assert_eq!(got, input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_marker_block_handles_marker_at_eof() {
+        // Pathological: marker is the LAST line, no export after it.
+        // We still want to drop the marker; "next line" is empty.
+        let input = "export EDITOR=vim\n# added by tebis installer\n";
+        let got = strip_marker_block(input, "# added by tebis installer");
+        assert_eq!(got, "export EDITOR=vim\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_marker_block_idempotent() {
+        let input = "# added by tebis installer\nexport PATH=x\n";
+        let once = strip_marker_block(input, "# added by tebis installer");
+        let twice = strip_marker_block(&once, "# added by tebis installer");
+        assert_eq!(once, twice);
+        assert_eq!(once, "");
     }
 }
